@@ -148,14 +148,16 @@ async def generate(req: GenerateRequest):
                         if isinstance(item, dict) and "filename" in item:
                             filename = item["filename"]
                             subfolder = item.get("subfolder", "")
+                            image_type = item.get("type", "output")
                             try:
                                 img_data = await worker.view.remote.aio(
-                                    filename, subfolder, "output"
+                                    filename, subfolder, image_type
                                 )
                                 if img_data and "data" in img_data:
                                     images.append({
                                         "filename": filename,
                                         "subfolder": subfolder,
+                                        "type": image_type,
                                         "data": img_data["data"],
                                     })
                             except Exception as e:
