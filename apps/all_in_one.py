@@ -148,9 +148,11 @@ async def generate(req: GenerateRequest):
     try:
         # ── 1. Envoyer le workflow et récupérer le prompt_id ──────────────
         prompt_result = await worker.prompt.remote.aio(req.workflow)
+        print(f"[Gateway] prompt_result = {prompt_result}")
         if prompt_result.get("error"):
             return JSONResponse({"error": prompt_result["error"]}, status_code=500)
         prompt_id = prompt_result.get("prompt_id")
+        print(f"[Gateway] prompt_id = {prompt_id}")
         if not prompt_id:
             return JSONResponse(
                 {"error": "No prompt_id returned by worker"},
@@ -164,11 +166,13 @@ async def generate(req: GenerateRequest):
             await asyncio.sleep(1)
             try:
                 history = await worker.history.remote.aio(prompt_id)
+                print(f"[Gateway] attempt {attempt}: history keys = {list(history.keys()) if isinstance(history, dict) else type(history)}")
                 if isinstance(history, dict) and history.get("error"):
                     return JSONResponse({"error": history["error"]}, status_code=500)
                 if isinstance(history, dict) and prompt_id in history:
                     history_data = history[prompt_id]
                     outputs = history_data.get("outputs", {})
+                    print(f"[Gateway] Found in history. outputs = {outputs}")
                     break
             except Exception:
                 # Le job n'est pas encore dans l'historique — on continue
@@ -181,6 +185,7 @@ async def generate(req: GenerateRequest):
 
         # ── 3. Récupérer les images de sortie via /view ──────────────────
         images = []
+        print(f"[Gateway] Processing outputs: {len(outputs)} nodes")
         for node_id, node_outputs in outputs.items():
             for output_key, output_data in node_outputs.items():
                 if isinstance(output_data, list):
@@ -189,12 +194,14 @@ async def generate(req: GenerateRequest):
                             filename = item["filename"]
                             subfolder = item.get("subfolder", "")
                             image_type = item.get("type", "output")
+                            print(f"[Gateway] Found image: filename={filename}, subfolder={subfolder}, type={image_type}")
                             try:
                                 img_data = await worker.view.remote.aio(
                                     filename, subfolder, image_type
                                 )
                                 if img_data and img_data.get("error"):
                                     return JSONResponse({"error": img_data["error"]}, status_code=500)
+                                print(f"[Gateway] img_data keys = {list(img_data.keys()) if isinstance(img_data, dict) else type(img_data)}")
                                 if img_data and "data" in img_data:
                                     images.append({
                                         "filename": filename,
@@ -208,6 +215,8 @@ async def generate(req: GenerateRequest):
                                 )
 
         # ── 4. Retourner le résultat formaté pour l'extension JS ─────────
+        print(f"[Gateway] Total images collected: {len(images)}")
+        print(f"[Gateway] Returning: {len(images)} images, job_id={prompt_id}")
         return {
             "images": images,
             "job_id": prompt_id,
