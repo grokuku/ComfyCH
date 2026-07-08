@@ -2,8 +2,7 @@
 
 Supports two sync modes:
 1. **Local models** — files detected in the local ComfyUI/models/ directory,
-   selected via the Modal Gateway UI, mounted into the container and copied
-   to the Volume.
+   selected via the Modal Gateway UI, added to the image and copied to the Volume.
 2. **HuggingFace models** — files listed in ``models.py``, downloaded via
    ``huggingface_hub``.
 
@@ -56,10 +55,17 @@ for candidate in _LOCAL_MODELS_CANDIDATES:
         local_models_dir = candidate
         break
 
-# ── Build mounts for local model files ───────────────────────────────────
-# Each selected model file is mounted into the container at /local_models/<filename>
+# ── Build image with local model files ───────────────────────────────────
+# In Modal 1.5.1, modal.Mount is removed. We use Image.add_local_file() instead.
 
-_local_mounts: list[modal.Mount] = []
+_sync_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .add_local_python_source("helpers", "models", copy=True)
+    .apt_install("aria2")
+    .pip_install("huggingface_hub")
+)
+
+# Add each selected local model file to the image
 if local_models_dir and models_to_sync:
     for model in models_to_sync:
         filename = model["filename"]
@@ -71,35 +77,29 @@ if local_models_dir and models_to_sync:
             continue
 
         size_mb = model_path.stat().st_size / (1024 * 1024)
-        print(f"📦 Mounting: {filename} ({size_mb:.0f} MB) from {model_dir}/")
-        _local_mounts.append(
-            modal.Mount.from_file(model_path, f"/local_models/{filename}")
+        print(f"📦 Adding to image: {filename} ({size_mb:.0f} MB) from {model_dir}/")
+        _sync_image = _sync_image.add_local_file(
+            str(model_path),
+            f"/local_models/{filename}",
         )
 
-# ── Image ────────────────────────────────────────────────────────────────
-
-image = (
-    modal.Image.debian_slim(python_version="3.11")
-    .add_local_python_source("helpers", "models", copy=True)
-    .apt_install("aria2")
-    .pip_install("huggingface_hub")
-)
-
-app = modal.App("comfy-sync", image=image)
+app = modal.App("comfy-sync", image=_sync_image)
 
 
-# ── Remote function: upload + link local models ──────────────────────────
+# ── Remote function: copy local models to volume + create symlinks ──────
 
 
 @app.function(
     cpu=2,
     memory=4096,
     volumes={"/cache": vol},
-    mounts=_local_mounts,
-    timeout=3600,  # 1 hour timeout for large files
+    timeout=3600,  # 1 hour for large files
 )
 def upload_and_link_local_models(models_list: list[dict]) -> dict:
-    """Copy mounted local model files to the Volume and create symlinks.
+    """Copy model files from the image to the Volume and create symlinks.
+
+    The local model files were added to the image via Image.add_local_file()
+    and are available at /local_models/<filename>.
 
     Returns a dict with verification results for each file.
     """
@@ -111,8 +111,8 @@ def upload_and_link_local_models(models_list: list[dict]) -> dict:
 
         src = Path(f"/local_models/{filename}")
         if not src.exists():
-            print(f"  ❌ Not found in mount: {filename}")
-            results[filename] = {"ok": False, "error": "not in mount"}
+            print(f"  ❌ Not found in image: {filename}")
+            results[filename] = {"ok": False, "error": "not in image"}
             continue
 
         src_size = src.stat().st_size
@@ -149,7 +149,8 @@ def upload_and_link_local_models(models_list: list[dict]) -> dict:
 
     # Commit volume changes
     vol.commit()
-    print(f"  💾 Volume committed ({len([r for r in results.values() if r.get('ok')])} files)")
+    ok_count = len([r for r in results.values() if r.get("ok")])
+    print(f"  💾 Volume committed ({ok_count}/{len(models_list)} files)")
     return results
 
 
@@ -183,7 +184,7 @@ def main() -> None:
     """Local entrypoint — uploads local models, then syncs HuggingFace models."""
 
     # ── Step 1: Upload + link local models ───────────────────────────────
-    if models_to_sync and _local_mounts:
+    if models_to_sync:
         print(f"\n{'='*60}")
         print(f"📦 Step 1: Uploading {len(models_to_sync)} local model(s) to Volume")
         print(f"{'='*60}\n")
@@ -206,8 +207,6 @@ def main() -> None:
         if fail_count > 0:
             print(f"\n⚠️ {fail_count} file(s) failed to upload!")
 
-    elif models_to_sync and not _local_mounts:
-        print("\n⚠️ Models selected but no local files found to mount!")
     else:
         print("\nℹ️ No local models selected in config.json")
 
