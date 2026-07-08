@@ -119,9 +119,11 @@ class ComfyWorker:
         async with httpx.AsyncClient() as client:
             resp = await client.post(
                 "http://127.0.0.1:8000/prompt",
-                json={"prompt": workflow},
+                json={"prompt": workflow, "client_id": "modal-gateway"},
             )
-            resp.raise_for_status()
+            if resp.status_code != 200:
+                print(f"[ComfyWorker] /prompt error {resp.status_code}: {resp.text}")
+                resp.raise_for_status()
             return resp.json()
 
     @modal.method()
@@ -135,7 +137,9 @@ class ComfyWorker:
             resp = await client.get(
                 f"http://127.0.0.1:8000/history/{job_id}",
             )
-            resp.raise_for_status()
+            if resp.status_code != 200:
+                print(f"[ComfyWorker] /history error {resp.status_code}: {resp.text}")
+                resp.raise_for_status()
             return resp.json()
 
     @modal.method()
@@ -164,7 +168,9 @@ class ComfyWorker:
                     "type": image_type,
                 },
             )
-            resp.raise_for_status()
+            if resp.status_code != 200:
+                print(f"[ComfyWorker] /upload/image error {resp.status_code}: {resp.text}")
+                resp.raise_for_status()
             return resp.json()
 
     @modal.method()
@@ -202,7 +208,9 @@ class ComfyWorker:
                     "type": view_type,
                 },
             )
-            resp.raise_for_status()
+            if resp.status_code != 200:
+                print(f"[ComfyWorker] /view error {resp.status_code}: {resp.text}")
+                resp.raise_for_status()
             return {
                 "data": base64.b64encode(resp.content).decode("ascii"),
                 "content_type": resp.headers.get("content-type", "application/octet-stream"),
