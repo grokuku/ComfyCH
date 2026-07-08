@@ -405,6 +405,13 @@
                 showLoading('☁️  Transfert des fichiers vers ' + currentGpu + '...');
                 var enrichedWorkflow = await encodeLocalImages(workflow);
 
+                // In new ComfyUI, queuePrompt receives { output: <api_format>, workflow: <ui_format> }
+                // We need the API format (output key) to send to the remote ComfyUI
+                if (enrichedWorkflow && enrichedWorkflow.output && typeof enrichedWorkflow.output === 'object') {
+                    console.log('Modal Gateway: detected new ComfyUI format, extracting output key');
+                    enrichedWorkflow = enrichedWorkflow.output;
+                }
+
                 console.log('Modal Gateway: workflow keys =', Object.keys(enrichedWorkflow));
                 console.log('Modal Gateway: workflow has SaveImage?', JSON.stringify(enrichedWorkflow).includes('SaveImage'));
                 console.log('Modal Gateway: workflow sample =', JSON.stringify(enrichedWorkflow).substring(0, 500));
