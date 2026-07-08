@@ -111,7 +111,7 @@ async def generate(req: GenerateRequest):
 
     try:
         # ── 1. Envoyer le workflow et récupérer le prompt_id ──────────────
-        prompt_result = await worker.prompt.remote(req.workflow)
+        prompt_result = await worker.prompt.remote.aio(req.workflow)
         prompt_id = prompt_result.get("prompt_id")
         if not prompt_id:
             return JSONResponse(
@@ -125,7 +125,7 @@ async def generate(req: GenerateRequest):
         for attempt in range(max_attempts):
             await asyncio.sleep(1)
             try:
-                history = await worker.history.remote(prompt_id)
+                history = await worker.history.remote.aio(prompt_id)
                 if isinstance(history, dict) and prompt_id in history:
                     history_data = history[prompt_id]
                     outputs = history_data.get("outputs", {})
@@ -149,7 +149,7 @@ async def generate(req: GenerateRequest):
                             filename = item["filename"]
                             subfolder = item.get("subfolder", "")
                             try:
-                                img_data = await worker.view.remote(
+                                img_data = await worker.view.remote.aio(
                                     filename, subfolder, "output"
                                 )
                                 if img_data and "data" in img_data:
@@ -196,7 +196,7 @@ async def upload_image(request: Request):
     content = await file.read()
     filename = form.get("filename", file.filename or "input.png")
 
-    result = await worker.upload_image.remote(content, filename)
+    result = await worker.upload_image.remote.aio(content)
     return result
 
 
@@ -221,7 +221,7 @@ async def view_image(
         return JSONResponse({"error": f"Unknown GPU: {gpu}"}, status_code=400)
 
     worker = worker_cls()
-    result = await worker.view.remote(filename, subfolder, view_type)
+    result = await worker.view.remote.aio(filename, subfolder, view_type)
     # Le worker renvoie { "data": "<base64>", "content_type": "...", "filename": "..." }
     binary = base64.b64decode(result["data"])
     media_type = result.get("content_type", "image/png")
@@ -237,7 +237,7 @@ async def get_history(job_id: str, gpu: str | None = None):
         return JSONResponse({"error": f"Unknown GPU: {gpu}"}, status_code=400)
 
     worker = worker_cls()
-    result = await worker.history.remote(job_id)
+    result = await worker.history.remote.aio(job_id)
     return result
 
 
