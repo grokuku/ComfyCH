@@ -24,7 +24,7 @@
         STORAGE_KEY: 'modal-gateway-mode',
 
         /** Timeout par défaut pour les requêtes vers Modal (en ms). */
-        TIMEOUT_MS: 120000, // 2 minutes — génération d'image longue
+        TIMEOUT_MS: 300000, // 5 minutes — workflows longs (FLUX, vidéo, cold start)
 
         /** Intervalle entre les tentatives d'interception de l'API (en ms). */
         RETRY_INTERVAL: 800,
