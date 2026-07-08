@@ -115,11 +115,23 @@ class ComfyWorker:
 
         Accepts a workflow JSON object and returns the prompt result
         (including the ``prompt_id``).  Called by the router via ``.remote()``.
+
+        Non-node keys (metadata like ``"workflow"``, ``"extra_data"``,
+        ``"version"``, etc.) are filtered out so that ComfyUI does not
+        try to parse them as nodes and fail with a ``missing_node_type``
+        error.
         """
+        # Filter out non-node keys (metadata like "workflow", "extra_data", "version", etc.)
+        clean_workflow = {
+            k: v for k, v in workflow.items()
+            if isinstance(v, dict) and "class_type" in v
+        }
+        if len(clean_workflow) != len(workflow):
+            print(f"[ComfyWorker] Filtered {len(workflow) - len(clean_workflow)} non-node keys from workflow")
         async with httpx.AsyncClient() as client:
             resp = await client.post(
                 "http://127.0.0.1:8000/prompt",
-                json={"prompt": workflow, "client_id": "modal-gateway"},
+                json={"prompt": clean_workflow, "client_id": "modal-gateway"},
             )
             if resp.status_code != 200:
                 error_text = resp.text

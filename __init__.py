@@ -32,6 +32,8 @@ DEFAULT_CONFIG = {
     "api_key": "",
     "last_sync": None,
     "last_deploy": None,
+    "custom_nodes": [],
+    "custom_nodes_ext": [],
 }
 
 
@@ -145,6 +147,55 @@ def _check_volume_exists() -> bool:
         return False
 
 
+def _detect_custom_nodes() -> list[dict]:
+    """Scan the local ComfyUI custom_nodes/ directory for installed nodes."""
+    custom_nodes_dir = PROJECT_ROOT.parent
+    results: list[dict] = []
+
+    if not custom_nodes_dir.is_dir():
+        print(f"[Modal Gateway] custom_nodes dir not found: {custom_nodes_dir}")
+        return results
+
+    for entry in sorted(custom_nodes_dir.iterdir()):
+        if not entry.is_dir():
+            continue
+        name = entry.name
+        if name.startswith(".") or name.startswith("__"):
+            continue
+        if name == PROJECT_ROOT.name:
+            continue
+
+        git_config_path = entry / ".git" / "config"
+        git_url = None
+        has_git = False
+
+        if git_config_path.is_file():
+            has_git = True
+            try:
+                content = git_config_path.read_text(errors="replace")
+                in_origin = False
+                for line in content.splitlines():
+                    stripped = line.strip()
+                    if stripped.startswith("[remote"):
+                        in_origin = '"origin"' in stripped
+                        continue
+                    if in_origin and stripped.startswith("url"):
+                        parts = stripped.split("=", 1)
+                        if len(parts) == 2:
+                            git_url = parts[1].strip()
+                        break
+            except OSError:
+                pass
+
+        results.append({
+            "name": name,
+            "git_url": git_url,
+            "has_git": has_git,
+        })
+
+    return results
+
+
 # ─── Initialisation : patcher PromptServer.add_routes ───
 
 try:
@@ -251,10 +302,51 @@ if PromptServer is not None:
                 pass
             return response
 
+        async def get_plugins_detect(request):
+            plugins = _detect_custom_nodes()
+            return web.json_response({"plugins": plugins})
+
+        async def get_plugins(request):
+            config = load_config()
+            return web.json_response({
+                "custom_nodes": config.get("custom_nodes", []),
+                "custom_nodes_ext": config.get("custom_nodes_ext", []),
+            })
+
+        async def post_plugins(request):
+            try:
+                data = await request.json()
+            except Exception:
+                return web.json_response(
+                    {"ok": False, "error": "Invalid JSON"}, status=400
+                )
+            custom_nodes = data.get("custom_nodes", [])
+            custom_nodes_ext = data.get("custom_nodes_ext", [])
+            if not isinstance(custom_nodes, list):
+                return web.json_response(
+                    {"ok": False, "error": "custom_nodes must be a list"}, status=400
+                )
+            if not isinstance(custom_nodes_ext, list):
+                return web.json_response(
+                    {"ok": False, "error": "custom_nodes_ext must be a list"}, status=400
+                )
+            save_config({
+                "custom_nodes": custom_nodes,
+                "custom_nodes_ext": custom_nodes_ext,
+            })
+            return web.json_response({
+                "ok": True,
+                "custom_nodes": custom_nodes,
+                "custom_nodes_ext": custom_nodes_ext,
+            })
+
         # Ensuite nos routes Modal Gateway
         routes = [
             ("GET", "/api/modal/config", get_config),
             ("POST", "/api/modal/config", post_config),
+            ("GET", "/api/modal/plugins/detect", get_plugins_detect),
+            ("GET", "/api/modal/plugins", get_plugins),
+            ("POST", "/api/modal/plugins", post_plugins),
             ("GET", "/api/modal/status", get_status),
             ("POST", "/api/modal/sync", post_sync),
             ("POST", "/api/modal/deploy", post_deploy),

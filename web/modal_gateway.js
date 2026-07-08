@@ -818,6 +818,51 @@
             '.modal-log-output::-webkit-scrollbar-thumb {',
             '  background: #555; border-radius: 3px;',
             '}',
+            '',
+            // ─── Plugins detection section ───
+            '.modal-plugins-list {',
+            '  max-height: 280px; overflow-y: auto;',
+            '  border: 1px solid #3a3a3e; border-radius: 8px;',
+            '  padding: 8px; margin-top: 8px; background: #1a1a1e;',
+            '}',
+            '.modal-plugin-item {',
+            '  display: flex; align-items: flex-start; gap: 8px;',
+            '  padding: 8px 6px; border-bottom: 1px solid #2e2e32;',
+            '  cursor: pointer; transition: background 0.15s;',
+            '}',
+            '.modal-plugin-item:last-child { border-bottom: none; }',
+            '.modal-plugin-item:hover { background: #252530; }',
+            '.modal-plugin-item input[type="checkbox"] {',
+            '  margin-top: 3px; flex-shrink: 0; cursor: pointer;',
+            '  width: 16px; height: 16px; accent-color: #4a4aff;',
+            '}',
+            '.modal-plugin-item-content { flex: 1; min-width: 0; }',
+            '.modal-plugin-item-name {',
+            '  font-size: 13px; font-weight: 600; color: #e0e0e0;',
+            '}',
+            '.modal-plugin-item-url {',
+            '  font-size: 11px; color: #777; word-break: break-all;',
+            '  margin-top: 2px; font-family: "Courier New", monospace;',
+            '}',
+            '.modal-plugin-item-nogit {',
+            '  font-size: 11px; color: #c0a030; margin-top: 2px;',
+            '}',
+            '.modal-plugin-actions {',
+            '  display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap;',
+            '}',
+            '.modal-plugin-note {',
+            '  font-size: 11px; color: #888; margin-top: 10px;',
+            '  padding: 8px 10px; background: #1e2a1e; border-radius: 6px;',
+            '  border-left: 3px solid #4a8a4a;',
+            '}',
+            '.modal-plugin-loading {',
+            '  font-size: 13px; color: #aaa; text-align: center;',
+            '  padding: 24px;',
+            '}',
+            '.modal-plugin-empty {',
+            '  font-size: 13px; color: #777; text-align: center;',
+            '  padding: 20px; font-style: italic;',
+            '}',
         ].join('\n');
         document.head.appendChild(style);
         console.log('Modal Gateway: styles injectés');
@@ -996,6 +1041,19 @@
             '        <div class="status-item">🌐 API configurée : ' + (status.api_configured ? '✅' : '❌') + '</div>',
             '      </div>',
             '    </section>',
+            '    <section>',
+            '      <h3>🧩 Custom Nodes</h3>',
+            '      <p style="font-size:12px;color:#999;margin:0 0 8px 0;">Détectez vos custom nodes locaux et synchronisez-les vers Modal.</p>',
+            '      <div class="modal-plugin-actions">',
+            '        <button id="cfg-detect-plugins" class="modal-btn modal-btn-action">🔄 Détecter mes nodes</button>',
+            '        <button id="cfg-save-plugins" class="modal-btn modal-btn-primary" disabled>💾 Save Plugins</button>',
+            '      </div>',
+            '      <div id="modal-plugins-list" class="modal-plugins-list" style="display:none;">',
+            '      </div>',
+            '      <div id="modal-plugins-loading" class="modal-plugin-loading" style="display:none;">⏳ Scan en cours...</div>',
+            '      <div id="modal-plugins-empty" class="modal-plugin-empty" style="display:none;">Aucun node détecté.</div>',
+            '      <div class="modal-plugin-note">ℹ️ Les changements nécessitent un <strong>redeploy</strong> (bouton 🚀 Deploy API) pour prendre effet sur Modal.</div>',
+            '    </section>',
             '    <section id="modal-log-section" style="display:none;">',
             '      <h3>📋 Logs</h3>',
             '      <pre id="modal-log-output" class="modal-log-output"></pre>',
@@ -1035,6 +1093,179 @@
 
         document.getElementById('cfg-run-sync').onclick = function () { runOperation('sync'); };
         document.getElementById('cfg-run-deploy').onclick = function () { runOperation('deploy'); };
+
+        var detectedPlugins = [];
+        var savedPlugins = null;
+
+        document.getElementById('cfg-detect-plugins').onclick = async function () {
+            var btn = document.getElementById('cfg-detect-plugins');
+            var listEl = document.getElementById('modal-plugins-list');
+            var loadingEl = document.getElementById('modal-plugins-loading');
+            var emptyEl = document.getElementById('modal-plugins-empty');
+            var saveBtn = document.getElementById('cfg-save-plugins');
+
+            btn.disabled = true;
+            btn.textContent = '⏳ Scan...';
+            listEl.style.display = 'none';
+            emptyEl.style.display = 'none';
+            loadingEl.style.display = 'block';
+
+            try {
+                if (savedPlugins === null) {
+                    try {
+                        var savedResp = await fetch('/api/modal/plugins');
+                        if (savedResp.ok) {
+                            savedPlugins = await savedResp.json();
+                        } else {
+                            savedPlugins = { custom_nodes: [], custom_nodes_ext: [] };
+                        }
+                    } catch (e) {
+                        savedPlugins = { custom_nodes: [], custom_nodes_ext: [] };
+                    }
+                }
+
+                var resp = await fetch('/api/modal/plugins/detect');
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                var data = await resp.json();
+                detectedPlugins = data.plugins || [];
+
+                loadingEl.style.display = 'none';
+                btn.disabled = false;
+                btn.textContent = '🔄 Détecter mes nodes';
+
+                if (detectedPlugins.length === 0) {
+                    emptyEl.style.display = 'block';
+                    saveBtn.disabled = true;
+                    return;
+                }
+
+                var savedExtUrls = {};
+                if (savedPlugins && savedPlugins.custom_nodes_ext) {
+                    for (var s = 0; s < savedPlugins.custom_nodes_ext.length; s++) {
+                        var p = savedPlugins.custom_nodes_ext[s];
+                        if (p.url) savedExtUrls[p.url] = p;
+                    }
+                }
+
+                listEl.innerHTML = '';
+                for (var i = 0; i < detectedPlugins.length; i++) {
+                    (function (plugin) {
+                        var item = document.createElement('label');
+                        item.className = 'modal-plugin-item';
+
+                        var checkbox = document.createElement('input');
+                        checkbox.type = 'checkbox';
+                        checkbox.dataset.pluginName = plugin.name;
+                        checkbox.dataset.pluginUrl = plugin.git_url || '';
+                        if (plugin.git_url && savedExtUrls[plugin.git_url]) {
+                            checkbox.checked = true;
+                        }
+
+                        var content = document.createElement('div');
+                        content.className = 'modal-plugin-item-content';
+
+                        var nameEl = document.createElement('div');
+                        nameEl.className = 'modal-plugin-item-name';
+                        nameEl.textContent = plugin.name;
+                        content.appendChild(nameEl);
+
+                        if (plugin.has_git && plugin.git_url) {
+                            var urlEl = document.createElement('div');
+                            urlEl.className = 'modal-plugin-item-url';
+                            urlEl.textContent = plugin.git_url;
+                            content.appendChild(urlEl);
+                        } else {
+                            var noGitEl = document.createElement('div');
+                            noGitEl.className = 'modal-plugin-item-nogit';
+                            noGitEl.textContent = '⚠️ Pas de dépôt git — ne peut pas être synchronisé automatiquement';
+                            content.appendChild(noGitEl);
+                            checkbox.disabled = true;
+                            checkbox.style.opacity = '0.4';
+                        }
+
+                        item.appendChild(checkbox);
+                        item.appendChild(content);
+                        listEl.appendChild(item);
+                    })(detectedPlugins[i]);
+                }
+
+                listEl.style.display = 'block';
+                saveBtn.disabled = false;
+
+            } catch (e) {
+                loadingEl.style.display = 'none';
+                btn.disabled = false;
+                btn.textContent = '🔄 Détecter mes nodes';
+                showNotification('❌ Erreur détection nodes : ' + e.message, 'error');
+            }
+        };
+
+        document.getElementById('cfg-save-plugins').onclick = async function () {
+            var saveBtn = document.getElementById('cfg-save-plugins');
+            var listEl = document.getElementById('modal-plugins-list');
+            saveBtn.disabled = true;
+            saveBtn.textContent = '⏳ Sauvegarde...';
+
+            try {
+                var checkboxes = listEl.querySelectorAll('input[type="checkbox"]:not(:disabled)');
+                var customNodesExt = [];
+
+                for (var i = 0; i < checkboxes.length; i++) {
+                    var cb = checkboxes[i];
+                    if (cb.checked && cb.dataset.pluginUrl) {
+                        var existing = null;
+                        if (savedPlugins && savedPlugins.custom_nodes_ext) {
+                            for (var j = 0; j < savedPlugins.custom_nodes_ext.length; j++) {
+                                if (savedPlugins.custom_nodes_ext[j].url === cb.dataset.pluginUrl) {
+                                    existing = savedPlugins.custom_nodes_ext[j];
+                                    break;
+                                }
+                            }
+                        }
+                        if (existing) {
+                            customNodesExt.push(existing);
+                        } else {
+                            customNodesExt.push({
+                                url: cb.dataset.pluginUrl,
+                            });
+                        }
+                    }
+                }
+
+                var customNodes = (savedPlugins && savedPlugins.custom_nodes) || [];
+
+                var resp = await fetch('/api/modal/plugins', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        custom_nodes: customNodes,
+                        custom_nodes_ext: customNodesExt,
+                    }),
+                });
+
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+
+                savedPlugins = {
+                    custom_nodes: customNodes,
+                    custom_nodes_ext: customNodesExt,
+                };
+
+                saveBtn.textContent = '✅ Sauvegardé';
+                showNotification(
+                    '✅ ' + customNodesExt.length + ' node(s) sauvegardé(s). Redeploy nécessaire.',
+                    'success'
+                );
+                setTimeout(function () {
+                    saveBtn.disabled = false;
+                    saveBtn.textContent = '💾 Save Plugins';
+                }, 2000);
+
+            } catch (e) {
+                saveBtn.disabled = false;
+                saveBtn.textContent = '💾 Save Plugins';
+                showNotification('❌ Erreur sauvegarde : ' + e.message, 'error');
+            }
+        };
     }
 
     // ─── Initialisation via l'API d'extension ComfyUI ───────────────────────

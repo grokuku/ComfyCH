@@ -9,6 +9,7 @@ container).  This image **must not** download any models.
 
 from __future__ import annotations
 
+import json
 import shlex
 from pathlib import Path
 
@@ -20,6 +21,17 @@ try:
     from plugins import comfy_plugins_ext
 except ImportError:
     comfy_plugins_ext = []
+
+_CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
+if _CONFIG_PATH.exists():
+    try:
+        _saved = json.loads(_CONFIG_PATH.read_text())
+        if _saved.get("custom_nodes"):
+            comfy_plugins = list(_saved["custom_nodes"])
+        if _saved.get("custom_nodes_ext"):
+            comfy_plugins_ext = list(_saved["custom_nodes_ext"])
+    except (json.JSONDecodeError, OSError):
+        pass
 
 root_dir = Path(__file__).parent
 
