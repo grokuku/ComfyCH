@@ -66,6 +66,40 @@ for candidate in _LOCAL_MODELS_CANDIDATES:
         break
 
 
+# ── Remote function: clear + verify volume files ─────────────────────────
+
+
+@app.function(
+    cpu=1,
+    memory=2048,
+    volumes={"/cache": vol},
+)
+def manage_volume_files(filenames: list[str], mode: str = "clear") -> dict:
+    """Clear existing files from volume or verify they exist.
+
+    mode="clear": delete files that already exist (to avoid FileExistsError on upload)
+    mode="verify": check that files exist and report their sizes
+    """
+    results = {}
+    for filename in filenames:
+        path = Path("/cache") / filename
+        if mode == "clear":
+            if path.exists():
+                path.unlink()
+                print(f"  🗑️ Deleted existing: {filename}")
+            results[filename] = {"cleared": True}
+        elif mode == "verify":
+            exists = path.exists()
+            size_mb = round(path.stat().st_size / (1024 * 1024), 1) if exists else 0
+            results[filename] = {"exists": exists, "size_mb": size_mb}
+            if exists:
+                print(f"  ✅ Verified: {filename} ({size_mb} MB)")
+            else:
+                print(f"  ❌ MISSING: {filename}")
+    vol.commit()
+    return results
+
+
 # ── Remote function: create symlinks for uploaded local models ───────────
 
 
@@ -127,8 +161,15 @@ def main() -> None:
 
     # ── Step 1: Upload local model files to the Volume ───────────────────
     if local_models_dir and models_to_sync:
+        filenames = [m["filename"] for m in models_to_sync]
+
+        # 1a. Clear existing files to avoid FileExistsError
+        print(f"🧹 Clearing existing files on Volume...")
+        manage_volume_files.remote(filenames, mode="clear")
+
+        # 1b. Upload local files
         print(f"📦 Uploading {len(models_to_sync)} local model(s) to Volume...")
-        uploaded = 0
+        total_mb = 0
         with vol.batch_upload() as batch:
             for model in models_to_sync:
                 filename = model["filename"]
@@ -140,12 +181,24 @@ def main() -> None:
                     continue
 
                 size_mb = model_path.stat().st_size / (1024 * 1024)
-                print(f"  📤 Uploading: {filename} ({size_mb:.0f} MB)")
-                # Upload to volume root (symlinks will point to /cache/filename)
+                total_mb += size_mb
+                print(f"  📤 Adding to batch: {filename} ({size_mb:.0f} MB)")
                 batch.put_file(model_path, filename)
-                uploaded += 1
 
-        print(f"  ✅ Uploaded {uploaded} file(s) to Volume")
+        print(f"  📦 Total to upload: {total_mb:.0f} MB — uploading to Modal...")
+
+        # 1c. Verify files are on the volume
+        print(f"🔍 Verifying uploaded files...")
+        verification = manage_volume_files.remote(filenames, mode="verify")
+        all_ok = True
+        for filename, info in verification.items():
+            if not info.get("exists"):
+                print(f"  ❌ UPLOAD FAILED: {filename} not found on volume!")
+                all_ok = False
+        if all_ok:
+            print(f"  ✅ All {len(filenames)} file(s) verified on Volume")
+        else:
+            print(f"  ⚠️ Some files missing — sync may be incomplete")
     else:
         if not models_to_sync:
             print("ℹ️ No local models selected in config.json")
