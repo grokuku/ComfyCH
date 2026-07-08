@@ -405,6 +405,10 @@
                 showLoading('☁️  Transfert des fichiers vers ' + currentGpu + '...');
                 var enrichedWorkflow = await encodeLocalImages(workflow);
 
+                console.log('Modal Gateway: workflow keys =', Object.keys(enrichedWorkflow));
+                console.log('Modal Gateway: workflow has SaveImage?', JSON.stringify(enrichedWorkflow).includes('SaveImage'));
+                console.log('Modal Gateway: workflow sample =', JSON.stringify(enrichedWorkflow).substring(0, 500));
+
                 // Étape 2 : envoyer le workflow à Modal
                 showLoading('☁️  Génération sur ' + currentGpu + ' en cours...\nPatiente un instant, le temps que le worker démarre.');
 

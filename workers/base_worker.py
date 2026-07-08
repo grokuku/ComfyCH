@@ -126,6 +126,9 @@ class ComfyWorker:
             k: v for k, v in workflow.items()
             if isinstance(v, dict) and "class_type" in v
         }
+        print(f"[ComfyWorker] Workflow: {len(workflow)} keys in, {len(clean_workflow)} kept. Keys filtered out: {set(workflow.keys()) - set(clean_workflow.keys())}")
+        print(f"[ComfyWorker] Clean workflow keys: {list(clean_workflow.keys())}")
+        print(f"[ComfyWorker] Has SaveImage? {'SaveImage' in str(clean_workflow)}")
         if len(clean_workflow) != len(workflow):
             print(f"[ComfyWorker] Filtered {len(workflow) - len(clean_workflow)} non-node keys from workflow")
         async with httpx.AsyncClient() as client:
