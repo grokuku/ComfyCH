@@ -140,7 +140,7 @@ def _check_modal_auth() -> bool:
 def _check_volume_exists() -> bool:
     try:
         result = subprocess.run(
-            ["modal", "volume", "ls"],
+            ["modal", "volume", "list"],
             capture_output=True, text=True, timeout=10,
         )
         return "comfy-models" in result.stdout

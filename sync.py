@@ -2,7 +2,8 @@
 
 Supports two sync modes:
 1. **Local models** — files detected in the local ComfyUI/models/ directory,
-   selected via the Modal Gateway UI, and uploaded to the Volume.
+   selected via the Modal Gateway UI, mounted into the container and copied
+   to the Volume.
 2. **HuggingFace models** — files listed in ``models.py``, downloaded via
    ``huggingface_hub``.
 
@@ -28,16 +29,6 @@ from helpers import (
 from models import models, models_ext
 
 vol = modal.Volume.from_name("comfy-models", create_if_missing=True)
-
-# Minimal CPU image with just our local sources and huggingface_hub.
-image = (
-    modal.Image.debian_slim(python_version="3.11")
-    .add_local_python_source("helpers", "models", copy=True)
-    .apt_install("aria2")
-    .pip_install("huggingface_hub")
-)
-
-app = modal.App("comfy-sync", image=image)
 
 # ── Read config.json for local models to sync ────────────────────────────
 
@@ -65,60 +56,86 @@ for candidate in _LOCAL_MODELS_CANDIDATES:
         local_models_dir = candidate
         break
 
+# ── Build mounts for local model files ───────────────────────────────────
+# Each selected model file is mounted into the container at /local_models/<filename>
 
-# ── Remote function: clear + verify volume files ─────────────────────────
+_local_mounts: list[modal.Mount] = []
+if local_models_dir and models_to_sync:
+    for model in models_to_sync:
+        filename = model["filename"]
+        model_dir = model["model_dir"]
+        model_path = local_models_dir / model_dir / filename
+
+        if not model_path.exists():
+            print(f"⚠️ Local model not found: {model_path}")
+            continue
+
+        size_mb = model_path.stat().st_size / (1024 * 1024)
+        print(f"📦 Mounting: {filename} ({size_mb:.0f} MB) from {model_dir}/")
+        _local_mounts.append(
+            modal.Mount.from_file(model_path, f"/local_models/{filename}")
+        )
+
+# ── Image ────────────────────────────────────────────────────────────────
+
+image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .add_local_python_source("helpers", "models", copy=True)
+    .apt_install("aria2")
+    .pip_install("huggingface_hub")
+)
+
+app = modal.App("comfy-sync", image=image)
+
+
+# ── Remote function: upload + link local models ──────────────────────────
 
 
 @app.function(
-    cpu=1,
-    memory=2048,
+    cpu=2,
+    memory=4096,
     volumes={"/cache": vol},
+    mounts=_local_mounts,
+    timeout=3600,  # 1 hour timeout for large files
 )
-def manage_volume_files(filenames: list[str], mode: str = "clear") -> dict:
-    """Clear existing files from volume or verify they exist.
+def upload_and_link_local_models(models_list: list[dict]) -> dict:
+    """Copy mounted local model files to the Volume and create symlinks.
 
-    mode="clear": delete files that already exist (to avoid FileExistsError on upload)
-    mode="verify": check that files exist and report their sizes
+    Returns a dict with verification results for each file.
     """
     results = {}
-    for filename in filenames:
-        path = Path("/cache") / filename
-        if mode == "clear":
-            if path.exists():
-                path.unlink()
-                print(f"  🗑️ Deleted existing: {filename}")
-            results[filename] = {"cleared": True}
-        elif mode == "verify":
-            exists = path.exists()
-            size_mb = round(path.stat().st_size / (1024 * 1024), 1) if exists else 0
-            results[filename] = {"exists": exists, "size_mb": size_mb}
-            if exists:
-                print(f"  ✅ Verified: {filename} ({size_mb} MB)")
-            else:
-                print(f"  ❌ MISSING: {filename}")
-    vol.commit()
-    return results
 
-
-# ── Remote function: create symlinks for uploaded local models ───────────
-
-
-@app.function(
-    cpu=1,
-    memory=2048,
-    volumes={"/cache": vol},
-)
-def link_local_models(models_list: list[dict]) -> None:
-    """Create symlinks in ComfyUI model dirs for files already in the Volume."""
     for model in models_list:
         filename = model["filename"]
         model_dir = model["model_dir"]
 
-        cache_path = Path("/cache") / filename
-        if not cache_path.exists():
-            print(f"  ⚠️ Not in volume: {filename} — skipping")
+        src = Path(f"/local_models/{filename}")
+        if not src.exists():
+            print(f"  ❌ Not found in mount: {filename}")
+            results[filename] = {"ok": False, "error": "not in mount"}
             continue
 
+        src_size = src.stat().st_size
+        size_mb = src_size / (1024 * 1024)
+
+        # Copy to volume
+        dst = Path("/cache") / filename
+        print(f"  📤 Copying to volume: {filename} ({size_mb:.0f} MB)")
+
+        # Remove existing file on volume if any
+        if dst.exists() or dst.is_symlink():
+            dst.unlink()
+
+        shutil.copy2(str(src), str(dst))
+
+        # Verify copy
+        dst_size = dst.stat().st_size
+        if dst_size != src_size:
+            print(f"  ❌ Size mismatch: {filename} (expected {src_size}, got {dst_size})")
+            results[filename] = {"ok": False, "error": "size mismatch"}
+            continue
+
+        # Create symlink in ComfyUI model directory
         target_dir = resolve_model_dir(model_dir)
         target_dir.mkdir(parents=True, exist_ok=True)
         target_path = target_dir / filename
@@ -126,8 +143,14 @@ def link_local_models(models_list: list[dict]) -> None:
         if target_path.exists() or target_path.is_symlink():
             target_path.unlink()
 
-        target_path.symlink_to(cache_path)
-        print(f"  ✅ Linked: {filename} -> {target_path}")
+        target_path.symlink_to(dst)
+        print(f"  ✅ {filename}: copied ({size_mb:.0f} MB) + linked -> {target_path}")
+        results[filename] = {"ok": True, "size_mb": round(size_mb, 1)}
+
+    # Commit volume changes
+    vol.commit()
+    print(f"  💾 Volume committed ({len([r for r in results.values() if r.get('ok')])} files)")
+    return results
 
 
 # ── Remote function: download HuggingFace + external models ──────────────
@@ -157,62 +180,44 @@ def sync_hf_models() -> None:
 
 @app.local_entrypoint()
 def main() -> None:
-    """Local entrypoint — uploads local models, then links them on the Volume."""
+    """Local entrypoint — uploads local models, then syncs HuggingFace models."""
 
-    # ── Step 1: Upload local model files to the Volume ───────────────────
-    if local_models_dir and models_to_sync:
-        filenames = [m["filename"] for m in models_to_sync]
+    # ── Step 1: Upload + link local models ───────────────────────────────
+    if models_to_sync and _local_mounts:
+        print(f"\n{'='*60}")
+        print(f"📦 Step 1: Uploading {len(models_to_sync)} local model(s) to Volume")
+        print(f"{'='*60}\n")
 
-        # 1a. Clear existing files to avoid FileExistsError
-        print(f"🧹 Clearing existing files on Volume...")
-        manage_volume_files.remote(filenames, mode="clear")
+        results = upload_and_link_local_models.remote(models_to_sync)
 
-        # 1b. Upload local files
-        print(f"📦 Uploading {len(models_to_sync)} local model(s) to Volume...")
-        total_mb = 0
-        with vol.batch_upload() as batch:
-            for model in models_to_sync:
-                filename = model["filename"]
-                model_dir = model["model_dir"]
-                model_path = local_models_dir / model_dir / filename
+        ok_count = sum(1 for r in results.values() if r.get("ok"))
+        fail_count = len(results) - ok_count
 
-                if not model_path.exists():
-                    print(f"  ⚠️ Not found locally: {model_path}")
-                    continue
+        print(f"\n📊 Results: {ok_count} OK, {fail_count} failed")
+        for filename, info in results.items():
+            status = "✅" if info.get("ok") else "❌"
+            size = info.get("size_mb", 0)
+            error = info.get("error", "")
+            if info.get("ok"):
+                print(f"  {status} {filename} ({size} MB)")
+            else:
+                print(f"  {status} {filename}: {error}")
 
-                size_mb = model_path.stat().st_size / (1024 * 1024)
-                total_mb += size_mb
-                print(f"  📤 Adding to batch: {filename} ({size_mb:.0f} MB)")
-                batch.put_file(model_path, filename)
+        if fail_count > 0:
+            print(f"\n⚠️ {fail_count} file(s) failed to upload!")
 
-        print(f"  📦 Total to upload: {total_mb:.0f} MB — uploading to Modal...")
-
-        # 1c. Verify files are on the volume
-        print(f"🔍 Verifying uploaded files...")
-        verification = manage_volume_files.remote(filenames, mode="verify")
-        all_ok = True
-        for filename, info in verification.items():
-            if not info.get("exists"):
-                print(f"  ❌ UPLOAD FAILED: {filename} not found on volume!")
-                all_ok = False
-        if all_ok:
-            print(f"  ✅ All {len(filenames)} file(s) verified on Volume")
-        else:
-            print(f"  ⚠️ Some files missing — sync may be incomplete")
+    elif models_to_sync and not _local_mounts:
+        print("\n⚠️ Models selected but no local files found to mount!")
     else:
-        if not models_to_sync:
-            print("ℹ️ No local models selected in config.json")
-        if not local_models_dir:
-            print("ℹ️ Local ComfyUI models/ directory not found")
+        print("\nℹ️ No local models selected in config.json")
 
-    # ── Step 2: Create symlinks on the Volume ────────────────────────────
-    if models_to_sync:
-        print("🔗 Creating symlinks in ComfyUI model directories...")
-        link_local_models.remote(models_to_sync)
-
-    # ── Step 3: Download HuggingFace models (from models.py) ─────────────
+    # ── Step 2: Download HuggingFace models (from models.py) ─────────────
     if models or models_ext:
-        print("📥 Downloading HuggingFace/external models...")
+        print(f"\n{'='*60}")
+        print(f"📥 Step 2: Downloading HuggingFace/external models")
+        print(f"{'='*60}\n")
         sync_hf_models.remote()
 
-    print("\n✅ Sync terminée !")
+    print(f"\n{'='*60}")
+    print("✅ Sync terminée !")
+    print(f"{'='*60}")
