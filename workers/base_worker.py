@@ -107,14 +107,13 @@ class ComfyWorker:
             except (ProcessLookupError, OSError):
                 pass
 
-    # ── Web endpoints (proxy to local ComfyUI API) ──────────────────────
+    # ── Proxy methods (called by the router via .remote()) ───────────────
 
-    @modal.fastapi_endpoint(method="POST")
     async def prompt(self, workflow: dict) -> dict:
         """Proxy to ComfyUI's ``POST /prompt``.
 
         Accepts a workflow JSON object and returns the prompt result
-        (including the ``prompt_id``).
+        (including the ``prompt_id``).  Called by the router via ``.remote()``.
         """
         async with httpx.AsyncClient() as client:
             resp = await client.post(
@@ -124,12 +123,11 @@ class ComfyWorker:
             resp.raise_for_status()
             return resp.json()
 
-    @modal.fastapi_endpoint(method="GET")
     async def history(self, job_id: str) -> dict:
         """Proxy to ComfyUI's ``GET /history/{job_id}``.
 
         Query parameter ``job_id`` is the prompt ID returned by ``/prompt``.
-        Returns the execution history for that prompt.
+        Returns the execution history for that prompt.  Called via ``.remote()``.
         """
         async with httpx.AsyncClient() as client:
             resp = await client.get(
@@ -138,12 +136,11 @@ class ComfyWorker:
             resp.raise_for_status()
             return resp.json()
 
-    @modal.fastapi_endpoint(method="POST")
     async def upload_image(self, image: bytes, subfolder: str = "", image_type: str = "input") -> dict:
         """Proxy to ComfyUI's ``POST /upload/image``.
 
         Accepts raw image bytes and optional metadata.  Returns the uploaded
-        image reference that can be used in a workflow.
+        image reference that can be used in a workflow.  Called via ``.remote()``.
 
         Parameters
         ----------
@@ -167,12 +164,11 @@ class ComfyWorker:
             resp.raise_for_status()
             return resp.json()
 
-    @modal.fastapi_endpoint(method="GET")
     async def view(self, filename: str, subfolder: str = "", view_type: str = "output") -> dict:
         """Proxy to ComfyUI's ``GET /view``.
 
         Retrieves a generated image or file from the ComfyUI output/input
-        directories.
+        directories.  Called via ``.remote()``.
 
         Parameters
         ----------
