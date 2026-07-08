@@ -147,6 +147,13 @@ def upload_and_link_local_models(models_list: list[dict]) -> dict:
         print(f"  ✅ {filename}: copied ({size_mb:.0f} MB) + linked -> {target_path}")
         results[filename] = {"ok": True, "size_mb": round(size_mb, 1)}
 
+    # Write manifest for workers to read at startup
+    import json as _json
+    manifest = {model["filename"]: model["model_dir"] for model in models_list if results.get(model["filename"], {}).get("ok")}
+    manifest_path = Path("/cache") / "model_manifest.json"
+    manifest_path.write_text(_json.dumps(manifest, indent=2))
+    print(f"  📝 Manifest written: {len(manifest)} entries")
+
     # Commit volume changes
     vol.commit()
     ok_count = len([r for r in results.values() if r.get("ok")])

@@ -31,6 +31,7 @@ from __future__ import annotations
 import socket
 import subprocess
 import time
+from pathlib import Path
 
 import httpx
 
@@ -90,10 +91,49 @@ class ComfyWorker:
         )
         wait_for_port(8000, timeout=300)
 
+        # ── Create model symlinks from volume manifest ────────────────
+        self._link_models_from_manifest()
+
+    def _link_models_from_manifest(self):
+        """Read /cache/model_manifest.json and create symlinks in ComfyUI model dirs."""
+        import json
+        manifest_path = Path("/cache") / "model_manifest.json"
+        if not manifest_path.exists():
+            print("[ComfyWorker] No model manifest found — skipping symlink creation")
+            return
+
+        try:
+            manifest = json.loads(manifest_path.read_text())
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"[ComfyWorker] Failed to read manifest: {e}")
+            return
+
+        models_root = Path("/root/comfy/ComfyUI/models")
+        linked = 0
+        for filename, model_dir in manifest.items():
+            cache_file = Path("/cache") / filename
+            if not cache_file.exists():
+                print(f"[ComfyWorker] Model file not in volume: {filename}")
+                continue
+
+            target_dir = models_root / model_dir
+            target_dir.mkdir(parents=True, exist_ok=True)
+            target_path = target_dir / filename
+
+            if target_path.exists() or target_path.is_symlink():
+                target_path.unlink()
+
+            target_path.symlink_to(cache_file)
+            linked += 1
+
+        print(f"[ComfyWorker] Created {linked} model symlinks from manifest")
+
     @modal.enter(snap=False)
     def start_restore(self) -> None:
         """Wait for ComfyUI to be ready after restoring from a snapshot."""
         wait_for_port(8000, timeout=30)
+        # Also create symlinks on restore (in case volume changed since snapshot)
+        self._link_models_from_manifest()
         print("[ComfyWorker] App restored from snapshot!")
 
     @modal.exit()
