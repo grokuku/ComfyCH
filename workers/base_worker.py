@@ -122,8 +122,9 @@ class ComfyWorker:
                 json={"prompt": workflow, "client_id": "modal-gateway"},
             )
             if resp.status_code != 200:
-                print(f"[ComfyWorker] /prompt error {resp.status_code}: {resp.text}")
-                resp.raise_for_status()
+                error_text = resp.text
+                print(f"[ComfyWorker] /prompt error {resp.status_code}: {error_text}")
+                return {"error": f"ComfyUI returned {resp.status_code}: {error_text}"}
             return resp.json()
 
     @modal.method()
@@ -138,8 +139,9 @@ class ComfyWorker:
                 f"http://127.0.0.1:8000/history/{job_id}",
             )
             if resp.status_code != 200:
-                print(f"[ComfyWorker] /history error {resp.status_code}: {resp.text}")
-                resp.raise_for_status()
+                error_text = resp.text
+                print(f"[ComfyWorker] /history error {resp.status_code}: {error_text}")
+                return {"error": f"ComfyUI returned {resp.status_code}: {error_text}"}
             return resp.json()
 
     @modal.method()
@@ -169,8 +171,9 @@ class ComfyWorker:
                 },
             )
             if resp.status_code != 200:
-                print(f"[ComfyWorker] /upload/image error {resp.status_code}: {resp.text}")
-                resp.raise_for_status()
+                error_text = resp.text
+                print(f"[ComfyWorker] /upload/image error {resp.status_code}: {error_text}")
+                return {"error": f"ComfyUI returned {resp.status_code}: {error_text}"}
             return resp.json()
 
     @modal.method()
@@ -209,8 +212,9 @@ class ComfyWorker:
                 },
             )
             if resp.status_code != 200:
-                print(f"[ComfyWorker] /view error {resp.status_code}: {resp.text}")
-                resp.raise_for_status()
+                error_text = resp.text
+                print(f"[ComfyWorker] /view error {resp.status_code}: {error_text}")
+                return {"data": "", "content_type": "", "filename": filename, "error": f"ComfyUI /view returned {resp.status_code}: {error_text}"}
             return {
                 "data": base64.b64encode(resp.content).decode("ascii"),
                 "content_type": resp.headers.get("content-type", "application/octet-stream"),

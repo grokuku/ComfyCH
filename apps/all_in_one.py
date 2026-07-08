@@ -148,6 +148,8 @@ async def generate(req: GenerateRequest):
     try:
         # ── 1. Envoyer le workflow et récupérer le prompt_id ──────────────
         prompt_result = await worker.prompt.remote(req.workflow)
+        if prompt_result.get("error"):
+            return JSONResponse({"error": prompt_result["error"]}, status_code=500)
         prompt_id = prompt_result.get("prompt_id")
         if not prompt_id:
             return JSONResponse(
@@ -162,6 +164,8 @@ async def generate(req: GenerateRequest):
             await asyncio.sleep(1)
             try:
                 history = await worker.history.remote(prompt_id)
+                if isinstance(history, dict) and history.get("error"):
+                    return JSONResponse({"error": history["error"]}, status_code=500)
                 if isinstance(history, dict) and prompt_id in history:
                     history_data = history[prompt_id]
                     outputs = history_data.get("outputs", {})
@@ -188,6 +192,8 @@ async def generate(req: GenerateRequest):
                                 img_data = await worker.view.remote(
                                     filename, subfolder, "output"
                                 )
+                                if img_data and img_data.get("error"):
+                                    return JSONResponse({"error": img_data["error"]}, status_code=500)
                                 if img_data and "data" in img_data:
                                     images.append({
                                         "filename": filename,
