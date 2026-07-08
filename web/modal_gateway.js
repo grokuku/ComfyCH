@@ -494,35 +494,137 @@
     // ─── Affichage des images reçues dans le canvas ─────────────────────────
 
     /**
-     * Ouvre une image générée (base64) dans un nouvel onglet du navigateur.
+     * Affiche les images générées (base64) dans un overlay plein écran sur la page.
      *
-     * Au lieu de dessiner sur le canvas ComfyUI — ce qui casse la disposition
-     * du graphe (ratio, zoom, image plein écran par-dessus) — on ouvre simplement
-     * l'image dans un nouvel onglet où elle peut être visualisée à pleine taille
-     * et téléchargée.
+     * Au lieu d'utiliser window.open() avec une data URL — ce qui est bloqué par
+     * les popup blockers — on crée un overlay modal dans la page courante.
+     * Les images sont collectées au fur et à mesure et affichées quand la dernière
+     * arrive (isLast = true).
      *
      * @param {string} base64Data - Données de l'image encodées en base64 (sans préfixe).
      * @param {string} filename - Nom du fichier (pour référence / téléchargement).
-     * @param {boolean} [isLast=false] - Si true, ouvre l'image dans un nouvel onglet.
+     * @param {boolean} [isLast=false] - Si true, affiche l'overlay avec toutes les images collectées.
      */
     function displayImageInCanvas(base64Data, filename, isLast) {
-        // Open the generated image in a new tab instead of drawing on the ComfyUI canvas.
-        // Drawing on the canvas breaks the graph layout (ratio, zoom, etc).
-        var dataUrl = 'data:image/png;base64,' + base64Data;
+        // Store images and show overlay when the last one arrives
+        if (!window._modalGatewayImages) {
+            window._modalGatewayImages = [];
+        }
+        window._modalGatewayImages.push({
+            data: base64Data,
+            filename: filename || 'modal_output.png',
+        });
 
-        // Create a temporary link to open/download the image
-        var link = document.createElement('a');
-        link.href = dataUrl;
-        link.download = filename || 'modal_output.png';
-        link.target = '_blank';
+        if (!isLast) return;
 
-        // For single images, open in a new tab. For multiple, download them.
-        if (isLast) {
-            // Open the last (or only) image in a new tab
-            window.open(dataUrl, '_blank');
+        // Show the overlay with all collected images
+        var images = window._modalGatewayImages;
+        window._modalGatewayImages = []; // reset for next batch
+
+        // Remove any existing overlay
+        var existing = document.getElementById('modal-image-overlay');
+        if (existing) existing.remove();
+
+        var overlay = document.createElement('div');
+        overlay.id = 'modal-image-overlay';
+        overlay.style.cssText = [
+            'position: fixed', 'top: 0', 'left: 0', 'width: 100%', 'height: 100%',
+            'background: rgba(0,0,0,0.85)', 'z-index: 99999',
+            'display: flex', 'flex-direction: column', 'align-items: center', 'justify-content: center',
+            'padding: 20px', 'box-sizing: border-box', 'backdrop-filter: blur(4px)',
+        ].join(';') + ';';
+
+        // Header bar
+        var header = document.createElement('div');
+        header.style.cssText = [
+            'position: absolute', 'top: 0', 'left: 0', 'right: 0',
+            'display: flex', 'justify-content: space-between', 'align-items: center',
+            'padding: 16px 24px', 'box-sizing: border-box',
+        ].join(';') + ';';
+
+        var title = document.createElement('div');
+        title.style.cssText = 'color: #fff; font-size: 16px; font-family: sans-serif;';
+        title.textContent = '🖼️ Modal Gateway — ' + images.length + ' image(s) reçue(s)';
+
+        var closeBtn = document.createElement('button');
+        closeBtn.innerHTML = '✕';
+        closeBtn.style.cssText = [
+            'background: rgba(255,255,255,0.15)', 'border: none', 'color: #fff',
+            'font-size: 24px', 'cursor: pointer', 'padding: 4px 12px',
+            'border-radius: 6px', 'line-height: 1',
+        ].join(';') + ';';
+        closeBtn.onmouseover = function () { closeBtn.style.background = 'rgba(255,255,255,0.3)'; };
+        closeBtn.onmouseout = function () { closeBtn.style.background = 'rgba(255,255,255,0.15)'; };
+
+        header.appendChild(title);
+        header.appendChild(closeBtn);
+        overlay.appendChild(header);
+
+        // Image container (scrollable if multiple images)
+        var imgContainer = document.createElement('div');
+        imgContainer.style.cssText = [
+            'max-width: 90%', 'max-height: 85%', 'overflow-y: auto',
+            'display: flex', 'flex-direction: ' + (images.length > 1 ? 'column' : 'row'),
+            'gap: 16px', 'align-items: ' + (images.length > 1 ? 'center' : 'stretch'),
+            'padding-top: 60px',
+        ].join(';') + ';';
+
+        for (var i = 0; i < images.length; i++) {
+            (function (imgData, imgFilename) {
+                var wrapper = document.createElement('div');
+                wrapper.style.cssText = 'position: relative; display: inline-block;';
+
+                var img = document.createElement('img');
+                img.src = 'data:image/png;base64,' + imgData.data;
+                img.style.cssText = [
+                    'max-width: 100%', 'max-height: 80vh',
+                    'border-radius: 8px', 'box-shadow: 0 8px 32px rgba(0,0,0,0.5)',
+                    'object-fit: contain',
+                ].join(';') + ';';
+
+                // Download button (always visible)
+                var dlBtn = document.createElement('a');
+                dlBtn.href = 'data:image/png;base64,' + imgData.data;
+                dlBtn.download = imgFilename;
+                dlBtn.innerHTML = '💾 Save';
+                dlBtn.style.cssText = [
+                    'position: absolute', 'top: 12px', 'right: 12px',
+                    'background: rgba(74,74,255,0.9)', 'color: #fff',
+                    'padding: 8px 16px', 'border-radius: 8px',
+                    'font-size: 14px', 'font-family: sans-serif',
+                    'text-decoration: none', 'cursor: pointer',
+                    'font-weight: 600', 'box-shadow: 0 4px 12px rgba(0,0,0,0.4)',
+                    'transition: background 0.2s',
+                ].join(';') + ';';
+                dlBtn.onmouseover = function () { dlBtn.style.background = 'rgba(90,90,255,1)'; };
+                dlBtn.onmouseout = function () { dlBtn.style.background = 'rgba(74,74,255,0.9)'; };
+
+                wrapper.appendChild(img);
+                wrapper.appendChild(dlBtn);
+                imgContainer.appendChild(wrapper);
+            })(images[i], images[i].filename);
         }
 
-        console.log('Modal Gateway: image ouverte dans un nouvel onglet —', filename);
+        overlay.appendChild(imgContainer);
+        document.body.appendChild(overlay);
+
+        // Close handlers
+        function closeOverlay() {
+            if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
+            document.removeEventListener('keydown', escHandler);
+        }
+
+        function escHandler(e) {
+            if (e.key === 'Escape') closeOverlay();
+        }
+
+        closeBtn.onclick = closeOverlay;
+        overlay.onclick = function (e) {
+            if (e.target === overlay || e.target === header) closeOverlay();
+        };
+        document.addEventListener('keydown', escHandler);
+
+        console.log('Modal Gateway: ' + images.length + ' image(s) affichée(s) dans l\'overlay');
     }
 
     // ─── Indicateur de chargement ───────────────────────────────────────────
