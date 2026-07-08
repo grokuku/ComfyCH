@@ -109,6 +109,7 @@ class ComfyWorker:
 
     # ── Proxy methods (called by the router via .remote()) ───────────────
 
+    @modal.method()
     async def prompt(self, workflow: dict) -> dict:
         """Proxy to ComfyUI's ``POST /prompt``.
 
@@ -123,6 +124,7 @@ class ComfyWorker:
             resp.raise_for_status()
             return resp.json()
 
+    @modal.method()
     async def history(self, job_id: str) -> dict:
         """Proxy to ComfyUI's ``GET /history/{job_id}``.
 
@@ -136,6 +138,7 @@ class ComfyWorker:
             resp.raise_for_status()
             return resp.json()
 
+    @modal.method()
     async def upload_image(self, image: bytes, subfolder: str = "", image_type: str = "input") -> dict:
         """Proxy to ComfyUI's ``POST /upload/image``.
 
@@ -164,6 +167,7 @@ class ComfyWorker:
             resp.raise_for_status()
             return resp.json()
 
+    @modal.method()
     async def view(self, filename: str, subfolder: str = "", view_type: str = "output") -> dict:
         """Proxy to ComfyUI's ``GET /view``.
 
