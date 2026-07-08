@@ -494,35 +494,35 @@
     // ─── Affichage des images reçues dans le canvas ─────────────────────────
 
     /**
-     * Dessine une image (base64) sur le canvas principal de ComfyUI.
+     * Ouvre une image générée (base64) dans un nouvel onglet du navigateur.
+     *
+     * Au lieu de dessiner sur le canvas ComfyUI — ce qui casse la disposition
+     * du graphe (ratio, zoom, image plein écran par-dessus) — on ouvre simplement
+     * l'image dans un nouvel onglet où elle peut être visualisée à pleine taille
+     * et téléchargée.
+     *
      * @param {string} base64Data - Données de l'image encodées en base64 (sans préfixe).
-     * @param {string} filename - Nom du fichier (pour référence).
-     * @param {boolean} [isLast=false] - Si true, réinitialise le zoom du canvas.
+     * @param {string} filename - Nom du fichier (pour référence / téléchargement).
+     * @param {boolean} [isLast=false] - Si true, ouvre l'image dans un nouvel onglet.
      */
     function displayImageInCanvas(base64Data, filename, isLast) {
-        // Chercher le canvas ComfyUI
-        var canvas = document.querySelector('.comfy-canvas canvas') ||
-                     document.querySelector('canvas');
-        if (!canvas) {
-            console.warn('Modal Gateway: aucun canvas trouvé pour afficher l\'image', filename);
-            return;
+        // Open the generated image in a new tab instead of drawing on the ComfyUI canvas.
+        // Drawing on the canvas breaks the graph layout (ratio, zoom, etc).
+        var dataUrl = 'data:image/png;base64,' + base64Data;
+
+        // Create a temporary link to open/download the image
+        var link = document.createElement('a');
+        link.href = dataUrl;
+        link.download = filename || 'modal_output.png';
+        link.target = '_blank';
+
+        // For single images, open in a new tab. For multiple, download them.
+        if (isLast) {
+            // Open the last (or only) image in a new tab
+            window.open(dataUrl, '_blank');
         }
 
-        var img = new Image();
-        img.onload = function () {
-            var ctx = canvas.getContext('2d');
-            if (ctx) {
-                // Redimensionner le canvas à la taille de l'image
-                canvas.width = img.width;
-                canvas.height = img.height;
-                ctx.drawImage(img, 0, 0);
-                console.log('Modal Gateway: image affichée sur le canvas —', filename, '(' + img.width + 'x' + img.height + ')');
-            }
-        };
-        img.onerror = function () {
-            console.error('Modal Gateway: échec du décodage de l\'image', filename);
-        };
-        img.src = 'data:image/png;base64,' + base64Data;
+        console.log('Modal Gateway: image ouverte dans un nouvel onglet —', filename);
     }
 
     // ─── Indicateur de chargement ───────────────────────────────────────────
