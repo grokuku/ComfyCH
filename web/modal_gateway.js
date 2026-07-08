@@ -874,6 +874,32 @@
             '  font-size: 13px; color: #777; text-align: center;',
             '  padding: 20px; font-style: italic;',
             '}',
+            '',
+            // ─── Models detection section (reuses plugin styles) ───
+            '.modal-models-list {',
+            '  max-height: 280px; overflow-y: auto;',
+            '  border: 1px solid #3a3a3e; border-radius: 8px;',
+            '  padding: 8px; margin-top: 8px; background: #1a1a1e;',
+            '}',
+            '.modal-model-item {',
+            '  display: flex; align-items: flex-start; gap: 8px;',
+            '  padding: 8px 6px; border-bottom: 1px solid #2e2e32;',
+            '  cursor: pointer; transition: background 0.15s;',
+            '}',
+            '.modal-model-item:last-child { border-bottom: none; }',
+            '.modal-model-item:hover { background: #252530; }',
+            '.modal-model-item input[type="checkbox"] {',
+            '  margin-top: 3px; flex-shrink: 0; cursor: pointer;',
+            '  width: 16px; height: 16px; accent-color: #4a8aff;',
+            '}',
+            '.modal-model-item-content { flex: 1; min-width: 0; }',
+            '.modal-model-item-name {',
+            '  font-size: 13px; font-weight: 600; color: #e0e0e0;',
+            '  word-break: break-all;',
+            '}',
+            '.modal-model-item-info {',
+            '  font-size: 11px; color: #777; margin-top: 2px;',
+            '}',
         ].join('\n');
         document.head.appendChild(style);
         console.log('Modal Gateway: styles injectés');
@@ -1029,11 +1055,21 @@
             '    </section>',
             '    <section>',
             '      <h3>📦 Modèles</h3>',
-            '      <div class="modal-status-row">',
+            '      <p style="font-size:12px;color:#999;margin:0 0 8px 0;">Détectez vos modèles locaux et synchronisez-les vers Modal.</p>',
+            '      <div class="modal-plugin-actions">',
+            '        <button id="cfg-detect-models" class="modal-btn modal-btn-action">🔄 Détecter mes modèles</button>',
+            '        <button id="cfg-save-models" class="modal-btn modal-btn-primary" disabled>💾 Save Selection</button>',
+            '      </div>',
+            '      <div id="modal-models-list" class="modal-models-list" style="display:none;">',
+            '      </div>',
+            '      <div id="modal-models-loading" class="modal-plugin-loading" style="display:none;">⏳ Scan en cours...</div>',
+            '      <div id="modal-models-empty" class="modal-plugin-empty" style="display:none;">Aucun modèle détecté.</div>',
+            '      <div class="modal-status-row" style="margin-top:12px;">',
             '        <span>🔄 Synchronisation des modèles</span>',
             '        <span class="status-badge" id="status-sync">' + (config.last_sync ? '✅ ' + escapeHtml(config.last_sync) : '⏳ Jamais') + '</span>',
             '      </div>',
             '      <button id="cfg-run-sync" class="modal-btn modal-btn-action">📥 Sync Models</button>',
+            '      <div class="modal-plugin-note">ℹ️ Sauvegardez votre sélection puis cliquez sur <strong>Sync Models</strong> pour uploader vers Modal.</div>',
             '    </section>',
             '    <section>',
             '      <h3>🚀 Déploiement</h3>',
@@ -1274,6 +1310,167 @@
             } catch (e) {
                 saveBtn.disabled = false;
                 saveBtn.textContent = '💾 Save Plugins';
+                showNotification('❌ Erreur sauvegarde : ' + e.message, 'error');
+            }
+        };
+
+        // ─── Models: detect & save ───
+        var detectedModels = [];
+        var savedModelsSelection = null;
+
+        document.getElementById('cfg-detect-models').onclick = async function () {
+            var btn = document.getElementById('cfg-detect-models');
+            var listEl = document.getElementById('modal-models-list');
+            var loadingEl = document.getElementById('modal-models-loading');
+            var emptyEl = document.getElementById('modal-models-empty');
+            var saveBtn = document.getElementById('cfg-save-models');
+
+            btn.disabled = true;
+            btn.textContent = '⏳ Scan...';
+            listEl.style.display = 'none';
+            emptyEl.style.display = 'none';
+            loadingEl.style.display = 'block';
+
+            try {
+                // Load saved selection from config
+                if (savedModelsSelection === null) {
+                    try {
+                        var savedResp = await fetch('/api/modal/models/select');
+                        if (savedResp.ok) {
+                            savedModelsSelection = await savedResp.json();
+                        } else {
+                            savedModelsSelection = { models_to_sync: [] };
+                        }
+                    } catch (e) {
+                        savedModelsSelection = { models_to_sync: [] };
+                    }
+                }
+
+                // Detect local models
+                var resp = await fetch('/api/modal/models/detect');
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                var data = await resp.json();
+                detectedModels = data.models || [];
+
+                loadingEl.style.display = 'none';
+                btn.disabled = false;
+                btn.textContent = '🔄 Détecter mes modèles';
+
+                if (detectedModels.length === 0) {
+                    emptyEl.style.display = 'block';
+                    saveBtn.disabled = true;
+                    return;
+                }
+
+                // Build set of already-saved model keys
+                var savedKeys = {};
+                if (savedModelsSelection && savedModelsSelection.models_to_sync) {
+                    for (var s = 0; s < savedModelsSelection.models_to_sync.length; s++) {
+                        var m = savedModelsSelection.models_to_sync[s];
+                        savedKeys[m.filename + '|' + m.model_dir] = true;
+                    }
+                }
+
+                // Render list
+                listEl.innerHTML = '';
+                for (var i = 0; i < detectedModels.length; i++) {
+                    (function (model) {
+                        var key = model.filename + '|' + model.model_dir;
+                        var item = document.createElement('label');
+                        item.className = 'modal-model-item';
+
+                        var checkbox = document.createElement('input');
+                        checkbox.type = 'checkbox';
+                        checkbox.dataset.modelFilename = model.filename;
+                        checkbox.dataset.modelDir = model.model_dir;
+                        checkbox.checked = !!savedKeys[key];
+
+                        var content = document.createElement('div');
+                        content.className = 'modal-model-item-content';
+
+                        var nameEl = document.createElement('div');
+                        nameEl.className = 'modal-model-item-name';
+                        nameEl.textContent = model.filename;
+
+                        var infoEl = document.createElement('div');
+                        infoEl.className = 'modal-model-item-info';
+                        infoEl.textContent = '📁 ' + model.model_dir + '  ·  ' + model.size_mb + ' MB';
+
+                        content.appendChild(nameEl);
+                        content.appendChild(infoEl);
+
+                        item.appendChild(checkbox);
+                        item.appendChild(content);
+                        listEl.appendChild(item);
+                    })(detectedModels[i]);
+                }
+
+                listEl.style.display = 'block';
+                saveBtn.disabled = false;
+
+            } catch (e) {
+                loadingEl.style.display = 'none';
+                btn.disabled = false;
+                btn.textContent = '🔄 Détecter mes modèles';
+                showNotification('❌ Erreur détection modèles : ' + e.message, 'error');
+            }
+        };
+
+        document.getElementById('cfg-save-models').onclick = async function () {
+            var saveBtn = document.getElementById('cfg-save-models');
+            var listEl = document.getElementById('modal-models-list');
+            saveBtn.disabled = true;
+            saveBtn.textContent = '⏳ Sauvegarde...';
+
+            try {
+                var checkboxes = listEl.querySelectorAll('input[type="checkbox"]');
+                var modelsToSync = [];
+
+                for (var i = 0; i < checkboxes.length; i++) {
+                    var cb = checkboxes[i];
+                    if (cb.checked) {
+                        modelsToSync.push({
+                            filename: cb.dataset.modelFilename,
+                            model_dir: cb.dataset.modelDir,
+                        });
+                    }
+                }
+
+                var resp = await fetch('/api/modal/models/select', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        models_to_sync: modelsToSync,
+                    }),
+                });
+
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+
+                savedModelsSelection = { models_to_sync: modelsToSync };
+
+                var totalMB = 0;
+                for (var j = 0; j < detectedModels.length; j++) {
+                    for (var k = 0; k < modelsToSync.length; k++) {
+                        if (detectedModels[j].filename === modelsToSync[k].filename &&
+                            detectedModels[j].model_dir === modelsToSync[k].model_dir) {
+                            totalMB += detectedModels[j].size_mb;
+                        }
+                    }
+                }
+
+                saveBtn.textContent = '✅ Sauvegardé';
+                showNotification(
+                    '✅ ' + modelsToSync.length + ' modèle(s) sélectionné(s) — ' + Math.round(totalMB) + ' MB. Cliquez sur Sync Models.',
+                    'success'
+                );
+                setTimeout(function () {
+                    saveBtn.disabled = false;
+                    saveBtn.textContent = '💾 Save Selection';
+                }, 2000);
+
+            } catch (e) {
+                saveBtn.disabled = false;
+                saveBtn.textContent = '💾 Save Selection';
                 showNotification('❌ Erreur sauvegarde : ' + e.message, 'error');
             }
         };

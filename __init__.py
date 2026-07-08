@@ -34,6 +34,7 @@ DEFAULT_CONFIG = {
     "last_deploy": None,
     "custom_nodes": [],
     "custom_nodes_ext": [],
+    "models_to_sync": [],
 }
 
 
@@ -196,6 +197,47 @@ def _detect_custom_nodes() -> list[dict]:
     return results
 
 
+def _detect_local_models() -> list[dict]:
+    """Scan the local ComfyUI models/ directory for installed model files.
+
+    Looks for .safetensors, .ckpt, .pt, .bin, .gguf, .pth files in each
+    subdirectory of ComfyUI/models/.
+
+    Returns a list of {"filename": str, "model_dir": str, "size_mb": float}.
+    """
+    # PROJECT_ROOT = custom_nodes/modal_gateway
+    # PROJECT_ROOT.parent = custom_nodes
+    # PROJECT_ROOT.parent.parent = ComfyUI
+    models_dir = PROJECT_ROOT.parent.parent / "models"
+
+    MODEL_EXTENSIONS = {".safetensors", ".ckpt", ".pt", ".bin", ".gguf", ".pth"}
+    results: list[dict] = []
+
+    if not models_dir.is_dir():
+        print(f"[Modal Gateway] models dir not found: {models_dir}")
+        return results
+
+    for subdir in sorted(models_dir.iterdir()):
+        if not subdir.is_dir():
+            continue
+        # Skip non-model dirs
+        if subdir.name.startswith(".") or subdir.name.startswith("__"):
+            continue
+        for file in sorted(subdir.iterdir()):
+            if file.is_file() and file.suffix.lower() in MODEL_EXTENSIONS:
+                try:
+                    size_mb = round(file.stat().st_size / (1024 * 1024), 1)
+                except OSError:
+                    size_mb = 0
+                results.append({
+                    "filename": file.name,
+                    "model_dir": subdir.name,
+                    "size_mb": size_mb,
+                })
+
+    return results
+
+
 # ─── Initialisation : patcher PromptServer.add_routes ───
 
 try:
@@ -340,6 +382,37 @@ if PromptServer is not None:
                 "custom_nodes_ext": custom_nodes_ext,
             })
 
+        # ── GET /api/modal/models/detect — scan local models ──
+        async def get_models_detect(request):
+            models = _detect_local_models()
+            return web.json_response({"models": models})
+
+        # ── GET /api/modal/models/select — get saved model selection ──
+        async def get_models_select(request):
+            config = load_config()
+            return web.json_response({
+                "models_to_sync": config.get("models_to_sync", []),
+            })
+
+        # ── POST /api/modal/models/select — save model selection ──
+        async def post_models_select(request):
+            try:
+                data = await request.json()
+            except Exception:
+                return web.json_response(
+                    {"ok": False, "error": "Invalid JSON"}, status=400
+                )
+            models_to_sync = data.get("models_to_sync", [])
+            if not isinstance(models_to_sync, list):
+                return web.json_response(
+                    {"ok": False, "error": "models_to_sync must be a list"}, status=400
+                )
+            save_config({"models_to_sync": models_to_sync})
+            return web.json_response({
+                "ok": True,
+                "models_to_sync": models_to_sync,
+            })
+
         # Ensuite nos routes Modal Gateway
         routes = [
             ("GET", "/api/modal/config", get_config),
@@ -347,6 +420,9 @@ if PromptServer is not None:
             ("GET", "/api/modal/plugins/detect", get_plugins_detect),
             ("GET", "/api/modal/plugins", get_plugins),
             ("POST", "/api/modal/plugins", post_plugins),
+            ("GET", "/api/modal/models/detect", get_models_detect),
+            ("GET", "/api/modal/models/select", get_models_select),
+            ("POST", "/api/modal/models/select", post_models_select),
             ("GET", "/api/modal/status", get_status),
             ("POST", "/api/modal/sync", post_sync),
             ("POST", "/api/modal/deploy", post_deploy),

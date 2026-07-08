@@ -1,7 +1,10 @@
 """CPU-only Modal app to sync model files into the ``comfy-models`` Volume.
 
-Run on-demand after changing ``models.py`` — no GPU needed, no image rebuild
-required.
+Supports two sync modes:
+1. **Local models** — files detected in the local ComfyUI/models/ directory,
+   selected via the Modal Gateway UI, and uploaded to the Volume.
+2. **HuggingFace models** — files listed in ``models.py``, downloaded via
+   ``huggingface_hub``.
 
 Usage::
 
@@ -10,19 +13,23 @@ Usage::
 
 from __future__ import annotations
 
+import json
+import shutil
+from pathlib import Path
+
 import modal
 
 from helpers import (
     download_external_model,
     get_hf_secrets,
     hf_download,
+    resolve_model_dir,
 )
 from models import models, models_ext
 
 vol = modal.Volume.from_name("comfy-models", create_if_missing=True)
 
 # Minimal CPU image with just our local sources and huggingface_hub.
-# No GPU dependencies, no ComfyUI install.
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .add_local_python_source("helpers", "models", copy=True)
@@ -32,6 +39,65 @@ image = (
 
 app = modal.App("comfy-sync", image=image)
 
+# ── Read config.json for local models to sync ────────────────────────────
+
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_CONFIG_PATH = _SCRIPT_DIR / "config.json"
+
+models_to_sync: list[dict] = []
+if _CONFIG_PATH.exists():
+    try:
+        _cfg = json.loads(_CONFIG_PATH.read_text())
+        models_to_sync = _cfg.get("models_to_sync", [])
+    except (json.JSONDecodeError, OSError):
+        pass
+
+# ── Find local ComfyUI models directory ──────────────────────────────────
+
+_LOCAL_MODELS_CANDIDATES = [
+    _SCRIPT_DIR.parent.parent / "models",   # custom_nodes/modal_gateway -> ComfyUI -> models
+    _SCRIPT_DIR.parent / "models",          # if at project root
+]
+
+local_models_dir: Path | None = None
+for candidate in _LOCAL_MODELS_CANDIDATES:
+    if candidate.is_dir():
+        local_models_dir = candidate
+        break
+
+
+# ── Remote function: create symlinks for uploaded local models ───────────
+
+
+@app.function(
+    cpu=1,
+    memory=2048,
+    volumes={"/cache": vol},
+)
+def link_local_models(models_list: list[dict]) -> None:
+    """Create symlinks in ComfyUI model dirs for files already in the Volume."""
+    for model in models_list:
+        filename = model["filename"]
+        model_dir = model["model_dir"]
+
+        cache_path = Path("/cache") / filename
+        if not cache_path.exists():
+            print(f"  ⚠️ Not in volume: {filename} — skipping")
+            continue
+
+        target_dir = resolve_model_dir(model_dir)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_path = target_dir / filename
+
+        if target_path.exists() or target_path.is_symlink():
+            target_path.unlink()
+
+        target_path.symlink_to(cache_path)
+        print(f"  ✅ Linked: {filename} -> {target_path}")
+
+
+# ── Remote function: download HuggingFace + external models ──────────────
+
 
 @app.function(
     cpu=1,
@@ -39,9 +105,9 @@ app = modal.App("comfy-sync", image=image)
     volumes={"/cache": vol},
     secrets=get_hf_secrets(),
 )
-def sync() -> None:
+def sync_hf_models() -> None:
     """Download all models defined in ``models.py`` into the shared Volume."""
-    print(f"Starting sync: {len(models)} HF models + {len(models_ext)} external models")
+    print(f"HuggingFace models: {len(models)} | External: {len(models_ext)}")
 
     for i, model in enumerate(models, start=1):
         print(f"[{i}/{len(models)}] HF: {model['repo_id']}/{model['filename']}")
@@ -51,11 +117,49 @@ def sync() -> None:
         print(f"[{i}/{len(models_ext)}] External: {model['filename']}")
         download_external_model(model["url"], model["filename"], model["model_dir"])
 
-    print("✅ Sync terminée !")
+
+# ── Local entrypoint: orchestrate the full sync ──────────────────────────
 
 
 @app.local_entrypoint()
 def main() -> None:
-    """Local entrypoint — calls ``sync.remote()`` on Modal infrastructure."""
-    sync.remote()
-    print("✅ Sync terminée !")
+    """Local entrypoint — uploads local models, then links them on the Volume."""
+
+    # ── Step 1: Upload local model files to the Volume ───────────────────
+    if local_models_dir and models_to_sync:
+        print(f"📦 Uploading {len(models_to_sync)} local model(s) to Volume...")
+        uploaded = 0
+        with vol.batch_upload() as batch:
+            for model in models_to_sync:
+                filename = model["filename"]
+                model_dir = model["model_dir"]
+                model_path = local_models_dir / model_dir / filename
+
+                if not model_path.exists():
+                    print(f"  ⚠️ Not found locally: {model_path}")
+                    continue
+
+                size_mb = model_path.stat().st_size / (1024 * 1024)
+                print(f"  📤 Uploading: {filename} ({size_mb:.0f} MB)")
+                # Upload to volume root (symlinks will point to /cache/filename)
+                batch.put_file(model_path, filename)
+                uploaded += 1
+
+        print(f"  ✅ Uploaded {uploaded} file(s) to Volume")
+    else:
+        if not models_to_sync:
+            print("ℹ️ No local models selected in config.json")
+        if not local_models_dir:
+            print("ℹ️ Local ComfyUI models/ directory not found")
+
+    # ── Step 2: Create symlinks on the Volume ────────────────────────────
+    if models_to_sync:
+        print("🔗 Creating symlinks in ComfyUI model directories...")
+        link_local_models.remote(models_to_sync)
+
+    # ── Step 3: Download HuggingFace models (from models.py) ─────────────
+    if models or models_ext:
+        print("📥 Downloading HuggingFace/external models...")
+        sync_hf_models.remote()
+
+    print("\n✅ Sync terminée !")
