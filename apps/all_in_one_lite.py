@@ -95,6 +95,9 @@ last_gpu: dict[str, str] = {}
 @web_app.middleware("http")
 async def verify_api_key(request: Request, call_next):
     """Protège tous les endpoints sauf /health et /gpus"""
+    # OPTIONS = preflight CORS → laisser passer sans auth
+    if request.method == "OPTIONS":
+        return await call_next(request)
     if request.url.path in ("/health", "/gpus", "/docs", "/openapi.json"):
         return await call_next(request)
     key = request.headers.get("X-API-Key")
