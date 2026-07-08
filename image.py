@@ -22,6 +22,8 @@ try:
 except ImportError:
     comfy_plugins_ext = []
 
+custom_nodes_local = []
+
 _CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
 if _CONFIG_PATH.exists():
     try:
@@ -30,6 +32,8 @@ if _CONFIG_PATH.exists():
             comfy_plugins = list(_saved["custom_nodes"])
         if _saved.get("custom_nodes_ext"):
             comfy_plugins_ext = list(_saved["custom_nodes_ext"])
+        if _saved.get("custom_nodes_local"):
+            custom_nodes_local = list(_saved["custom_nodes_local"])
     except (json.JSONDecodeError, OSError):
         pass
 
@@ -67,6 +71,10 @@ def _build_image() -> modal.Image:
     for plugin in comfy_plugins_ext:
         image = _install_ext_plugin(image, plugin)
 
+    # ── Local custom nodes (non-git, copied from filesystem) ───────────
+    for node_name in custom_nodes_local:
+        image = _install_local_node(image, node_name)
+
     # ── Reverse-proxy fix so workflow save works behind Modal's edge proxy
     image = image.add_local_dir(
         root_dir / "vendor_nodes" / "reverse_proxy_fix",
@@ -80,9 +88,9 @@ def _build_image() -> modal.Image:
 def _install_ext_plugin(image: modal.Image, plugin: dict) -> modal.Image:
     """Install one external custom node from git into ComfyUI's custom_nodes.
 
-    Supports optional ``branch``, ``requirements`` (a list of requirement
-    files), an ``install`` script (.py), and ``ext_deps`` (a list of extra pip
-    packages). User-supplied values are shell-quoted before use.
+    If a local directory with the same node name exists, it is staged as a
+    fallback — if the git clone fails (e.g. private repo, no auth), the local
+    copy is used instead.
     """
     nodes_dir = "/root/comfy/ComfyUI/custom_nodes"
     url = plugin["url"]
@@ -91,16 +99,30 @@ def _install_ext_plugin(image: modal.Image, plugin: dict) -> modal.Image:
 
     branch = plugin.get("branch", "").strip()
     branch_opt = f"--branch {shlex.quote(branch)} " if branch else ""
-    image = image.run_commands(
-        f"cd {nodes_dir} && git clone --recurse-submodules --single-branch "
-        f"{branch_opt}{shlex.quote(url)}"
-    )
+
+    # Check if a local copy exists (for fallback)
+    local_source = Path(__file__).resolve().parent.parent / name
+    has_local_fallback = local_source.is_dir()
+
+    if has_local_fallback:
+        # Stage local copy as fallback
+        image = image.add_local_dir(str(local_source), f"/local_nodes_backup/{name}", copy=True)
+        # Try git clone, fall back to local copy on failure
+        image = image.run_commands(
+            f"cd {nodes_dir} && git clone --recurse-submodules --single-branch "
+            f"{branch_opt}{shlex.quote(url)} 2>/dev/null || "
+            f"(cp -r /local_nodes_backup/{name} {work_dir} && echo 'Used local fallback for {name}')"
+        )
+    else:
+        # No local fallback available, just try git clone
+        image = image.run_commands(
+            f"cd {nodes_dir} && git clone --recurse-submodules --single-branch "
+            f"{branch_opt}{shlex.quote(url)}"
+        )
 
     requirements = plugin.get("requirements") or []
     if requirements:
         files = " ".join(f"-r {shlex.quote(f)}" for f in requirements)
-        # --no-deps so a node's requirements can't pull a CPU-only torch over
-        # the CUDA build; use "ext_deps" below to add back what's needed.
         image = image.run_commands(
             f"cd {work_dir} && uv pip install --no-deps "
             f"--python $(command -v python) --compile-bytecode {files}"
@@ -118,6 +140,26 @@ def _install_ext_plugin(image: modal.Image, plugin: dict) -> modal.Image:
     ext_deps = plugin.get("ext_deps") or []
     if ext_deps:
         image = image.uv_pip_install(ext_deps, extra_options="--no-deps")
+
+    return image
+
+
+def _install_local_node(image: modal.Image, node_name: str) -> modal.Image:
+    """Copy a local non-git custom node directory into the Modal image."""
+    source_dir = Path(__file__).resolve().parent.parent / node_name
+    if not source_dir.is_dir():
+        print(f"Warning: local custom node '{node_name}' not found at {source_dir}, skipping.")
+        return image
+
+    dest_dir = f"/root/comfy/ComfyUI/custom_nodes/{shlex.quote(node_name)}"
+    image = image.add_local_dir(str(source_dir), dest_dir, copy=True)
+
+    req_file = source_dir / "requirements.txt"
+    if req_file.is_file():
+        image = image.run_commands(
+            f"cd {dest_dir} && uv pip install --no-deps "
+            f"--python $(command -v python) --compile-bytecode -r requirements.txt"
+        )
 
     return image
 

@@ -34,6 +34,7 @@ DEFAULT_CONFIG = {
     "last_deploy": None,
     "custom_nodes": [],
     "custom_nodes_ext": [],
+    "custom_nodes_local": [],
     "models_to_sync": [],
 }
 
@@ -353,6 +354,7 @@ if PromptServer is not None:
             return web.json_response({
                 "custom_nodes": config.get("custom_nodes", []),
                 "custom_nodes_ext": config.get("custom_nodes_ext", []),
+                "custom_nodes_local": config.get("custom_nodes_local", []),
             })
 
         async def post_plugins(request):
@@ -364,6 +366,7 @@ if PromptServer is not None:
                 )
             custom_nodes = data.get("custom_nodes", [])
             custom_nodes_ext = data.get("custom_nodes_ext", [])
+            custom_nodes_local = data.get("custom_nodes_local", [])
             if not isinstance(custom_nodes, list):
                 return web.json_response(
                     {"ok": False, "error": "custom_nodes must be a list"}, status=400
@@ -372,14 +375,20 @@ if PromptServer is not None:
                 return web.json_response(
                     {"ok": False, "error": "custom_nodes_ext must be a list"}, status=400
                 )
+            if not isinstance(custom_nodes_local, list):
+                return web.json_response(
+                    {"ok": False, "error": "custom_nodes_local must be a list"}, status=400
+                )
             save_config({
                 "custom_nodes": custom_nodes,
                 "custom_nodes_ext": custom_nodes_ext,
+                "custom_nodes_local": custom_nodes_local,
             })
             return web.json_response({
                 "ok": True,
                 "custom_nodes": custom_nodes,
                 "custom_nodes_ext": custom_nodes_ext,
+                "custom_nodes_local": custom_nodes_local,
             })
 
         # ── GET /api/modal/models/detect — scan local models ──

@@ -1266,10 +1266,10 @@
                         if (savedResp.ok) {
                             savedPlugins = await savedResp.json();
                         } else {
-                            savedPlugins = { custom_nodes: [], custom_nodes_ext: [] };
+                            savedPlugins = { custom_nodes: [], custom_nodes_ext: [], custom_nodes_local: [] };
                         }
                     } catch (e) {
-                        savedPlugins = { custom_nodes: [], custom_nodes_ext: [] };
+                        savedPlugins = { custom_nodes: [], custom_nodes_ext: [], custom_nodes_local: [] };
                     }
                 }
 
@@ -1310,6 +1310,13 @@
                             checkbox.checked = true;
                         }
 
+                        // Pre-check local nodes from saved config
+                        if (!plugin.has_git && savedPlugins && savedPlugins.custom_nodes_local) {
+                            if (savedPlugins.custom_nodes_local.indexOf(plugin.name) !== -1) {
+                                checkbox.checked = true;
+                            }
+                        }
+
                         var content = document.createElement('div');
                         content.className = 'modal-plugin-item-content';
 
@@ -1318,18 +1325,18 @@
                         nameEl.textContent = plugin.name;
                         content.appendChild(nameEl);
 
+                        checkbox.dataset.pluginIsLocal = 'false';
                         if (plugin.has_git && plugin.git_url) {
                             var urlEl = document.createElement('div');
                             urlEl.className = 'modal-plugin-item-url';
                             urlEl.textContent = plugin.git_url;
                             content.appendChild(urlEl);
                         } else {
+                            checkbox.dataset.pluginIsLocal = 'true';
                             var noGitEl = document.createElement('div');
                             noGitEl.className = 'modal-plugin-item-nogit';
-                            noGitEl.textContent = '⚠️ Pas de dépôt git — ne peut pas être synchronisé automatiquement';
+                            noGitEl.textContent = '📁 Node local — sera copié dans l\'image Modal';
                             content.appendChild(noGitEl);
-                            checkbox.disabled = true;
-                            checkbox.style.opacity = '0.4';
                         }
 
                         item.appendChild(checkbox);
@@ -1358,6 +1365,7 @@
             try {
                 var checkboxes = listEl.querySelectorAll('input[type="checkbox"]:not(:disabled)');
                 var customNodesExt = [];
+                var customNodesLocal = [];
 
                 for (var i = 0; i < checkboxes.length; i++) {
                     var cb = checkboxes[i];
@@ -1378,6 +1386,8 @@
                                 url: cb.dataset.pluginUrl,
                             });
                         }
+                    } else if (cb.checked && cb.dataset.pluginIsLocal === 'true') {
+                        customNodesLocal.push(cb.dataset.pluginName);
                     }
                 }
 
@@ -1389,6 +1399,7 @@
                     body: JSON.stringify({
                         custom_nodes: customNodes,
                         custom_nodes_ext: customNodesExt,
+                        custom_nodes_local: customNodesLocal,
                     }),
                 });
 
@@ -1397,11 +1408,12 @@
                 savedPlugins = {
                     custom_nodes: customNodes,
                     custom_nodes_ext: customNodesExt,
+                    custom_nodes_local: customNodesLocal,
                 };
 
                 saveBtn.textContent = '✅ Sauvegardé';
                 showNotification(
-                    '✅ ' + customNodesExt.length + ' node(s) sauvegardé(s). Redeploy nécessaire.',
+                    '✅ ' + (customNodesExt.length + customNodesLocal.length) + ' node(s) sauvegardé(s) (' + customNodesLocal.length + ' local). Redeploy nécessaire.',
                     'success'
                 );
                 setTimeout(function () {
