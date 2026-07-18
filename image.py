@@ -138,12 +138,20 @@ def _install_ext_plugin(image: modal.Image, plugin: dict) -> modal.Image:
             f"{branch_opt}{shlex.quote(url)}"
         )
 
+    # Install requirements — from config OR auto-detect requirements.txt
     requirements = plugin.get("requirements") or []
     if requirements:
         files = " ".join(f"-r {shlex.quote(f)}" for f in requirements)
         image = image.run_commands(
             f"cd {work_dir} && uv pip install --no-deps "
             f"--python $(command -v python) --compile-bytecode {files}"
+        )
+    else:
+        # Auto-detect and install requirements.txt if it exists
+        image = image.run_commands(
+            f"cd {work_dir} && [ -f requirements.txt ] && "
+            f"uv pip install --no-deps --python $(command -v python) "
+            f"--compile-bytecode -r requirements.txt || true"
         )
 
     install = plugin.get("install", "").strip()
