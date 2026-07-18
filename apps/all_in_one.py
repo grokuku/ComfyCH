@@ -214,6 +214,32 @@ async def generate(req: GenerateRequest):
                                     f"[Modal Gateway] Error fetching image {filename}: {e}"
                                 )
 
+        # ── 3b. Récupérer les fichiers sideload (.txt, .json) ──────
+        from pathlib import Path as _Path
+        sideload_exts = [".txt", ".json"]
+        sideload_files = []
+        for img in images:
+            base_name = _Path(img["filename"]).stem
+            subfolder = img.get("subfolder", "")
+            for ext in sideload_exts:
+                side_name = base_name + ext
+                try:
+                    file_data = await worker.view.remote.aio(side_name, subfolder, "output")
+                    if file_data and not file_data.get("error") and file_data.get("data"):
+                        sideload_files.append({
+                            "filename": side_name,
+                            "subfolder": subfolder,
+                            "type": "output",
+                            "data": file_data["data"],
+                            "content_type": file_data.get("content_type", "application/octet-stream"),
+                            "is_sideload": True,
+                        })
+                        print(f"[Gateway] Sideload fetched: {side_name}")
+                except Exception as e:
+                    pass  # File doesn't exist, skip silently
+
+        images.extend(sideload_files)
+
         # ── 4. Retourner le résultat formaté pour l'extension JS ─────────
         print(f"[Gateway] Total images collected: {len(images)}")
         print(f"[Gateway] Returning: {len(images)} images, job_id={prompt_id}")

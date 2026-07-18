@@ -36,6 +36,7 @@ DEFAULT_CONFIG = {
     "custom_nodes_ext": [],
     "custom_nodes_local": [],
     "models_to_sync": [],
+    "local_output_dir": "",
 }
 
 
@@ -422,6 +423,56 @@ if PromptServer is not None:
                 "models_to_sync": models_to_sync,
             })
 
+        # ── POST /api/modal/save-local — save image to local filesystem ──
+        async def post_save_local(request):
+            try:
+                data = await request.json()
+            except Exception:
+                return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
+
+            filename = data.get("filename", "")
+            subfolder = data.get("subfolder", "")
+            image_type = data.get("type", "output")
+            base64_data = data.get("data", "")
+
+            if not filename or not base64_data:
+                return web.json_response({"ok": False, "error": "Missing filename or data"}, status=400)
+
+            import base64 as b64mod
+
+            # Determine local output directory
+            config = load_config()
+            output_dir_str = config.get("local_output_dir", "")
+            if output_dir_str:
+                output_dir = Path(output_dir_str)
+            else:
+                # Auto-detect: PROJECT_ROOT = custom_nodes/ComfyCH
+                # ComfyUI root = PROJECT_ROOT.parent.parent
+                # output dir = ComfyUI root / "output"
+                comfy_root = PROJECT_ROOT.parent.parent
+                output_dir = comfy_root / "output"
+
+            # Build target path preserving subfolder structure
+            if subfolder:
+                target_dir = output_dir / subfolder
+            else:
+                target_dir = output_dir
+
+            target_dir.mkdir(parents=True, exist_ok=True)
+            target_path = target_dir / filename
+
+            # Write the file
+            try:
+                file_data = b64mod.b64decode(base64_data)
+                target_path.write_bytes(file_data)
+                print(f"[Modal Gateway] Saved locally: {target_path}")
+                return web.json_response({
+                    "ok": True,
+                    "path": str(target_path),
+                })
+            except Exception as e:
+                return web.json_response({"ok": False, "error": str(e)}, status=500)
+
         # Ensuite nos routes Modal Gateway
         routes = [
             ("GET", "/api/modal/config", get_config),
@@ -437,6 +488,7 @@ if PromptServer is not None:
             ("POST", "/api/modal/deploy", post_deploy),
             ("GET", "/api/modal/logs", get_logs),
             ("GET", "/api/modal/logs/stream", get_logs_stream),
+            ("POST", "/api/modal/save-local", post_save_local),
         ]
         for method, path, handler in routes:
             self.app.router.add_route(method, path, handler)

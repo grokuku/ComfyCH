@@ -58,6 +58,123 @@
             // L'utilisateur devra configurer via la modale
         });
 
+    // ─── Render Queue ──────────────────────────────────────────────────────
+
+    var RenderQueue = {
+        items: [],
+        activeCount: 0,
+        maxConcurrent: 1,
+        nextId: 1,
+        processing: false,
+
+        enqueue: function (number, workflow, options, gpu) {
+            var self = this;
+            // Deep clone workflow — ComfyUI may mutate it after queuePrompt returns
+            var clonedWorkflow = JSON.parse(JSON.stringify(workflow));
+
+            var item = {
+                id: self.nextId++,
+                number: number,
+                workflow: clonedWorkflow,
+                options: options,
+                gpu: gpu,
+                status: 'pending',
+                error: null,
+                addedAt: Date.now(),
+            };
+
+            var promise = new Promise(function (resolve, reject) {
+                item.resolve = resolve;
+                item.reject = reject;
+            });
+
+            self.items.push(item);
+            self.updateUI();
+            self.process();
+            return promise;
+        },
+
+        process: function () {
+            var self = this;
+            if (self.processing || self.activeCount >= self.maxConcurrent) return;
+
+            var next = null;
+            for (var i = 0; i < self.items.length; i++) {
+                if (self.items[i].status === 'pending') {
+                    next = self.items[i];
+                    break;
+                }
+            }
+            if (!next) return;
+
+            next.status = 'processing';
+            self.activeCount++;
+            self.processing = true;
+            self.updateUI();
+
+            executeCloudRender(next)
+                .then(function (result) {
+                    next.status = 'completed';
+                    next.resolve(result);
+                })
+                .catch(function (err) {
+                    next.status = 'failed';
+                    next.error = err.message || 'Unknown error';
+                    next.reject(err);
+                    showNotification('❌ Render #' + next.id + ' échoué: ' + (next.error || '').substring(0, 80) + '. Queue continue.', 'error');
+                })
+                .then(function () {
+                    self.activeCount--;
+                    self.processing = false;
+                    self.updateUI();
+                    // Clean up old completed/failed items (keep last 50)
+                    if (self.items.length > 50) {
+                        self.items = self.items.filter(function (i) {
+                            return i.status === 'pending' || i.status === 'processing';
+                        }).concat(self.items.slice(-50));
+                    }
+                    self.process();
+                });
+        },
+
+        updateUI: function () {
+            var badge = document.getElementById('modal-queue-badge');
+            if (!badge) return;
+
+            var pending = 0, active = 0, failed = 0;
+            for (var i = 0; i < this.items.length; i++) {
+                var s = this.items[i].status;
+                if (s === 'pending') pending++;
+                else if (s === 'processing') active++;
+                else if (s === 'failed') failed++;
+            }
+
+            if (pending + active === 0) {
+                badge.style.display = 'none';
+                return;
+            }
+
+            badge.style.display = 'inline-block';
+            var text = '🎮 Queue: ' + (pending + active);
+            if (active > 0) text += ' (1 running)';
+            if (failed > 0) text += ' · ' + failed + ' ❌';
+            badge.textContent = text;
+            badge.style.borderColor = failed > 0 ? '#c0392b' : (active > 0 ? '#4a8a4a' : '#333');
+        },
+
+        clearPending: function () {
+            for (var i = 0; i < this.items.length; i++) {
+                if (this.items[i].status === 'pending') {
+                    this.items[i].status = 'failed';
+                    this.items[i].error = 'Cancelled by user';
+                    this.items[i].reject(new Error('Cancelled by user'));
+                }
+            }
+            this.updateUI();
+            showNotification('🗑️ Queue cleared', 'info');
+        },
+    };
+
     /**
      * Options de GPU proposées dans le dropdown.
      * Chaque entrée : { value, label }.
@@ -319,6 +436,24 @@
 
         container.appendChild(label);
         container.appendChild(select);
+
+        // Queue status badge
+        const queueBadge = document.createElement('span');
+        queueBadge.id = 'modal-queue-badge';
+        queueBadge.style.cssText = [
+            'font-size: 11px', 'color: #aaa', 'padding: 2px 8px',
+            'background: #1a1a2e', 'border-radius: 10px',
+            'border: ' + '1px solid #333', 'display: none',
+            'font-family: sans-serif', 'white-space: ' + 'nowrap',
+            'cursor: pointer',
+        ].join(';') + ';';
+        queueBadge.textContent = 'Queue: 0';
+        queueBadge.title = 'Click to clear pending items';
+        queueBadge.addEventListener('click', function () {
+            RenderQueue.clearPending();
+        });
+        container.appendChild(queueBadge);
+
         container.appendChild(settingsBtn);
 
         // Insérer avant le bouton Settings (comme FR.IA)
@@ -360,11 +495,106 @@
         return null;
     }
 
+    // ─── Execute Cloud Render (extracted from interceptQueuePrompt) ──────────
+
+    /**
+     * Exécute un rendu cloud sur un worker Modal.
+     * Extrait de l'ancienne logique inline de interceptQueuePrompt.
+     * En cas d'erreur, l'appelant (RenderQueue) marque l'item comme failed
+     * et la queue continue — PAS de fallback en local.
+     *
+     * @param {object} item - L'item de la RenderQueue à traiter.
+     * @returns {Promise<object>} Le résultat JSON du worker Modal.
+     */
+    async function executeCloudRender(item) {
+        var gpu = item.gpu;
+        currentGpu = gpu;
+
+        // Step 1: encode local images
+        showLoading('☁️  Transfert des fichiers vers ' + gpu + ' (queue #' + item.id + ')...');
+        var enrichedWorkflow = await encodeLocalImages(item.workflow);
+
+        // Extract API-format prompt from new ComfyUI format
+        if (enrichedWorkflow && enrichedWorkflow.output && typeof enrichedWorkflow.output === 'object') {
+            console.log('Modal Gateway: detected new ComfyUI format, extracting output key');
+            enrichedWorkflow = enrichedWorkflow.output;
+        }
+
+        console.log('Modal Gateway: workflow keys =', Object.keys(enrichedWorkflow));
+        console.log('Modal Gateway: workflow has SaveImage?', JSON.stringify(enrichedWorkflow).includes('SaveImage'));
+        console.log('Modal Gateway: workflow sample =', JSON.stringify(enrichedWorkflow).substring(0, 500));
+
+        // Step 2: send to Modal
+        showLoading('☁️  Génération sur ' + gpu + ' (queue #' + item.id + ')...\nPatiente, le worker démarre.');
+
+        var controller = new AbortController();
+        var timeoutId = setTimeout(function () { controller.abort(); }, CONFIG.TIMEOUT_MS);
+
+        var response = await fetch(CONFIG.API_URL + '/generate', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-API-Key': CONFIG.API_KEY,
+            },
+            body: JSON.stringify({
+                workflow: enrichedWorkflow,
+                gpu: gpu,
+            }),
+            signal: controller.signal,
+        });
+
+        clearTimeout(timeoutId);
+
+        if (!response.ok) {
+            var errorText = '';
+            try { errorText = await response.text(); } catch (_) { errorText = '(erreur de lecture)'; }
+            throw new Error('HTTP ' + response.status + ': ' + errorText);
+        }
+
+        var result = await response.json();
+        hideLoading();
+
+        // Step 3: process response — save locally + display
+        if (result.images && result.images.length > 0) {
+            var imageCount = 0;
+            for (var i = 0; i < result.images.length; i++) {
+                var img = result.images[i];
+                if (img.data) {
+                    // Save all files locally
+                    fetch('/api/modal/save-local', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            filename: img.filename || ('modal_output_' + i + '.png'),
+                            subfolder: img.subfolder || '',
+                            type: img.type || 'output',
+                            data: img.data,
+                        }),
+                    }).catch(function (e) {
+                        console.warn('Modal Gateway: auto-save failed for', img.filename, e);
+                    });
+
+                    // Only display image files (skip .txt, .json sideloads)
+                    if (!img.is_sideload) {
+                        imageCount++;
+                        displayImageInCanvas(img.data, img.filename || 'output_' + i + '.png', imageCount === 1);
+                    }
+                }
+            }
+            showNotification('✅  ' + imageCount + ' image(s) + ' + (result.images.length - imageCount) + ' fichier(s) — Render #' + item.id, 'success');
+        } else {
+            showNotification('✅  Génération terminée sur ' + gpu + ' (Render #' + item.id + ')', 'info');
+        }
+
+        return result;
+    }
+
     /**
      * Patche queuePrompt pour intercepter les envois de workflow.
      * Utilise findApi() pour localiser l'API ComfyUI quel que soit l'emplacement.
      * En mode "local", le comportement d'origine est conservé.
-     * En mode "modal:*", le workflow est sérialisé et envoyé à l'API Modal.
+     * En mode "modal:*", le workflow est mis dans la RenderQueue et exécuté
+     * via executeCloudRender().
      */
     function interceptQueuePrompt() {
         var api = findApi();
@@ -385,107 +615,19 @@
             var select = document.getElementById('modal-gpu-selector');
             var mode = select ? select.value : 'local';
 
-            // ── Mode local : comportement normal ──
+            // ── Mode local: pas de queue ──
             if (mode === 'local') {
                 return originalQueue(number, workflow, options);
             }
 
-            // ── Mode cloud : interception ──
+            // ── Mode cloud: mettre dans la queue ──
             var gpu = mode.split(':')[1];
             if (!gpu) {
                 showNotification('⚠️  GPU invalide, fallback en local.', 'error');
                 return originalQueue(number, workflow, options);
             }
 
-            // Stocker le GPU courant pour les appels d'upload direct
-            currentGpu = gpu.toUpperCase();
-
-            try {
-                // Étape 1 : encoder / uploader les images locales
-                showLoading('☁️  Transfert des fichiers vers ' + currentGpu + '...');
-                var enrichedWorkflow = await encodeLocalImages(workflow);
-
-                // In new ComfyUI, queuePrompt receives { output: <api_format>, workflow: <ui_format> }
-                // We need the API format (output key) to send to the remote ComfyUI
-                if (enrichedWorkflow && enrichedWorkflow.output && typeof enrichedWorkflow.output === 'object') {
-                    console.log('Modal Gateway: detected new ComfyUI format, extracting output key');
-                    enrichedWorkflow = enrichedWorkflow.output;
-                }
-
-                console.log('Modal Gateway: workflow keys =', Object.keys(enrichedWorkflow));
-                console.log('Modal Gateway: workflow has SaveImage?', JSON.stringify(enrichedWorkflow).includes('SaveImage'));
-                console.log('Modal Gateway: workflow sample =', JSON.stringify(enrichedWorkflow).substring(0, 500));
-
-                // Étape 2 : envoyer le workflow à Modal
-                showLoading('☁️  Génération sur ' + currentGpu + ' en cours...\nPatiente un instant, le temps que le worker démarre.');
-
-                var controller = new AbortController();
-                var timeoutId = setTimeout(function () {
-                    controller.abort();
-                }, CONFIG.TIMEOUT_MS);
-
-                var response = await fetch(CONFIG.API_URL + '/generate', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'X-API-Key': CONFIG.API_KEY,
-                    },
-                    body: JSON.stringify({
-                        workflow: enrichedWorkflow,
-                        gpu: currentGpu,
-                    }),
-                    signal: controller.signal,
-                });
-
-                clearTimeout(timeoutId);
-
-                if (!response.ok) {
-                    var errorText = '';
-                    try {
-                        errorText = await response.text();
-                    } catch (_) {
-                        errorText = '(erreur de lecture)';
-                    }
-                    throw new Error('HTTP ' + response.status + ': ' + errorText);
-                }
-
-                var result = await response.json();
-                hideLoading();
-
-                // Afficher les images générées dans le canvas ComfyUI
-                if (result.images && result.images.length > 0) {
-                    for (var i = 0; i < result.images.length; i++) {
-                        var img = result.images[i];
-                        if (img.data) {
-                            displayImageInCanvas(img.data, img.filename || 'output_' + i + '.png', i === result.images.length - 1);
-                        }
-                    }
-                    showNotification('✅  ' + result.images.length + ' image(s) reçue(s) depuis ' + gpu.toUpperCase(), 'success');
-                } else {
-                    showNotification('✅  Génération terminée sur ' + gpu.toUpperCase() + ' (aucune image retournée)', 'info');
-                }
-
-                return result;
-
-            } catch (error) {
-                hideLoading();
-
-                if (error.name === 'AbortError') {
-                    console.error('Modal Gateway: Timeout après', CONFIG.TIMEOUT_MS, 'ms');
-                    showNotification('⏱️  Timeout — Modal ne répond pas après ' + (CONFIG.TIMEOUT_MS / 1000) + 's. Passage en local.', 'error');
-                } else {
-                    console.error('Modal Gateway Error:', error);
-                    showNotification(
-                        '⚠️  Modal inaccessible (' +
-                            (error.message ? error.message.substring(0, 80) : 'erreur inconnue') +
-                            '). Passage en local.',
-                        'error'
-                    );
-                }
-
-                // Fallback : exécuter localement
-                return originalQueue(number, workflow, options);
-            }
+            return RenderQueue.enqueue(number, workflow, options, gpu.toUpperCase());
         };
 
         return true; // Interception réussie
@@ -574,9 +716,17 @@
                 var wrapper = document.createElement('div');
                 wrapper.style.cssText = 'position: relative; display: inline-block;';
 
-                var img = document.createElement('img');
-                img.src = 'data:image/png;base64,' + imgData.data;
-                img.style.cssText = [
+                var isVideo = (imgFilename || '').toLowerCase().endsWith('.mp4');
+                var mediaEl;
+                if (isVideo) {
+                    mediaEl = document.createElement('video');
+                    mediaEl.src = 'data:video/mp4;base64,' + imgData.data;
+                    mediaEl.controls = true;
+                } else {
+                    mediaEl = document.createElement('img');
+                    mediaEl.src = 'data:image/png;base64,' + imgData.data;
+                }
+                mediaEl.style.cssText = [
                     'max-width: 100%', 'max-height: 80vh',
                     'border-radius: 8px', 'box-shadow: 0 8px 32px rgba(0,0,0,0.5)',
                     'object-fit: contain',
@@ -584,7 +734,7 @@
 
                 // Download button (always visible)
                 var dlBtn = document.createElement('a');
-                dlBtn.href = 'data:image/png;base64,' + imgData.data;
+                dlBtn.href = isVideo ? 'data:video/mp4;base64,' + imgData.data : 'data:image/png;base64,' + imgData.data;
                 dlBtn.download = imgFilename;
                 dlBtn.innerHTML = '💾 Save';
                 dlBtn.style.cssText = [
@@ -599,7 +749,7 @@
                 dlBtn.onmouseover = function () { dlBtn.style.background = 'rgba(90,90,255,1)'; };
                 dlBtn.onmouseout = function () { dlBtn.style.background = 'rgba(74,74,255,0.9)'; };
 
-                wrapper.appendChild(img);
+                wrapper.appendChild(mediaEl);
                 wrapper.appendChild(dlBtn);
                 imgContainer.appendChild(wrapper);
             })(images[i], images[i].filename);
@@ -1001,6 +1151,13 @@
             '}',
             '.modal-model-item-info {',
             '  font-size: 11px; color: #777; margin-top: 2px;',
+            '}',
+            '',
+            '#modal-queue-badge {',
+            '  transition: border-color 0.3s, background 0.3s;',
+            '}',
+            '#modal-queue-badge:hover {',
+            '  background: #252535;',
             '}',
         ].join('\n');
         document.head.appendChild(style);
