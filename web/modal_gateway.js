@@ -1161,6 +1161,7 @@
             '      <div class="modal-plugin-actions">',
             '        <button id="cfg-detect-models" class="modal-btn modal-btn-action">🔄 Détecter mes modèles</button>',
             '        <button id="cfg-save-models" class="modal-btn modal-btn-primary" disabled>💾 Save Selection</button>',
+            '        <a id="cfg-toggle-models" style="font-size:12px;color:#6a6aff;cursor:pointer;margin-left:8px;display:none;">Tout sélectionner</a>',
             '      </div>',
             '      <div id="modal-models-list" class="modal-models-list" style="display:none;">',
             '      </div>',
@@ -1196,6 +1197,7 @@
             '      <div class="modal-plugin-actions">',
             '        <button id="cfg-detect-plugins" class="modal-btn modal-btn-action">🔄 Détecter mes nodes</button>',
             '        <button id="cfg-save-plugins" class="modal-btn modal-btn-primary" disabled>💾 Save Plugins</button>',
+            '        <a id="cfg-toggle-plugins" style="font-size:12px;color:#6a6aff;cursor:pointer;margin-left:8px;display:none;">Tout sélectionner</a>',
             '      </div>',
             '      <div id="modal-plugins-list" class="modal-plugins-list" style="display:none;">',
             '      </div>',
@@ -1344,6 +1346,17 @@
                         listEl.appendChild(item);
                     })(detectedPlugins[i]);
                 }
+
+                var toggleBtn = document.getElementById('cfg-toggle-plugins');
+                toggleBtn.style.display = 'inline';
+                toggleBtn.textContent = 'Tout sélectionner';
+                var allChecked = false;
+                toggleBtn.onclick = function () {
+                    allChecked = !allChecked;
+                    var cbs = listEl.querySelectorAll('input[type="checkbox"]:not([disabled])');
+                    for (var t = 0; t < cbs.length; t++) cbs[t].checked = allChecked;
+                    toggleBtn.textContent = allChecked ? 'Tout désélectionner' : 'Tout sélectionner';
+                };
 
                 listEl.style.display = 'block';
                 saveBtn.disabled = false;
@@ -1518,6 +1531,17 @@
                         listEl.appendChild(item);
                     })(detectedModels[i]);
                 }
+
+                var toggleBtn = document.getElementById('cfg-toggle-models');
+                toggleBtn.style.display = 'inline';
+                toggleBtn.textContent = 'Tout sélectionner';
+                var allChecked = false;
+                toggleBtn.onclick = function () {
+                    allChecked = !allChecked;
+                    var cbs = listEl.querySelectorAll('input[type="checkbox"]');
+                    for (var t = 0; t < cbs.length; t++) cbs[t].checked = allChecked;
+                    toggleBtn.textContent = allChecked ? 'Tout désélectionner' : 'Tout sélectionner';
+                };
 
                 listEl.style.display = 'block';
                 saveBtn.disabled = false;
