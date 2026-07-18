@@ -75,6 +75,19 @@ def _build_image() -> modal.Image:
     for node_name in custom_nodes_local:
         image = _install_local_node(image, node_name)
 
+    # ── Copy local ComfyUI user settings (API keys, UI config) ──────────
+    user_dir = Path(__file__).resolve().parent.parent.parent / "user"
+    if user_dir.is_dir():
+        image = image.add_local_dir(
+            str(user_dir),
+            "/root/comfy/ComfyUI/user",
+            copy=True,
+            ignore=["*.sqlite", "*.db", "*.sqlite-wal", "*.sqlite-shm"],
+        )
+        print("Copied local user/ settings directory into image")
+    else:
+        print("Warning: no local user/ directory found — API keys from UI won't be available on Modal")
+
     # ── Reverse-proxy fix so workflow save works behind Modal's edge proxy
     image = image.add_local_dir(
         root_dir / "vendor_nodes" / "reverse_proxy_fix",
