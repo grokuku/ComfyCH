@@ -106,7 +106,12 @@ def _install_ext_plugin(image: modal.Image, plugin: dict) -> modal.Image:
 
     if has_local_fallback:
         # Stage local copy as fallback
-        image = image.add_local_dir(str(local_source), f"/local_nodes_backup/{name}", copy=True)
+        image = image.add_local_dir(
+            str(local_source),
+            f"/local_nodes_backup/{name}",
+            copy=True,
+            ignore=["*.sqlite", "*.db", "*.sqlite-wal", "*.sqlite-shm"],
+        )
         # Try git clone, fall back to local copy on failure
         image = image.run_commands(
             f"cd {nodes_dir} && git clone --recurse-submodules --single-branch "
@@ -152,7 +157,10 @@ def _install_local_node(image: modal.Image, node_name: str) -> modal.Image:
         return image
 
     dest_dir = f"/root/comfy/ComfyUI/custom_nodes/{shlex.quote(node_name)}"
-    image = image.add_local_dir(str(source_dir), dest_dir, copy=True)
+    image = image.add_local_dir(
+        str(source_dir), dest_dir, copy=True,
+        ignore=["*.sqlite", "*.db", "*.sqlite-wal", "*.sqlite-shm"],
+    )
 
     req_file = source_dir / "requirements.txt"
     if req_file.is_file():
