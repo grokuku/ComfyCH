@@ -1373,7 +1373,49 @@
 
         // Gestionnaires d'événements
         overlay.querySelector('.modal-settings-close').onclick = function () { overlay.remove(); };
-        overlay.onclick = function (e) { if (e.target === overlay) overlay.remove(); };
+        // NOTE: clicking on the overlay background no longer closes the modal
+        // overlay.onclick = function (e) { if (e.target === overlay) overlay.remove(); };
+
+        // ── Make modal draggable by header ──
+        var panel = overlay.querySelector('.modal-settings-panel');
+        var header = overlay.querySelector('.modal-settings-header');
+        var isDragging = false;
+        var dragOffsetX = 0;
+        var dragOffsetY = 0;
+
+        if (header && panel) {
+            header.style.cursor = 'move';
+            header.style.userSelect = 'none';
+
+            header.addEventListener('mousedown', function (e) {
+                // Don't start drag if clicking the close button
+                if (e.target.classList.contains('modal-settings-close')) return;
+                isDragging = true;
+                var rect = panel.getBoundingClientRect();
+                dragOffsetX = e.clientX - rect.left;
+                dragOffsetY = e.clientY - rect.top;
+                panel.style.position = 'fixed';
+                panel.style.left = rect.left + 'px';
+                panel.style.top = rect.top + 'px';
+                panel.style.transform = 'none';
+                e.preventDefault();
+            });
+
+            document.addEventListener('mousemove', function (e) {
+                if (!isDragging) return;
+                var x = e.clientX - dragOffsetX;
+                var y = e.clientY - dragOffsetY;
+                // Keep within viewport bounds
+                x = Math.max(0, Math.min(x, window.innerWidth - 100));
+                y = Math.max(0, Math.min(y, window.innerHeight - 50));
+                panel.style.left = x + 'px';
+                panel.style.top = y + 'px';
+            });
+
+            document.addEventListener('mouseup', function () {
+                isDragging = false;
+            });
+        }
 
         document.getElementById('cfg-save-connection').onclick = async function () {
             var apiUrl = document.getElementById('cfg-api-url').value.trim();
