@@ -1273,6 +1273,72 @@
     }
 
     /**
+     * Extracts model filenames and class_types from the current ComfyUI workflow.
+     * Returns {modelFiles: [...], classTypes: [...]} or null if unavailable.
+     */
+    async function getWorkflowInfo() {
+        var appInstance = window.app || (window.comfyAPI && window.comfyAPI.app && window.comfyAPI.app.app);
+        if (!appInstance) return null;
+
+        try {
+            // Try to get the API-format workflow
+            var prompt = null;
+            if (appInstance.graphToPrompt) {
+                prompt = await appInstance.graphToPrompt();
+            } else if (appInstance.graph && appInstance.graph.serialize) {
+                // Fallback: can't easily get API format, return null
+                return null;
+            }
+
+            if (!prompt || typeof prompt !== 'object') return null;
+
+            // The prompt might be {output: {...}, workflow: {...}} (new format) or direct API format
+            var apiPrompt = prompt.output || prompt;
+
+            var modelFiles = [];
+            var classTypes = [];
+            var modelInputKeys = ['unet_name', 'model_name', 'clip_name', 'clip_name1', 'clip_name2',
+                'vae_name', 'lora_name', 'control_net_name', 'upscale_model', 'checkpoint_name',
+                'model_name', 'face_model', 'model_file', 'filename', 'embedding_name'];
+
+            for (var nodeId in apiPrompt) {
+                if (!Object.prototype.hasOwnProperty.call(apiPrompt, nodeId)) continue;
+                var node = apiPrompt[nodeId];
+                if (!node || typeof node !== 'object') continue;
+
+                if (node.class_type) {
+                    classTypes.push(node.class_type);
+                }
+
+                if (node.inputs) {
+                    for (var key in node.inputs) {
+                        if (!Object.prototype.hasOwnProperty.call(node.inputs, key)) continue;
+                        var val = node.inputs[key];
+                        if (typeof val === 'string' && val.length > 0) {
+                            // Check if this input key looks like a model reference
+                            var isModelKey = false;
+                            for (var m = 0; m < modelInputKeys.length; m++) {
+                                if (key === modelInputKeys[m] || key.endsWith('_name') || key.endsWith('_model')) {
+                                    isModelKey = true;
+                                    break;
+                                }
+                            }
+                            if (isModelKey) {
+                                modelFiles.push(val);
+                            }
+                        }
+                    }
+                }
+            }
+
+            return {modelFiles: modelFiles, classTypes: classTypes};
+        } catch (e) {
+            console.warn('Modal Gateway: could not extract workflow info', e);
+            return null;
+        }
+    }
+
+    /**
      * Ouvre la modale de configuration Modal Gateway.
      * Charge la config et le statut depuis l'API ComfyUI.
      */
@@ -1319,6 +1385,7 @@
             '        <button id="cfg-detect-models" class="modal-btn modal-btn-action">🔄 Détecter mes modèles</button>',
             '        <button id="cfg-save-models" class="modal-btn modal-btn-primary" disabled>💾 Save Selection</button>',
             '        <a id="cfg-toggle-models" style="font-size:12px;color:#6a6aff;cursor:pointer;margin-left:8px;display:none;">Tout sélectionner</a>',
+            '        <label style="font-size:12px;color:#999;display:block;margin-top:8px;"><input type="checkbox" id="cfg-models-workflow-only" style="vertical-align:middle;"> 📋 Workflow seulement</label>',
             '      </div>',
             '      <div id="modal-models-list" class="modal-models-list" style="display:none;">',
             '      </div>',
@@ -1355,6 +1422,7 @@
             '        <button id="cfg-detect-plugins" class="modal-btn modal-btn-action">🔄 Détecter mes nodes</button>',
             '        <button id="cfg-save-plugins" class="modal-btn modal-btn-primary" disabled>💾 Save Plugins</button>',
             '        <a id="cfg-toggle-plugins" style="font-size:12px;color:#6a6aff;cursor:pointer;margin-left:8px;display:none;">Tout sélectionner</a>',
+            '        <label style="font-size:12px;color:#999;display:block;margin-top:8px;"><input type="checkbox" id="cfg-plugins-workflow-only" style="vertical-align:middle;"> 📋 Workflow seulement</label>',
             '      </div>',
             '      <div id="modal-plugins-list" class="modal-plugins-list" style="display:none;">',
             '      </div>',
@@ -1557,6 +1625,49 @@
                     toggleBtn.textContent = allChecked ? 'Tout désélectionner' : 'Tout sélectionner';
                 };
 
+                // Filter by workflow if enabled
+                var pluginsWorkflowOnly = document.getElementById('cfg-plugins-workflow-only');
+                if (pluginsWorkflowOnly && pluginsWorkflowOnly.checked) {
+                    var wfInfoPlugins = await getWorkflowInfo();
+                    if (wfInfoPlugins && wfInfoPlugins.classTypes.length > 0) {
+                        try {
+                            var matchResp = await fetch('/api/modal/plugins/match', {
+                                method: 'POST',
+                                headers: {'Content-Type': 'application/json'},
+                                body: JSON.stringify({class_types: wfInfoPlugins.classTypes}),
+                            });
+                            if (matchResp.ok) {
+                                var matchData = await matchResp.json();
+                                var matches = matchData.matches || [];
+                                var matchSet = {};
+                                for (var mi = 0; mi < matches.length; mi++) matchSet[matches[mi]] = true;
+                                var pItems = listEl.querySelectorAll('.modal-plugin-item');
+                                var pVisible = 0;
+                                for (var pi = 0; pi < pItems.length; pi++) {
+                                    var pCb = pItems[pi].querySelector('input[type="checkbox"]');
+                                    if (pCb && matchSet[pCb.dataset.pluginName]) {
+                                        pVisible++;
+                                    } else {
+                                        pItems[pi].style.display = 'none';
+                                    }
+                                }
+                                if (pVisible === 0) {
+                                    listEl.style.display = 'none';
+                                    emptyEl.style.display = 'block';
+                                    emptyEl.textContent = 'Aucun node du workflow trouvé localement.';
+                                    saveBtn.disabled = true;
+                                    return;
+                                }
+                                showNotification('📋 ' + pVisible + ' node(s) du workflow filtré(s)', 'info');
+                            }
+                        } catch (e) {
+                            showNotification('⚠️ Filtrage workflow échoué: ' + e.message, 'error');
+                        }
+                    } else if (!wfInfoPlugins) {
+                        showNotification('⚠️ Impossible de lire le workflow', 'error');
+                    }
+                }
+
                 listEl.style.display = 'block';
                 saveBtn.disabled = false;
 
@@ -1741,6 +1852,38 @@
                     for (var t = 0; t < cbs.length; t++) cbs[t].checked = allChecked;
                     toggleBtn.textContent = allChecked ? 'Tout désélectionner' : 'Tout sélectionner';
                 };
+
+                // Filter by workflow if enabled
+                var workflowOnly = document.getElementById('cfg-models-workflow-only');
+                if (workflowOnly && workflowOnly.checked) {
+                    var wfInfo = await getWorkflowInfo();
+                    if (wfInfo && wfInfo.modelFiles.length > 0) {
+                        var wfFiles = wfInfo.modelFiles.map(function(f) { return f.toLowerCase(); });
+                        var filtered = [];
+                        var items = listEl.querySelectorAll('.modal-model-item');
+                        for (var fi = 0; fi < items.length; fi++) {
+                            var cb = items[fi].querySelector('input[type="checkbox"]');
+                            if (cb && wfFiles.indexOf(cb.dataset.modelFilename.toLowerCase()) !== -1) {
+                                filtered.push(items[fi]);
+                            } else {
+                                items[fi].style.display = 'none';
+                            }
+                        }
+                        // Update count
+                        var visibleCount = filtered.length;
+                        var emptyEl2 = document.getElementById('modal-models-empty');
+                        if (visibleCount === 0) {
+                            listEl.style.display = 'none';
+                            emptyEl2.style.display = 'block';
+                            emptyEl2.textContent = 'Aucun modèle du workflow trouvé localement.';
+                            saveBtn.disabled = true;
+                            return;
+                        }
+                        showNotification('📋 ' + visibleCount + ' modèle(s) du workflow filtré(s) sur ' + detectedModels.length + ' total', 'info');
+                    } else if (!wfInfo) {
+                        showNotification('⚠️ Impossible de lire le workflow', 'error');
+                    }
+                }
 
                 listEl.style.display = 'block';
                 saveBtn.disabled = false;

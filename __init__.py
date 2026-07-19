@@ -240,6 +240,45 @@ def _detect_local_models() -> list[dict]:
     return results
 
 
+def _match_nodes_to_class_types(class_types: list[str]) -> list[str]:
+    """Match workflow class_types to local custom node directories.
+
+    Reads each custom node's __init__.py and looks for NODE_CLASS_MAPPINGS
+    entries that match the given class_types.
+    Returns a list of node directory names that provide any of the class_types.
+    """
+    custom_nodes_dir = PROJECT_ROOT.parent
+    matches: list[str] = []
+
+    if not custom_nodes_dir.is_dir():
+        return matches
+
+    for entry in sorted(custom_nodes_dir.iterdir()):
+        if not entry.is_dir():
+            continue
+        if entry.name.startswith(".") or entry.name.startswith("__"):
+            continue
+        if entry.name == PROJECT_ROOT.name:
+            continue
+
+        init_path = entry / "__init__.py"
+        if not init_path.is_file():
+            continue
+
+        try:
+            content = init_path.read_text(errors="replace")
+            # Check if any class_type appears in the file
+            for ct in class_types:
+                if ct in content:
+                    if entry.name not in matches:
+                        matches.append(entry.name)
+                    break
+        except OSError:
+            pass
+
+    return matches
+
+
 # ─── Initialisation : patcher PromptServer.add_routes ───
 
 try:
@@ -423,6 +462,18 @@ if PromptServer is not None:
                 "models_to_sync": models_to_sync,
             })
 
+        # ── POST /api/modal/plugins/match — match class_types to nodes ──
+        async def post_plugins_match(request):
+            try:
+                data = await request.json()
+            except Exception:
+                return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
+            class_types = data.get("class_types", [])
+            if not isinstance(class_types, list):
+                return web.json_response({"ok": False, "error": "class_types must be a list"}, status=400)
+            matches = _match_nodes_to_class_types(class_types)
+            return web.json_response({"matches": matches})
+
         # ── POST /api/modal/save-local — save image to local filesystem ──
         async def post_save_local(request):
             try:
@@ -480,6 +531,7 @@ if PromptServer is not None:
             ("GET", "/api/modal/plugins/detect", get_plugins_detect),
             ("GET", "/api/modal/plugins", get_plugins),
             ("POST", "/api/modal/plugins", post_plugins),
+            ("POST", "/api/modal/plugins/match", post_plugins_match),
             ("GET", "/api/modal/models/detect", get_models_detect),
             ("GET", "/api/modal/models/select", get_models_select),
             ("POST", "/api/modal/models/select", post_models_select),
