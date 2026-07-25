@@ -82,7 +82,7 @@ def _build_image() -> modal.Image:
             str(user_dir),
             "/root/comfy/ComfyUI/user",
             copy=True,
-            ignore=["*.sqlite", "*.db", "*.sqlite-wal", "*.sqlite-shm"],
+            ignore=["*.sqlite", "*.db", "*.sqlite-wal", "*.sqlite-shm", "*.log", "*.log.*"],
         )
         print("Copied local user/ settings directory into image")
     else:

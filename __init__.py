@@ -357,10 +357,13 @@ if PromptServer is not None:
 
             log_path = _log_path()
             last_size = log_path.stat().st_size if log_path.exists() else 0
+            keepalive_count = 0
 
             try:
-                for _ in range(600):  # Timeout ~5 min (600 * 0.5s)
+                while True:  # No more 5-minute limit
                     await asyncio.sleep(0.5)
+                    keepalive_count += 1
+
                     if log_path.exists():
                         current_size = log_path.stat().st_size
                         if current_size > last_size:
@@ -370,16 +373,31 @@ if PromptServer is not None:
                                 last_size = current_size
                                 for line in new_content.split("\n"):
                                     if line.strip():
-                                        await response.write(
-                                            f"data: {json.dumps({'line': line.rstrip()})}\n\n".encode()
-                                        )
-                    # Vérifier si le processus est fini
+                                        try:
+                                            await response.write(
+                                                f"data: {json.dumps({'line': line.rstrip()})}\n\n".encode()
+                                            )
+                                        except (ConnectionResetError, ConnectionAbortedError):
+                                            return response
+                                    keepalive_count = 0
+
+                    # Send keepalive every 30 seconds to prevent proxy timeout
+                    if keepalive_count >= 60:  # 60 * 0.5s = 30s
+                        try:
+                            await response.write(f": keepalive\n\n".encode())
+                        except (ConnectionResetError, ConnectionAbortedError):
+                            return response
+                        keepalive_count = 0
+
                     status_path = _status_path()
                     if status_path.exists():
                         status = status_path.read_text().strip()
-                        await response.write(
-                            f"event: done\ndata: {json.dumps({'code': status})}\n\n".encode()
-                        )
+                        try:
+                            await response.write(
+                                f"event: done\ndata: {json.dumps({'code': status})}\n\n".encode()
+                            )
+                        except (ConnectionResetError, ConnectionAbortedError):
+                            pass
                         break
             except (ConnectionResetError, ConnectionAbortedError):
                 pass
