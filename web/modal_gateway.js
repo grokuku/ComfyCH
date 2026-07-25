@@ -799,6 +799,36 @@
         inner.textContent = msg;
 
         overlay.appendChild(inner);
+
+        // Make loading overlay draggable
+        (function() {
+            var isDragging = false, offsetX = 0, offsetY = 0;
+            inner.style.cursor = 'grab';
+            inner.addEventListener('mousedown', function(e) {
+                isDragging = true;
+                var rect = inner.getBoundingClientRect();
+                offsetX = e.clientX - rect.left;
+                offsetY = e.clientY - rect.top;
+                inner.style.position = 'fixed';
+                inner.style.left = rect.left + 'px';
+                inner.style.top = rect.top + 'px';
+                inner.style.transform = 'none';
+                inner.style.cursor = 'grabbing';
+                e.preventDefault();
+            });
+            document.addEventListener('mousemove', function(e) {
+                if (!isDragging) return;
+                inner.style.left = Math.max(0, e.clientX - offsetX) + 'px';
+                inner.style.top = Math.max(0, e.clientY - offsetY) + 'px';
+            });
+            document.addEventListener('mouseup', function() {
+                if (isDragging) {
+                    isDragging = false;
+                    inner.style.cursor = 'grab';
+                }
+            });
+        })();
+
         document.body.appendChild(overlay);
     }
 
@@ -892,6 +922,7 @@
             '  justify-content: center;',
             '  z-index: 99999;',
             '  backdrop-filter: blur(2px);',
+            '  pointer-events: none;',
             '}',
             '#modal-loading-content {',
             '  background: #1a1a2e;',
@@ -905,6 +936,7 @@
             '  max-width: 80vw;',
             '  text-align: center;',
             '  line-height: 1.5;',
+            '  pointer-events: auto;',
             '}',
             '#modal-loading-content::before {',
             '  content: "";',
