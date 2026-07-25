@@ -118,6 +118,7 @@
                     next.resolve(result);
                 })
                 .catch(function (err) {
+                    hideLoading();
                     next.status = 'failed';
                     next.error = err.message || 'Unknown error';
                     next.reject(err);
@@ -512,81 +513,84 @@
 
         // Step 1: encode local images
         showLoading('☁️  Transfert des fichiers vers ' + gpu + ' (queue #' + item.id + ')...');
-        var enrichedWorkflow = await encodeLocalImages(item.workflow);
+        try {
+            var enrichedWorkflow = await encodeLocalImages(item.workflow);
 
-        // Extract API-format prompt from new ComfyUI format
-        if (enrichedWorkflow && enrichedWorkflow.output && typeof enrichedWorkflow.output === 'object') {
-            console.log('Modal Gateway: detected new ComfyUI format, extracting output key');
-            enrichedWorkflow = enrichedWorkflow.output;
-        }
+            // Extract API-format prompt from new ComfyUI format
+            if (enrichedWorkflow && enrichedWorkflow.output && typeof enrichedWorkflow.output === 'object') {
+                console.log('Modal Gateway: detected new ComfyUI format, extracting output key');
+                enrichedWorkflow = enrichedWorkflow.output;
+            }
 
-        console.log('Modal Gateway: workflow keys =', Object.keys(enrichedWorkflow));
-        console.log('Modal Gateway: workflow has SaveImage?', JSON.stringify(enrichedWorkflow).includes('SaveImage'));
-        console.log('Modal Gateway: workflow sample =', JSON.stringify(enrichedWorkflow).substring(0, 500));
+            console.log('Modal Gateway: workflow keys =', Object.keys(enrichedWorkflow));
+            console.log('Modal Gateway: workflow has SaveImage?', JSON.stringify(enrichedWorkflow).includes('SaveImage'));
+            console.log('Modal Gateway: workflow sample =', JSON.stringify(enrichedWorkflow).substring(0, 500));
 
-        // Step 2: send to Modal
-        showLoading('☁️  Génération sur ' + gpu + ' (queue #' + item.id + ')...\nPatiente, le worker démarre.');
+            // Step 2: send to Modal
+            showLoading('☁️  Génération sur ' + gpu + ' (queue #' + item.id + ')...\nPatiente, le worker démarre.');
 
-        var controller = new AbortController();
-        var timeoutId = setTimeout(function () { controller.abort(); }, CONFIG.TIMEOUT_MS);
+            var controller = new AbortController();
+            var timeoutId = setTimeout(function () { controller.abort(); }, CONFIG.TIMEOUT_MS);
 
-        var response = await fetch(CONFIG.API_URL + '/generate', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-API-Key': CONFIG.API_KEY,
-            },
-            body: JSON.stringify({
-                workflow: enrichedWorkflow,
-                gpu: gpu,
-            }),
-            signal: controller.signal,
-        });
+            var response = await fetch(CONFIG.API_URL + '/generate', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-API-Key': CONFIG.API_KEY,
+                },
+                body: JSON.stringify({
+                    workflow: enrichedWorkflow,
+                    gpu: gpu,
+                }),
+                signal: controller.signal,
+            });
 
-        clearTimeout(timeoutId);
+            clearTimeout(timeoutId);
 
-        if (!response.ok) {
-            var errorText = '';
-            try { errorText = await response.text(); } catch (_) { errorText = '(erreur de lecture)'; }
-            throw new Error('HTTP ' + response.status + ': ' + errorText);
-        }
+            if (!response.ok) {
+                var errorText = '';
+                try { errorText = await response.text(); } catch (_) { errorText = '(erreur de lecture)'; }
+                throw new Error('HTTP ' + response.status + ': ' + errorText);
+            }
 
-        var result = await response.json();
-        hideLoading();
+            var result = await response.json();
 
-        // Step 3: process response — save locally + display
-        if (result.images && result.images.length > 0) {
-            var imageCount = 0;
-            for (var i = 0; i < result.images.length; i++) {
-                var img = result.images[i];
-                if (img.data) {
-                    // Save all files locally
-                    fetch('/api/modal/save-local', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            filename: img.filename || ('modal_output_' + i + '.png'),
-                            subfolder: img.subfolder || '',
-                            type: img.type || 'output',
-                            data: img.data,
-                        }),
-                    }).catch(function (e) {
-                        console.warn('Modal Gateway: auto-save failed for', img.filename, e);
-                    });
+            // Step 3: process response — save locally + display
+            if (result.images && result.images.length > 0) {
+                var imageCount = 0;
+                for (var i = 0; i < result.images.length; i++) {
+                    var img = result.images[i];
+                    if (img.data) {
+                        // Save all files locally
+                        fetch('/api/modal/save-local', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                filename: img.filename || ('modal_output_' + i + '.png'),
+                                subfolder: img.subfolder || '',
+                                type: img.type || 'output',
+                                data: img.data,
+                            }),
+                        }).catch(function (e) {
+                            console.warn('Modal Gateway: auto-save failed for', img.filename, e);
+                        });
 
-                    // Only display image files (skip .txt, .json sideloads)
-                    if (!img.is_sideload) {
-                        imageCount++;
-                        displayImageInCanvas(img.data, img.filename || 'output_' + i + '.png', imageCount === 1);
+                        // Only display image files (skip .txt, .json sideloads)
+                        if (!img.is_sideload) {
+                            imageCount++;
+                            displayImageInCanvas(img.data, img.filename || 'output_' + i + '.png', imageCount === 1);
+                        }
                     }
                 }
+                showNotification('✅  ' + imageCount + ' image(s) + ' + (result.images.length - imageCount) + ' fichier(s) — Render #' + item.id, 'success');
+            } else {
+                showNotification('✅  Génération terminée sur ' + gpu + ' (Render #' + item.id + ')', 'info');
             }
-            showNotification('✅  ' + imageCount + ' image(s) + ' + (result.images.length - imageCount) + ' fichier(s) — Render #' + item.id, 'success');
-        } else {
-            showNotification('✅  Génération terminée sur ' + gpu + ' (Render #' + item.id + ')', 'info');
-        }
 
-        return result;
+            return result;
+        } finally {
+            hideLoading();
+        }
     }
 
     /**
@@ -916,12 +920,11 @@
             '  left: 0;',
             '  width: 100%;',
             '  height: 100%;',
-            '  background: rgba(0, 0, 0, 0.65);',
+            '  background: rgba(0, 0, 0, 0.25);',
             '  display: flex;',
             '  align-items: center;',
             '  justify-content: center;',
             '  z-index: 99999;',
-            '  backdrop-filter: blur(2px);',
             '  pointer-events: none;',
             '}',
             '#modal-loading-content {',
