@@ -183,6 +183,38 @@ def sync_hf_models() -> None:
         download_external_model(model["url"], model["filename"], model["model_dir"])
 
 
+# ── Remote function: sync user settings to volume ────────────────────────
+
+user_vol = modal.Volume.from_name("comfy-user-settings", create_if_missing=True)
+
+
+@app.function(
+    cpu=1,
+    memory=512,
+    volumes={"/user-settings": user_vol},
+    timeout=120,
+)
+def sync_user_settings():
+    """Upload the local ComfyUI user/ directory to the comfy-user-settings volume."""
+    from pathlib import Path
+
+    # Find local user/ directory
+    user_dir = Path(__file__).resolve().parent.parent.parent / "user"
+    if not user_dir.is_dir():
+        print(f"❌ Local user/ directory not found at {user_dir}")
+        return {"error": "user/ directory not found"}
+
+    print(f"📁 Uploading user settings from {user_dir}...")
+
+    # Upload to volume
+    with user_vol.batch_upload() as batch:
+        batch.put_directory(str(user_dir), "/")
+
+    user_vol.commit()
+    print(f"✅ User settings synced to volume")
+    return {"ok": True}
+
+
 # ── Local entrypoint: orchestrate the full sync ──────────────────────────
 
 
