@@ -194,21 +194,17 @@ user_vol = modal.Volume.from_name("comfy-user-settings", create_if_missing=True)
     volumes={"/user-settings": user_vol},
     timeout=120,
 )
-def sync_user_settings():
+def sync_user_settings(user_dir: str):
     """Upload the local ComfyUI user/ directory to the comfy-user-settings volume."""
-    from pathlib import Path
-
-    # Find local user/ directory
-    user_dir = Path(__file__).resolve().parent.parent.parent / "user"
-    if not user_dir.is_dir():
+    src = Path(user_dir)
+    if not src.is_dir():
         print(f"❌ Local user/ directory not found at {user_dir}")
-        return {"error": "user/ directory not found"}
+        return {"error": f"user/ directory not found at {user_dir}"}
 
     print(f"📁 Uploading user settings from {user_dir}...")
 
-    # Upload to volume
     with user_vol.batch_upload() as batch:
-        batch.put_directory(str(user_dir), "/")
+        batch.put_directory(str(src), "/")
 
     user_vol.commit()
     print(f"✅ User settings synced to volume")
@@ -260,7 +256,8 @@ def main() -> None:
     print(f"\n{'='*60}")
     print(f"👤 Step 3: Syncing user settings to volume")
     print(f"{'='*60}\n")
-    sync_user_settings.remote()
+    user_settings_dir = str(Path(__file__).resolve().parent.parent.parent / "user")
+    sync_user_settings.remote(user_settings_dir)
 
     print(f"\n{'='*60}")
     print("✅ Sync terminée !")
