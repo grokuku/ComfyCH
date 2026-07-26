@@ -515,25 +515,49 @@
             console.log('Modal Gateway: workflow has SaveImage?', JSON.stringify(enrichedWorkflow).includes('SaveImage'));
             console.log('Modal Gateway: workflow sample =', JSON.stringify(enrichedWorkflow).substring(0, 500));
 
-            // Step 2: send to Modal
-            showLoading('☁️  Génération sur ' + gpu + ' (queue #' + item.id + ')...\nPatiente, le worker démarre.');
+            // Step 2: send to Modal with retry (handles worker cold start 303 redirects)
+            var maxRetries = 3;
+            var response = null;
+            for (var attempt = 1; attempt <= maxRetries; attempt++) {
+                try {
+                    showLoading('☁️  Génération sur ' + gpu + ' (queue #' + item.id + ', tentative ' + attempt + '/' + maxRetries + ')...\nPatiente, le worker démarre.');
 
-            var controller = new AbortController();
-            var timeoutId = setTimeout(function () { controller.abort(); }, CONFIG.TIMEOUT_MS);
+                    var controller = new AbortController();
+                    var timeoutId = setTimeout(function () { controller.abort(); }, CONFIG.TIMEOUT_MS);
 
-            var response = await fetch(CONFIG.API_URL + '/generate', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({
-                    workflow: enrichedWorkflow,
-                    gpu: gpu,
-                }),
-                signal: controller.signal,
-            });
+                    response = await fetch(CONFIG.API_URL + '/generate', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify({
+                            workflow: enrichedWorkflow,
+                            gpu: gpu,
+                        }),
+                        signal: controller.signal,
+                    });
 
-            clearTimeout(timeoutId);
+                    clearTimeout(timeoutId);
+                    break; // Success, exit retry loop
+                } catch (fetchErr) {
+                    clearTimeout(timeoutId);
+                    if (attempt < maxRetries && fetchErr.name === 'AbortError') {
+                        // AbortError = timeout, not a cold start issue
+                        throw fetchErr;
+                    }
+                    if (attempt < maxRetries) {
+                        console.warn('Modal Gateway: fetch attempt ' + attempt + ' failed, retrying in 5s...', fetchErr.message);
+                        showLoading('⏳ Worker en cours de démarrage... nouvelle tentative dans 5s (' + (attempt + 1) + '/' + maxRetries + ')');
+                        await new Promise(function(resolve) { setTimeout(resolve, 5000); });
+                    } else {
+                        throw fetchErr; // All retries exhausted
+                    }
+                }
+            }
+
+            if (!response) {
+                throw new Error('All fetch attempts failed');
+            }
 
             if (!response.ok) {
                 var errorText = '';
