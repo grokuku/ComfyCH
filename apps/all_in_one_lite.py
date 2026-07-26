@@ -89,7 +89,7 @@ web_app.add_middleware(
         "https://localhost:8188",
         "https://127.0.0.1:8188",
     ],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
