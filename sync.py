@@ -187,16 +187,29 @@ def sync_hf_models() -> None:
 
 
 def _clear_user_volume(vol: modal.Volume) -> None:
-    """Remove all files from the user-settings volume to prepare for re-upload."""
+    """Delete and recreate the user-settings volume for a clean slate."""
     import subprocess
+    import time
 
+    # Delete the volume
     result = subprocess.run(
-        ["modal", "volume", "rm", "comfy-user-settings", "/", "--recursive", "-y"],
+        ["modal", "volume", "delete", "comfy-user-settings"],
+        capture_output=True, text=True, input="y\n",
+    )
+    if result.returncode != 0:
+        print(f"  ⚠️ Volume delete returned {result.returncode}: {result.stderr.strip()}")
+
+    # Recreate the volume
+    result = subprocess.run(
+        ["modal", "volume", "create", "comfy-user-settings"],
         capture_output=True, text=True,
     )
     if result.returncode != 0:
-        # Volume might be empty or not exist — that's fine
-        pass
+        print(f"  ⚠️ Volume create returned {result.returncode}: {result.stderr.strip()}")
+
+    # Brief pause for propagation
+    time.sleep(2)
+    print("  🧹 Volume comfy-user-settings cleared (deleted + recreated)")
 
 
 # ── Local entrypoint: orchestrate the full sync ──────────────────────────
@@ -252,6 +265,9 @@ def main() -> None:
         _clear_user_volume(user_vol)
     except Exception as e:
         print(f"⚠️ Could not clear volume: {e}")
+
+    # Re-create volume reference after delete/recreate
+    user_vol = modal.Volume.from_name("comfy-user-settings", create_if_missing=True)
 
     user_dir = Path(__file__).resolve().parent.parent.parent / "user"
     if user_dir.is_dir():
