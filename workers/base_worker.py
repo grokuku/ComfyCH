@@ -94,6 +94,38 @@ class ComfyWorker:
         # ── Create model symlinks from volume manifest ────────────────
         self._link_models_from_manifest()
 
+        # ── Sync user settings from volume ────────────────────────────
+        self._sync_user_settings_from_volume()
+
+    def _sync_user_settings_from_volume(self):
+        """Copy user settings from the mounted volume to the ComfyUI user/ directory."""
+        vol_path = Path("/user-settings")
+        user_path = Path("/root/comfy/ComfyUI/user")
+
+        if not vol_path.is_dir():
+            print("[ComfyWorker] No user-settings volume mounted")
+            return
+
+        if not any(vol_path.iterdir()):
+            print("[ComfyWorker] User settings volume is empty — skipping")
+            return
+
+        import shutil
+        user_path.mkdir(parents=True, exist_ok=True)
+
+        # Copy each item from the volume to the user directory
+        count = 0
+        for item in vol_path.iterdir():
+            dest = user_path / item.name
+            if item.is_dir():
+                shutil.copytree(str(item), str(dest), dirs_exist_ok=True)
+                count += 1
+            elif item.is_file():
+                shutil.copy2(str(item), str(dest))
+                count += 1
+
+        print(f"[ComfyWorker] Synced {count} items from user-settings volume")
+
     def _link_models_from_manifest(self):
         """Read /cache/model_manifest.json and create symlinks in ComfyUI model dirs."""
         import json
@@ -134,6 +166,9 @@ class ComfyWorker:
         wait_for_port(8000, timeout=30)
         # Also create symlinks on restore (in case volume changed since snapshot)
         self._link_models_from_manifest()
+
+        # Sync user settings on restore too
+        self._sync_user_settings_from_volume()
         print("[ComfyWorker] App restored from snapshot!")
 
     @modal.exit()

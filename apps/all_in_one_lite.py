@@ -28,7 +28,10 @@ app = modal.App(name="modal-comfy-gateway-lite", image=image)
 
 @app.cls(
     gpu=L4Worker.gpu_type,
-    volumes={"/cache": modal.Volume.from_name("comfy-models", create_if_missing=True)},
+    volumes={
+        "/cache": modal.Volume.from_name("comfy-models", create_if_missing=True),
+        "/user-settings": modal.Volume.from_name("comfy-user-settings", create_if_missing=True),
+    },
     scaledown_window=L4Worker.scaledown_window,
     enable_memory_snapshot=True,
     experimental_options={"enable_gpu_snapshot": True},
@@ -39,7 +42,10 @@ class L4(L4Worker):
 
 @app.cls(
     gpu=L40SWorker.gpu_type,
-    volumes={"/cache": modal.Volume.from_name("comfy-models", create_if_missing=True)},
+    volumes={
+        "/cache": modal.Volume.from_name("comfy-models", create_if_missing=True),
+        "/user-settings": modal.Volume.from_name("comfy-user-settings", create_if_missing=True),
+    },
     scaledown_window=L40SWorker.scaledown_window,
     enable_memory_snapshot=True,
     experimental_options={"enable_gpu_snapshot": True},
@@ -50,7 +56,10 @@ class L40S(L40SWorker):
 
 @app.cls(
     gpu=A100Worker.gpu_type,
-    volumes={"/cache": modal.Volume.from_name("comfy-models", create_if_missing=True)},
+    volumes={
+        "/cache": modal.Volume.from_name("comfy-models", create_if_missing=True),
+        "/user-settings": modal.Volume.from_name("comfy-user-settings", create_if_missing=True),
+    },
     scaledown_window=A100Worker.scaledown_window,
     enable_memory_snapshot=True,
     experimental_options={"enable_gpu_snapshot": True},

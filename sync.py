@@ -224,6 +224,12 @@ def main() -> None:
         print(f"{'='*60}\n")
         sync_hf_models.remote()
 
+    # ── Step 3: Sync user settings ───────────────────────────────
+    print(f"\n{'='*60}")
+    print(f"👤 Step 3: Syncing user settings to volume")
+    print(f"{'='*60}\n")
+    sync_user_settings.remote()
+
     print(f"\n{'='*60}")
     print("✅ Sync terminée !")
     print(f"{'='*60}")

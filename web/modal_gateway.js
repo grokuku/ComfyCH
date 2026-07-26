@@ -1420,6 +1420,20 @@
             '      <div class="modal-plugin-note">ℹ️ Sauvegardez votre sélection puis cliquez sur <strong>Sync Models</strong> pour uploader vers Modal.</div>',
             '    </section>',
             '    <section>',
+            '      <h3>👤 User Settings</h3>',
+            '      <p style="font-size:12px;color:#999;margin:0 0 8px 0;">Synchronisez vos paramètres ComfyUI (workflows, clés API, config) vers le volume cloud.</p>',
+            '      <div class="modal-status-row">',
+            '        <span>📁 Dossier user/ local</span>',
+            '        <span class="status-badge" id="status-user-settings">⏳ Vérification...</span>',
+            '      </div>',
+            '      <div class="modal-status-row">',
+            '        <span>🔄 Dernière sync</span>',
+            '        <span class="status-badge" id="status-user-sync">⏳ Jamais</span>',
+            '      </div>',
+            '      <button id="cfg-sync-user" class="modal-btn modal-btn-action">👤 Sync User Settings</button>',
+            '      <div class="modal-plugin-note">ℹ️ Les workflows, clés API et préférences UI seront copiés vers le volume. Un redémarrage du worker est nécessaire pour appliquer les changements.</div>',
+            '    </section>',
+            '    <section>',
             '      <h3>🚀 Déploiement</h3>',
             '      <div class="modal-status-row">',
             '        <span>🌐 API Gateway déployée</span>',
@@ -1971,6 +1985,45 @@
                 saveBtn.textContent = '💾 Save Selection';
                 showNotification('❌ Erreur sauvegarde : ' + e.message, 'error');
             }
+        };
+
+        // ─── User Settings ────────────────────────────────────────────────
+        // Fetch status
+        var userStatusEl = document.getElementById('status-user-settings');
+        var userSyncEl = document.getElementById('status-user-sync');
+        
+        if (userStatusEl) {
+            fetch('/api/modal/user-settings/status')
+                .then(function(r) { return r.json(); })
+                .then(function(status) {
+                    if (status.exists) {
+                        userStatusEl.textContent = '✅ ' + status.file_count + ' fichiers (' + status.size_mb + ' MB)';
+                    } else {
+                        userStatusEl.textContent = '❌ Non trouvé';
+                    }
+                })
+                .catch(function() {
+                    userStatusEl.textContent = '❌ Erreur';
+                });
+        }
+        
+        if (userSyncEl) {
+            fetch('/api/modal/config')
+                .then(function(r) { return r.json(); })
+                .then(function(config) {
+                    if (config.last_user_sync) {
+                        userSyncEl.textContent = '✅ ' + escapeHtml(config.last_user_sync);
+                    } else {
+                        userSyncEl.textContent = '⏳ Jamais';
+                    }
+                })
+                .catch(function() {
+                    userSyncEl.textContent = '❌ Erreur';
+                });
+        }
+
+        document.getElementById('cfg-sync-user').onclick = function() {
+            runOperation('sync-user');
         };
     }
 

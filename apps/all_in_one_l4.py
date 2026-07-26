@@ -26,7 +26,10 @@ app = modal.App(name="modal-comfy-gateway-l4", image=image)
 
 @app.cls(
     gpu=L4Worker.gpu_type,
-    volumes={"/cache": modal.Volume.from_name("comfy-models", create_if_missing=True)},
+    volumes={
+        "/cache": modal.Volume.from_name("comfy-models", create_if_missing=True),
+        "/user-settings": modal.Volume.from_name("comfy-user-settings", create_if_missing=True),
+    },
     scaledown_window=L4Worker.scaledown_window,
     enable_memory_snapshot=True,
     experimental_options={"enable_gpu_snapshot": True},
