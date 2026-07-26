@@ -9,7 +9,6 @@ Deploy::
 from __future__ import annotations
 
 import asyncio
-import os
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -62,27 +61,8 @@ web_app.add_middleware(
     allow_headers=["*"],
 )
 
-API_KEY = os.environ.get("MODAL_GATEWAY_KEY", "dev-key-please-change")
-
 # ─── Session tracking : dernier GPU utilisé par session ───
 last_gpu: dict[str, str] = {}
-
-
-@web_app.middleware("http")
-async def verify_api_key(request: Request, call_next):
-    """Protège tous les endpoints sauf /health et /gpus"""
-    # OPTIONS = preflight CORS → laisser passer sans auth
-    if request.method == "OPTIONS":
-        return await call_next(request)
-    if request.url.path in ("/health", "/gpus", "/docs", "/openapi.json"):
-        return await call_next(request)
-    key = request.headers.get("X-API-Key")
-    if not key or key != API_KEY:
-        return JSONResponse(
-            {"error": "Unauthorized", "message": "X-API-Key header required"},
-            status_code=401,
-        )
-    return await call_next(request)
 
 
 WORKER_MAP = {
@@ -262,9 +242,7 @@ async def health():
 
 
 # Point d'entrée Modal — expose le routeur FastAPI
-@app.function(
-    secrets=[modal.Secret.from_name("modal-gateway-key")],
-)
+@app.function()
 @modal.concurrent(max_inputs=20)
 @modal.asgi_app(label="gateway-l4")
 def gateway():

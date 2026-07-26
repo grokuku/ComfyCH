@@ -32,11 +32,6 @@
         /** Nombre maximum de tentatives d'interception. */
         MAX_RETRIES: 20,
 
-        /**
-         * Clé API pour l'authentification auprès du Gateway Modal.
-         * Chargée depuis localStorage ou l'API serveur.
-         */
-        API_KEY: localStorage.getItem('modal-api-key') || '',
     };
 
     // ─── Chargement de la config depuis le serveur au démarrage ────────────
@@ -48,10 +43,7 @@
                 CONFIG.API_URL = config.api_url;
                 localStorage.setItem('modal-api-url', config.api_url);
             }
-            if (config.api_key) {
-                CONFIG.API_KEY = config.api_key;
-                localStorage.setItem('modal-api-key', config.api_key);
-            }
+
         })
         .catch(function () {
             // Mode dégradé : utiliser les valeurs par défaut (vides ou localStorage)
@@ -317,9 +309,6 @@
 
         var response = await fetch(CONFIG.API_URL + '/upload/image' + gpuParam, {
             method: 'POST',
-            headers: {
-                'X-API-Key': CONFIG.API_KEY,
-            },
             body: formData,
         });
 
@@ -536,7 +525,6 @@
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
-                    'X-API-Key': CONFIG.API_KEY,
                 },
                 body: JSON.stringify({
                     workflow: enrichedWorkflow,
@@ -1382,7 +1370,7 @@
         if (document.getElementById('modal-settings-overlay')) return;
 
         // Charger la config depuis l'API ComfyUI
-        var config = { api_url: CONFIG.API_URL, api_key: CONFIG.API_KEY };
+        var config = { api_url: CONFIG.API_URL };
         try {
             var resp = await fetch('/api/modal/config');
             if (resp.ok) config = await resp.json();
@@ -1409,8 +1397,6 @@
             '      <h3>🔌 Connexion API Modal</h3>',
             '      <label>URL de l\'API</label>',
             '      <input type="text" id="cfg-api-url" value="' + escapeHtml(config.api_url || '') + '" placeholder="https://xxx.modal.run" />',
-            '      <label>Clé API (X-API-Key)</label>',
-            '      <input type="password" id="cfg-api-key" value="' + escapeHtml(config.api_key || '') + '" placeholder="Votre clé secrète" />',
             '      <button id="cfg-save-connection" class="modal-btn modal-btn-primary">💾 Sauvegarder</button>',
             '    </section>',
             '    <section>',
@@ -1522,22 +1508,19 @@
 
         document.getElementById('cfg-save-connection').onclick = async function () {
             var apiUrl = document.getElementById('cfg-api-url').value.trim();
-            var apiKey = document.getElementById('cfg-api-key').value.trim();
             try {
                 var saveResp = await fetch('/api/modal/config', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ api_url: apiUrl, api_key: apiKey }),
+                    body: JSON.stringify({ api_url: apiUrl }),
                 });
                 if (!saveResp.ok) {
                     throw new Error('HTTP ' + saveResp.status);
                 }
                 // Mettre à jour les constantes
                 CONFIG.API_URL = apiUrl;
-                CONFIG.API_KEY = apiKey;
                 // Persister en localStorage
                 if (apiUrl) localStorage.setItem('modal-api-url', apiUrl);
-                if (apiKey) localStorage.setItem('modal-api-key', apiKey);
                 showNotification('✅ Configuration sauvegardée', 'success');
             } catch (e) {
                 showNotification('❌ Erreur lors de la sauvegarde : ' + e.message, 'error');
