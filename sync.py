@@ -275,7 +275,6 @@ def main() -> None:
                 rel_path = f.relative_to(user_dir)
                 batch.put_file(str(f), f"/{rel_path}")
 
-        user_vol.commit()
         print(f"✅ User settings synced to volume ({len(files_to_upload)} files)")
     else:
         print(f"❌ Local user/ directory not found at {user_dir}")
