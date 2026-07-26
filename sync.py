@@ -147,12 +147,24 @@ def upload_and_link_local_models(models_list: list[dict]) -> dict:
         print(f"  ✅ {filename}: copied ({size_mb:.0f} MB) + linked -> {target_path}")
         results[filename] = {"ok": True, "size_mb": round(size_mb, 1)}
 
-    # Write manifest for workers to read at startup
+    # Write manifest for workers to read at startup — ACCUMULATE with existing entries
     import json as _json
-    manifest = {model["filename"]: model["model_dir"] for model in models_list if results.get(model["filename"], {}).get("ok")}
     manifest_path = Path("/cache") / "model_manifest.json"
-    manifest_path.write_text(_json.dumps(manifest, indent=2))
-    print(f"  📝 Manifest written: {len(manifest)} entries")
+
+    # Read existing manifest if present
+    existing_manifest = {}
+    if manifest_path.exists():
+        try:
+            existing_manifest = _json.loads(manifest_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # Merge: new entries overwrite existing ones with same filename, but keep others
+    new_entries = {model["filename"]: model["model_dir"] for model in models_list if results.get(model["filename"], {}).get("ok")}
+    existing_manifest.update(new_entries)
+
+    manifest_path.write_text(_json.dumps(existing_manifest, indent=2))
+    print(f"  📝 Manifest updated: {len(existing_manifest)} total entries ({len(new_entries)} new/updated)")
 
     # Commit volume changes
     vol.commit()
