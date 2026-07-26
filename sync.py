@@ -183,34 +183,6 @@ def sync_hf_models() -> None:
         download_external_model(model["url"], model["filename"], model["model_dir"])
 
 
-# ── Remote function: sync user settings to volume ────────────────────────
-
-user_vol = modal.Volume.from_name("comfy-user-settings", create_if_missing=True)
-
-
-@app.function(
-    cpu=1,
-    memory=512,
-    volumes={"/user-settings": user_vol},
-    timeout=120,
-)
-def sync_user_settings(user_dir: str):
-    """Upload the local ComfyUI user/ directory to the comfy-user-settings volume."""
-    src = Path(user_dir)
-    if not src.is_dir():
-        print(f"❌ Local user/ directory not found at {user_dir}")
-        return {"error": f"user/ directory not found at {user_dir}"}
-
-    print(f"📁 Uploading user settings from {user_dir}...")
-
-    with user_vol.batch_upload() as batch:
-        batch.put_directory(str(src), "/")
-
-    user_vol.commit()
-    print(f"✅ User settings synced to volume")
-    return {"ok": True}
-
-
 # ── Local entrypoint: orchestrate the full sync ──────────────────────────
 
 
@@ -252,12 +224,20 @@ def main() -> None:
         print(f"{'='*60}\n")
         sync_hf_models.remote()
 
-    # ── Step 3: Sync user settings ───────────────────────────────
+    # ── Step 3: Sync user settings to volume ───────────────────────────────
     print(f"\n{'='*60}")
     print(f"👤 Step 3: Syncing user settings to volume")
     print(f"{'='*60}\n")
-    user_settings_dir = str(Path(__file__).resolve().parent.parent.parent / "user")
-    sync_user_settings.remote(user_settings_dir)
+
+    user_vol = modal.Volume.from_name("comfy-user-settings", create_if_missing=True)
+    user_dir = Path(__file__).resolve().parent.parent.parent / "user"
+    if user_dir.is_dir():
+        print(f"📁 Uploading user settings from {user_dir}...")
+        with user_vol.batch_upload() as batch:
+            batch.put_directory(str(user_dir), "/")
+        print(f"✅ User settings synced to volume")
+    else:
+        print(f"❌ Local user/ directory not found at {user_dir}")
 
     print(f"\n{'='*60}")
     print("✅ Sync terminée !")
