@@ -183,6 +183,22 @@ def sync_hf_models() -> None:
         download_external_model(model["url"], model["filename"], model["model_dir"])
 
 
+# ── Helper: clear user-settings volume ──────────────────────────────
+
+
+def _clear_user_volume(vol: modal.Volume) -> None:
+    """Remove all files from the user-settings volume to prepare for re-upload."""
+    import subprocess
+
+    result = subprocess.run(
+        ["modal", "volume", "rm", "comfy-user-settings", "/", "--recursive", "-y"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        # Volume might be empty or not exist — that's fine
+        pass
+
+
 # ── Local entrypoint: orchestrate the full sync ──────────────────────────
 
 
@@ -230,12 +246,37 @@ def main() -> None:
     print(f"{'='*60}\n")
 
     user_vol = modal.Volume.from_name("comfy-user-settings", create_if_missing=True)
+
+    # Clear existing files from the volume before uploading
+    try:
+        _clear_user_volume(user_vol)
+    except Exception as e:
+        print(f"⚠️ Could not clear volume: {e}")
+
     user_dir = Path(__file__).resolve().parent.parent.parent / "user"
     if user_dir.is_dir():
-        print(f"📁 Uploading user settings from {user_dir}...")
+        # Build a filtered list of files to upload (skip .db files)
+        files_to_upload = []
+        for f in user_dir.rglob("*"):
+            if not f.is_file():
+                continue
+            # Skip database and cache files that might be locked/modified during upload
+            if f.suffix.lower() in (".db", ".sqlite", ".sqlite-wal", ".sqlite-shm", ".log", ".tmp", ".temp"):
+                continue
+            # Skip cache directories
+            if "cache" in f.parts or "__manager" in f.parts:
+                continue
+            files_to_upload.append(f)
+
+        print(f"📁 Uploading {len(files_to_upload)} user setting file(s) from {user_dir}...")
+
         with user_vol.batch_upload() as batch:
-            batch.put_directory(str(user_dir), "/")
-        print(f"✅ User settings synced to volume")
+            for f in files_to_upload:
+                rel_path = f.relative_to(user_dir)
+                batch.put_file(str(f), f"/{rel_path}")
+
+        user_vol.commit()
+        print(f"✅ User settings synced to volume ({len(files_to_upload)} files)")
     else:
         print(f"❌ Local user/ directory not found at {user_dir}")
 
