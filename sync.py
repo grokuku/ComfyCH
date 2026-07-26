@@ -118,15 +118,15 @@ def upload_and_link_local_models(models_list: list[dict]) -> dict:
         src_size = src.stat().st_size
         size_mb = src_size / (1024 * 1024)
 
-        # Copy to volume
+        # Copy to volume (skip if already exists with same size)
         dst = Path("/cache") / filename
-        print(f"  📤 Copying to volume: {filename} ({size_mb:.0f} MB)")
-
-        # Remove existing file on volume if any
-        if dst.exists() or dst.is_symlink():
-            dst.unlink()
-
-        shutil.copy2(str(src), str(dst))
+        if dst.exists() and dst.stat().st_size == src_size:
+            print(f"  ⏭️ Already on volume: {filename} — skipping copy, updating symlink only")
+        else:
+            print(f"  📤 Copying to volume: {filename} ({size_mb:.0f} MB)")
+            if dst.exists() or dst.is_symlink():
+                dst.unlink()
+            shutil.copy2(str(src), str(dst))
 
         # Verify copy
         dst_size = dst.stat().st_size
