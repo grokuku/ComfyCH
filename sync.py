@@ -195,35 +195,6 @@ def sync_hf_models() -> None:
         download_external_model(model["url"], model["filename"], model["model_dir"])
 
 
-# ── Helper: clear user-settings volume ──────────────────────────────
-
-
-def _clear_user_volume(vol: modal.Volume) -> None:
-    """Delete and recreate the user-settings volume for a clean slate."""
-    import subprocess
-    import time
-
-    # Delete the volume
-    result = subprocess.run(
-        ["modal", "volume", "delete", "comfy-user-settings"],
-        capture_output=True, text=True, input="y\n",
-    )
-    if result.returncode != 0:
-        print(f"  ⚠️ Volume delete returned {result.returncode}: {result.stderr.strip()}")
-
-    # Recreate the volume
-    result = subprocess.run(
-        ["modal", "volume", "create", "comfy-user-settings"],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        print(f"  ⚠️ Volume create returned {result.returncode}: {result.stderr.strip()}")
-
-    # Brief pause for propagation
-    time.sleep(2)
-    print("  🧹 Volume comfy-user-settings cleared (deleted + recreated)")
-
-
 # ── Local entrypoint: orchestrate the full sync ──────────────────────────
 
 
@@ -272,15 +243,6 @@ def main() -> None:
 
     user_vol = modal.Volume.from_name("comfy-user-settings", create_if_missing=True)
 
-    # Clear existing files from the volume before uploading
-    try:
-        _clear_user_volume(user_vol)
-    except Exception as e:
-        print(f"⚠️ Could not clear volume: {e}")
-
-    # Re-create volume reference after delete/recreate
-    user_vol = modal.Volume.from_name("comfy-user-settings", create_if_missing=True)
-
     user_dir = Path(__file__).resolve().parent.parent.parent / "user"
     if user_dir.is_dir():
         # Build a filtered list of files to upload (skip .db files)
@@ -298,12 +260,18 @@ def main() -> None:
 
         print(f"📁 Uploading {len(files_to_upload)} user setting file(s) from {user_dir}...")
 
-        with user_vol.batch_upload() as batch:
-            for f in files_to_upload:
-                rel_path = f.relative_to(user_dir)
-                batch.put_file(str(f), f"/{rel_path}")
+        uploaded = 0
+        skipped = 0
+        for f in files_to_upload:
+            rel_path = f.relative_to(user_dir)
+            try:
+                with user_vol.batch_upload() as batch:
+                    batch.put_file(str(f), f"/{rel_path}")
+                uploaded += 1
+            except FileExistsError:
+                skipped += 1
 
-        print(f"✅ User settings synced to volume ({len(files_to_upload)} files)")
+        print(f"✅ User settings synced to volume ({uploaded} uploaded, {skipped} already present)")
     else:
         print(f"❌ Local user/ directory not found at {user_dir}")
 
