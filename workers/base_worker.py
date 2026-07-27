@@ -162,12 +162,24 @@ class ComfyWorker:
 
     @modal.enter(snap=False)
     def start_restore(self) -> None:
-        """Wait for ComfyUI to be ready after restoring from a snapshot."""
-        wait_for_port(8000, timeout=30)
-        # Also create symlinks on restore (in case volume changed since snapshot)
-        self._link_models_from_manifest()
+        """Wait for ComfyUI to be ready after restoring from a snapshot.
 
-        # Sync user settings on restore too
+        If ComfyUI is not responding (e.g. it crashed before the snapshot
+        was taken), restart it automatically instead of failing.
+        """
+        try:
+            wait_for_port(8000, timeout=30)
+            print("[ComfyWorker] ComfyUI is running from snapshot")
+        except (TimeoutError, OSError):
+            print("[ComfyWorker] ComfyUI not responding after snapshot — cold restarting...")
+            self.proc = subprocess.Popen(
+                "comfy launch --background -- --listen 0.0.0.0 --port 8000",
+                shell=True,
+            )
+            wait_for_port(8000, timeout=300)
+            print("[ComfyWorker] ComfyUI cold-started successfully")
+
+        self._link_models_from_manifest()
         self._sync_user_settings_from_volume()
         print("[ComfyWorker] App restored from snapshot!")
 
