@@ -28,6 +28,7 @@ Usage (Phase 4 — ``apps/all_in_one.py``)
 
 from __future__ import annotations
 
+import shutil
 import socket
 import subprocess
 import time
@@ -94,8 +95,35 @@ class ComfyWorker:
         # ── Create model symlinks from volume manifest ────────────────
         self._link_models_from_manifest()
 
+        # ── Restore user uploads from volume ──────────────────────────
+        self._restore_uploads_from_volume()
+
         # ── Sync user settings from volume ────────────────────────────
         self._sync_user_settings_from_volume()
+
+    def _restore_uploads_from_volume(self):
+        """Copy user-uploaded images from the volume to the ComfyUI input dir.
+
+        Les images uploadées via /upload/image sont persistées dans
+        /cache/uploads (volume) pour survivre au redémarrage du container —
+        sinon une image uploadée sur un worker serait perdue si le container
+        s'arrête (scaledown) avant le /generate.
+        """
+        uploads_dir = Path("/cache/uploads")
+        input_dir = Path("/root/comfy/ComfyUI/input")
+        if not uploads_dir.is_dir():
+            return
+
+        input_dir.mkdir(parents=True, exist_ok=True)
+        count = 0
+        for f in uploads_dir.iterdir():
+            if f.is_file() and not f.name.startswith("."):
+                dst = input_dir / f.name
+                if not dst.exists():
+                    shutil.copy2(str(f), str(dst))
+                    count += 1
+
+        print(f"[ComfyWorker] Restored {count} upload(s) from volume")
 
     def _sync_user_settings_from_volume(self):
         """Copy user settings from the mounted volume to the ComfyUI user/ directory."""
@@ -180,6 +208,7 @@ class ComfyWorker:
             print("[ComfyWorker] ComfyUI cold-started successfully")
 
         self._link_models_from_manifest()
+        self._restore_uploads_from_volume()
         self._sync_user_settings_from_volume()
         print("[ComfyWorker] App restored from snapshot!")
 
@@ -276,7 +305,31 @@ class ComfyWorker:
                 error_text = resp.text
                 print(f"[ComfyWorker] /upload/image error {resp.status_code}: {error_text}")
                 return {"error": f"ComfyUI returned {resp.status_code}: {error_text}"}
-            return resp.json()
+            result = resp.json()
+
+        # ── Persist uploaded file to the shared volume ──────────────────
+        # L'image est copiée dans /cache/uploads (volume) pour survivre au
+        # scaledown/restart du container. Les workers la restaurent dans leur
+        # dossier input au démarrage (_restore_uploads_from_volume).
+        try:
+            filename = result.get("name", "")
+            if filename:
+                input_root = Path("/root/comfy/ComfyUI/input")
+                src = (input_root / subfolder / filename) if subfolder else (input_root / filename)
+                if src.is_file():
+                    uploads_dir = Path("/cache/uploads")
+                    uploads_dir.mkdir(parents=True, exist_ok=True)
+                    dst = uploads_dir / filename
+                    if dst.exists() or dst.is_symlink():
+                        dst.unlink()
+                    shutil.copy2(str(src), str(dst))
+                    vol = modal.Volume.from_name("comfy-models")
+                    vol.commit()
+                    print(f"[ComfyWorker] Upload persisted to volume: {filename}")
+        except Exception as e:
+            print(f"[ComfyWorker] Upload persist failed (non-fatal): {e}")
+
+        return result
 
     @modal.method()
     async def view(self, filename: str, subfolder: str = "", view_type: str = "output") -> dict:

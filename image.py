@@ -44,7 +44,7 @@ def _build_image() -> modal.Image:
     """Build and return the ComfyUI Docker image (no model downloads)."""
     image = (
         modal.Image.debian_slim(python_version="3.11")
-        .add_local_python_source("image", "helpers", "workers", "models", "plugins", copy=True)
+        .add_local_python_source("image", "helpers", "auth", "gateway_router", "workers", "models", "plugins", copy=True)
         .apt_install("git", "git-lfs", "libgl1-mesa-dev", "libglib2.0-0", "aria2")
         .pip_install_from_requirements(str(root_dir / "requirements_comfy.txt"))
         .run_commands("comfy --skip-prompt install --nvidia")

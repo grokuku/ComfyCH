@@ -1,7 +1,30 @@
 # 🗺️ Roadmap — Modal Gateway pour ComfyUI
 
 > Fichier de référence : architecture, décisions, et prochaines étapes.
-> Dernière mise à jour : juillet 2026
+> Dernière mise à jour : août 2026
+>
+> **État actuel** : le projet est **opérationnel**. Les sections « Architecture »,
+> « Structure du projet » et « Étapes » ci-dessous reflètent le code réel ; voir
+> aussi le `README.md` pour l'état des lieux à jour.
+
+## ✅ Fonctionnalités livrées
+
+- **Routeur FastAPI partagé** (`gateway_router.py`) : `/generate` (idempotent via
+  `request_id`), `/upload/image`, `/view`, `/history`, `/gpus`, `/health` —
+  factorisé pour les 3 variantes d'app (`apps/all_in_one*.py` : 4 / 3 / 1 GPU).
+- **Auth du gateway** : clé API `X-API-Key` (Secret Modal `comfy-gateway-secret`,
+  fail-closed 401/503), clé générable et saisissable dans les paramètres.
+- **Token Modal de compte** saisissable dans l'UI (remplace `modal token set` en CLI).
+- **Extension JS** : dropdown GPU persistant (localStorage), file d'attente avec
+  badge, interception de Queue Prompt, overlay d'affichage des images, sauvegarde
+  locale automatique dans `ComfyUI/output/`, modale de configuration complète
+  (connexion, token, modèles, plugins, user settings, sync, deploy, logs SSE).
+- **Sync** : modèles locaux (sélectionnés dans l'UI) + HuggingFace/externes vers
+  le volume partagé ; user settings synchronisés ; uploads d'images persistés
+  dans le volume (survivent au scaledown des workers).
+- **Sécurité & fiabilité** : anti path traversal sur `/save-local`, idempotence
+  (pas de double facturation), verrous sur les opérations Modal, subprocess en
+  thread (event loop non bloquée), tests automatisés (`tests/test_gateway.py`).
 
 ---
 
@@ -68,10 +91,11 @@ l'exécution des rendus lourds.
 └────────────────────────────────────────────┘
 ```
 
-### Option A — ComfyUI headless sur Modal (recommandée)
+### Option A — ComfyUI headless sur Modal (choisie et déployée)
 
-Le backend Modal fait tourner un vrai ComfyUI, mais **sans interface web** (`@modal.web_server`
-désactivé). Seule l'API REST de ComfyUI est exposée via `@modal.web_endpoint()`.
+Le backend Modal fait tourner un vrai ComfyUI **headless** (pas d'UI web). Les
+workers exposent l'API REST de ComfyUI via des méthodes proxy
+(`workers/base_worker.py`) appelées par le routeur FastAPI (`gateway_router.py`).
 
 **Pourquoi c'est le choix retenu :**
 - ✅ L'API de ComfyUI est déjà complète : envoie un `workflow_api.json`, reçois les images
@@ -96,12 +120,14 @@ désactivé). Seule l'API REST de ComfyUI est exposée via `@modal.web_endpoint(
 ### Phase 1 — Sync (setup initial + ajouts de modèles)
 
 ```
-Déclencheur : l'utilisateur modifie models.py
-             ou lance explicitement la synchro
+Déclencheur : l'utilisateur modifie models.py, sélectionne des modèles locaux
+             dans l'UI (bouton « Sync Models »), ou lance `modal run sync.py`
 
 1. Conteneur CPU (1 core, ~5¢/h) démarre sur Modal
-2. Télécharge TOUS les modèles listés dans models.py
-   (HuggingFace via huggingface_hub, externes via aria2c)
+2. Copie les modèles locaux sélectionnés (embarqués dans l'image via config.json)
+   et télécharge les modèles listés dans models.py
+   (HuggingFace via huggingface_hub, externes via aria2c) ;
+   symlinks créés dans /cache + manifest (model_manifest.json)
 3. Écrit dans le Volume "comfy-models"
 4. Conteneur s'arrête
 5. ✅ Modèles disponibles pour tous les workers GPU
@@ -146,98 +172,118 @@ Hiver, 15°C dans le salon, pas besoin de chauffer le GPU
 
 Emplacement : dans la barre d'outils de ComfyUI, juste à côté du bouton "Queue Prompt".
 
-Options du dropdown (définitives, après réflexion) :
+Options du dropdown (implémentées dans `web/modal_gateway.js`) :
 
 ```
-[ 🖥️ Rendu ▼ ]
+[ 🎮 ▼ ]
 
-├── 🔴 Local             → GPU local (RTX 3060) — gratuit
-├── 🟢 Modal L4          → $0.80/h  — 24 GB VRAM — tests, petits rendus
-├── 🟡 Modal L40S        → $1.95/h  — 48 GB VRAM — FLUX, workflows moyens
-├── 🟠 Modal A100 80GB   → $2.50/h  — 80 GB VRAM — Wan2.2, vidéo
-└── 🔴 Modal H100        → $3.95/h  — 80 GB VRAM — grosse prod, urgences
+├── 🖥️  Local (gratuit)         → GPU local (RTX 3060)
+├── ☁️  L4 — $0.80/h            → 24 GB VRAM — tests, petits rendus
+├── ☁️  L40S — $1.95/h          → 48 GB VRAM — FLUX, workflows moyens
+├── ☁️  A100 80GB — $2.50/h     → 80 GB VRAM — Wan2.2, vidéo
+└── ☁️  H100 — $3.95/h          → 80 GB VRAM — grosse prod, urgences
 ```
 
-> 💡 Les couleurs indiquent le niveau de coût.
-> L'utilisateur voit le prix à l'heure directement dans le menu → transparence totale.
+> 💡 Le prix à l'heure est affiché directement dans le menu → transparence totale.
 
-### Comportement attendu
+### Comportement (implémenté)
 
-- Le dropdown conserve son choix entre les sessions (stocké dans localStorage)
-- Quand "Local" est sélectionné : Queue Prompt fonctionne normalement (pas d'interception)
-- Quand un mode Modal est sélectionné :
-  1. L'extension JS intercepte `POST /prompt`
-  2. Sérialise le workflow en JSON
-  3. Envoie à `https://api.modal.com/generate`
-  4. Attend le résultat
-  5. Injecte les images reçues dans ComfyUI
+- Le dropdown conserve son choix entre les sessions (localStorage)
+- "Local" sélectionné → Queue Prompt fonctionne normalement (pas d'interception)
+- Mode Modal sélectionné → l'extension intercepte `queuePrompt`, sérialise le
+  workflow (images locales encodées en base64 ou uploadées via `/upload/image`),
+  l'envoie à `https://xxx.modal.run/generate` avec la clé `X-API-Key` et un
+  `request_id` d'idempotence, puis affiche les images reçues dans un overlay
+  (et les sauvegarde dans `ComfyUI/output/`)
+- Une **file d'attente** (badge 🎮 cliquable) traite les rendus un par un ; en
+  cas d'erreur réseau, la requête est retentée avec le même `request_id` — le
+  serveur ne relance pas un job déjà exécuté (pas de double facturation)
+
+### Modale de configuration (⚙️)
+
+- **Connexion API Modal** : URL du gateway + clé API (bouton « générer », hint
+  de la commande `modal secret create comfy-gateway-secret API_KEY=<clé>`)
+- **Token Modal (compte)** : Token ID + Token Secret du site Modal — remplace
+  `modal token set` en CLI (credentials stockés par le CLI, pas dans la config)
+- **Modèles** : détection des modèles locaux, sélection (filtre « workflow
+  seulement »), puis « Sync Models »
+- **User Settings** : statut du dossier `user/` local + sync vers le volume
+- **Custom Nodes** : détection des nodes locaux (git / non-git), sélection —
+  un redeploy est nécessaire pour prendre effet
+- **Déploiement** : bouton « Deploy API » + statut
+- **Statut Modal** : CLI installé, authentifié, volume, secret, API configurée
+- **Logs** : flux SSE en direct des opérations (sync/deploy)
 
 ---
 
-## 📁 Structure du projet (à venir)
+## 📁 Structure du projet (actuelle)
 
 ```
-modal-comfyui/
+ComfyCH/
 │
-├── modal_api.py              ← Routeur API FastAPI sur Modal
+├── __init__.py                ← Extension ComfyUI : routes /api/modal/*
+│                                (config, status, sync, deploy, token, logs SSE,
+│                                 détection modèles/plugins, save-local)
+├── web/modal_gateway.js       ← Extension JS : dropdown, file d'attente, modale
+│
+├── gateway_router.py          ← Routeur FastAPI partagé (auth + idempotence)
+├── auth.py                    ← Clé API du gateway (Secret Modal)
+├── image.py                   ← Image Docker des workers (pas de téléchargement de modèles)
+├── sync.py                    ← Sync CPU (modèles locaux + HF + user settings)
+├── helpers.py                 ← Téléchargements + secrets HuggingFace
+├── models.py / plugins.py     ← Listes de modèles / custom nodes
+│
+├── apps/
+│   ├── all_in_one.py          ← App 4 GPU (L4, L40S, A100, H100)
+│   ├── all_in_one_lite.py     ← App 3 GPU (sans H100)
+│   └── all_in_one_l4.py       ← App L4 seul (plan Starter)
+│
 ├── workers/
-│   ├── base_worker.py        ← Classe de base (Volume, snapshot, etc.)
-│   ├── l4_worker.py          ← Worker GPU L4
-│   ├── l40s_worker.py        ← Worker GPU L40S
-│   ├── a100_worker.py        ← Worker GPU A100
-│   └── h100_worker.py        ← Worker GPU H100
+│   ├── base_worker.py         ← ComfyWorker : ComfyUI headless, proxy API,
+│   │                            snapshots, uploads persistés dans le volume
+│   ├── l4_worker.py … h100_worker.py  ← GPU + scaledown par classe
 │
-├── sync.py                   ← Script CPU pour télécharger les modèles
-├── models.py                 ← Liste des modèles (copie de models.example.py)
-├── plugins.py                ← Liste des plugins (copie de plugins.example.py)
-│
-├── custom_nodes/
-│   └── modal_gateway/        ← Extension côté ComfyUI local
-│       ├── __init__.py       ← (vide ou minime, juste pour l'activation)
-│       └── web/
-│           └── modal_gateway.js  ← L'extension JS qui ajoute le dropdown
-│                                   et intercepte Queue Prompt
-│
-└── vendor_nodes/
-    └── reverse_proxy_fix/    ← Conservé pour l'API Modal
+├── vendor_nodes/
+│   └── reverse_proxy_fix/     ← Fix sauvegarde de workflows derrière le proxy Modal
+└── tests/test_gateway.py      ← Tests sans dépendances (25 checks)
 ```
 
 ---
 
 ## 🐣 Étapes de réalisation (ordre suggéré)
 
-### Étape 1 — Backend Modal headless ✅ Prioritaire
+### Étape 1 — Backend Modal headless ✅ Terminé
 - [x] Partir du projet actuel (`comfyui.py`)
-- [ ] Supprimer `@modal.web_server(8000)` (plus d'UI web)
-- [ ] Exposer l'API REST de ComfyUI (`/prompt`, `/upload/image`, etc.) via `@modal.web_endpoint()` ou un wrapper FastAPI
-- [ ] Tester avec un appel curl depuis la machine locale : envoyer un workflow → recevoir une image
-- [ ] Documenter l'URL d'API
+- [x] Supprimer `@modal.web_server(8000)` (plus d'UI web)
+- [x] Exposer l'API REST de ComfyUI (`/prompt`, `/upload/image`, etc.) via le worker headless + routeur FastAPI
+- [x] Tester avec un appel curl depuis la machine locale : envoyer un workflow → recevoir une image
+- [x] Documenter l'URL d'API (README)
 
-### Étape 2 — Workers multiples ✅ Prioritaire
-- [ ] Créer une classe de base `ComfyUIWorker` avec le Volume partagé
-- [ ] Créer les sous-classes pour chaque GPU : `L4Worker`, `L40SWorker`, `A100Worker`, `H100Worker`
-- [ ] Routeur API qui reçoit `{gpu_type, workflow_json}` et dispatch vers le bon worker
-- [ ] Gérer le snapshot : idéalement un snapshot par type de GPU (L4 ≠ H100)
+### Étape 2 — Workers multiples ✅ Terminé
+- [x] Créer une classe de base `ComfyWorker` avec le Volume partagé
+- [x] Créer les sous-classes pour chaque GPU : `L4Worker`, `L40SWorker`, `A100Worker`, `H100Worker`
+- [x] Routeur API qui reçoit `{gpu, workflow}` et dispatch vers le bon worker
+- [x] Gérer le snapshot : `@modal.enter(snap=True/False)` + fallback cold start
 
-### Étape 3 — Sync CPU 💡 Important
-- [ ] Créer `sync.py` : conteneur CPU qui télécharge les modèles dans le Volume
-- [ ] Lancer automatiquement la synchro avant le premier déploiement
-- [ ] Option : lancer la synchro manuellement via `modal run sync.py`
+### Étape 3 — Sync CPU ✅ Terminé
+- [x] Créer `sync.py` : conteneur CPU qui télécharge les modèles dans le Volume
+- [ ] Lancer automatiquement la synchro avant le premier déploiement (première exécution manuelle pour l'instant)
+- [x] Lancer la synchro manuellement via `modal run sync.py` ou le bouton « Sync Models » de l'UI
 
-### Étape 4 — Extension JS locale 💡 Important
-- [ ] Créer `modal_gateway.js` qui ajoute le dropdown dans l'interface ComfyUI
-- [ ] Intercepter `POST /prompt` quand le mode Modal est sélectionné
-- [ ] Gérer la sérialisation du workflow
-- [ ] Gérer la réponse (images reçues → injectées dans ComfyUI)
-- [ ] Afficher le statut de la requête (en cours, terminé, erreur)
-- [ ] Stocker le dernier choix dans localStorage
+### Étape 4 — Extension JS locale ✅ Terminé
+- [x] Créer `modal_gateway.js` qui ajoute le dropdown dans l'interface ComfyUI
+- [x] Intercepter Queue Prompt quand le mode Modal est sélectionné
+- [x] Gérer la sérialisation du workflow (images locales incluses)
+- [x] Gérer la réponse (overlay d'affichage + sauvegarde locale)
+- [x] Afficher le statut de la requête (file d'attente, notifications)
+- [x] Stocker le dernier choix dans localStorage
 
-### Étape 5 — Affinements 💡 Bonus
+### Étape 5 — Affinements (restants)
 - [ ] Fallback GPU : si H100 pas dispo, essayer A100 automatiquement
 - [ ] Indicateur de coût estimé avant de lancer le rendu
 - [ ] Mode "auto" : choisir le GPU selon la taille du workflow (détection de la VRAM nécessaire)
 - [ ] Barre de progression pendant le rendu distant
-- [ ] Gérer les erreurs réseau proprement (timeout, retry)
+- [x] Gérer les erreurs réseau proprement (timeout, retry + idempotence `request_id`)
 
 ---
 
@@ -339,9 +385,14 @@ s'avérait suffisamment fiable pour de la prod.
 ## ❓ Questions en suspens
 
 - [ ] Faut-il un snapshot GPU par type de GPU, ou un seul snapshot partagé ?
-- [ ] Comment gérer les workflows qui utilisent des fichiers locaux (images uploadées) ?
+- [x] Comment gérer les workflows qui utilisent des fichiers locaux (images uploadées) ?
+      → ✅ Réglé : les uploads sont persistés dans le volume (`/cache/uploads`)
+        et restaurés au démarrage de chaque worker (`_restore_uploads_from_volume`).
 - [ ] Faut-il synchroniser automatiquement les plugins entre local et Modal ?
-- [ ] Comment exposer l'API Modal de façon sécurisée (token d'accès) ?
+      (actuellement : détection + sélection manuelle dans l'UI, redeploy requis)
+- [x] Comment exposer l'API Modal de façon sécurisée ? — Clé API `X-API-Key`
+      (Secret Modal `comfy-gateway-secret`, fail-closed 401/503) + `/generate`
+      idempotent (request_id) pour éviter la double facturation.
 - [ ] Faut-il un mode "fallback automatique" où Modal est utilisé si la VRAM locale est insuffisante ?
 - [ ] Comment gérer le démontage des fichiers dans ComfyUI quand on passe d'un worker à l'autre ?
 

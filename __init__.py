@@ -9,10 +9,12 @@ Ajoute des routes API au ComfyUI PromptServer pour :
 from __future__ import annotations
 
 import asyncio
+import ast
 import json
 import os
 import subprocess
 import sys
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -50,11 +52,15 @@ def load_config() -> dict:
     return dict(DEFAULT_CONFIG)
 
 
+_CONFIG_LOCK = threading.Lock()
+
+
 def save_config(config: dict) -> None:
-    current = load_config()
-    current.update(config)
-    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG_PATH.write_text(json.dumps(current, indent=2))
+    with _CONFIG_LOCK:
+        current = load_config()
+        current.update(config)
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        CONFIG_PATH.write_text(json.dumps(current, indent=2))
 
 
 # ─── Helpers ───
@@ -72,8 +78,21 @@ def _status_path() -> Path:
     return LOG_DIR / "last_operation.status"
 
 
+_OP_LOCK = asyncio.Lock()  # sérialise les opérations Modal (sync/deploy/sync-user)
+
+
 async def _run_async(operation: str, cmd: list[str]):
-    """Exécute une commande modal et écrit les logs + status."""
+    """Exécute une commande modal et écrit les logs + status.
+
+    Sérialisée par _OP_LOCK : une seule opération à la fois — les opérations
+    partagent les mêmes fichiers de logs et le même volume.
+    """
+    async with _OP_LOCK:
+        await _run_async_inner(operation, cmd)
+
+
+async def _run_async_inner(operation: str, cmd: list[str]):
+    """Exécute réellement la commande (appelée sous _OP_LOCK)."""
     log_path = _log_path()
     status_path = _status_path()
 
@@ -88,13 +107,21 @@ async def _run_async(operation: str, cmd: list[str]):
     env = os.environ.copy()
     env["PATH"] = f"{os.path.dirname(sys.executable)}:{env.get('PATH', '')}"
 
-    process = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-        cwd=project_dir,
-        env=env,
-    )
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            cwd=project_dir,
+            env=env,
+        )
+    except (OSError, ValueError) as e:
+        # modal absent ou commande invalide → logguer et marquer l'échec
+        # (sinon le SSE attendrait un status qui ne viendrait jamais)
+        with open(log_path, "a") as f:
+            f.write(f"ERROR: impossible de lancer la commande: {e}\n")
+        status_path.write_text("1")
+        return
 
     # Lire et écrire les logs en temps réel
     async for line in process.stdout:
@@ -149,6 +176,18 @@ def _check_volume_exists() -> bool:
             capture_output=True, text=True, timeout=10,
         )
         return "comfy-models" in result.stdout
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
+def _check_secret_exists() -> bool:
+    """Check that the gateway API-key Secret exists on the Modal account."""
+    try:
+        result = subprocess.run(
+            ["modal", "secret", "list"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return "comfy-gateway-secret" in result.stdout
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return False
 
@@ -243,17 +282,48 @@ def _detect_local_models() -> list[dict]:
     return results
 
 
+def _extract_class_mappings(init_path: Path) -> set[str]:
+    """Extrait les clés de NODE_CLASS_MAPPINGS d'un __init__.py via AST.
+
+    Évite le matching par sous-chaîne (faux positifs : commentaires, chaînes
+    de doc, etc.).
+    """
+    try:
+        tree = ast.parse(init_path.read_text(errors="replace"))
+    except (SyntaxError, OSError):
+        return set()
+
+    mappings: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if not (isinstance(target, ast.Name) and target.id == "NODE_CLASS_MAPPINGS"):
+                continue
+            if not isinstance(node.value, ast.Dict):
+                continue
+            for key in node.value.keys:
+                if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                    mappings.add(key.value)
+    return mappings
+
+
 def _match_nodes_to_class_types(class_types: list[str]) -> list[str]:
     """Match workflow class_types to local custom node directories.
 
-    Reads each custom node's __init__.py and looks for NODE_CLASS_MAPPINGS
-    entries that match the given class_types.
-    Returns a list of node directory names that provide any of the class_types.
+    Parse chaque custom node's __init__.py (AST) et extrait les vraies clés de
+    NODE_CLASS_MAPPINGS — pas de matching par sous-chaîne.
+    Retourne une liste de noms de dossiers de nodes fournissant l'un des
+    class_types donnés.
     """
     custom_nodes_dir = PROJECT_ROOT.parent
     matches: list[str] = []
 
     if not custom_nodes_dir.is_dir():
+        return matches
+
+    wanted = set(class_types)
+    if not wanted:
         return matches
 
     for entry in sorted(custom_nodes_dir.iterdir()):
@@ -268,18 +338,50 @@ def _match_nodes_to_class_types(class_types: list[str]) -> list[str]:
         if not init_path.is_file():
             continue
 
-        try:
-            content = init_path.read_text(errors="replace")
-            # Check if any class_type appears in the file
-            for ct in class_types:
-                if ct in content:
-                    if entry.name not in matches:
-                        matches.append(entry.name)
-                    break
-        except OSError:
-            pass
+        if _extract_class_mappings(init_path) & wanted:
+            matches.append(entry.name)
 
     return matches
+
+
+def _sanitize_save_path(output_dir: Path, subfolder: str, filename: str) -> Path | None:
+    """Valide un couple (subfolder, filename) contre le path traversal.
+
+    Retourne le chemin cible résolu s'il est valide et situé sous *output_dir*,
+    sinon None. Rejette : chemins absolus, composants ``..``/``.`` dans
+    subfolder, filename avec séparateurs ou ``..``, et toute sortie du dossier
+    (y compris via symlinks, grâce à ``resolve()``).
+    """
+    try:
+        base = output_dir.resolve()
+    except OSError:
+        return None
+
+    # subfolder : ni chemin absolu, ni composant ".." ou "."
+    if subfolder:
+        sub_path = Path(subfolder)
+        if sub_path.is_absolute() or any(p in ("..", ".") for p in sub_path.parts):
+            return None
+        target_dir = base.joinpath(*sub_path.parts)
+    else:
+        target_dir = base
+
+    # filename : un seul composant, sans séparateur de chemin
+    if (
+        "/" in filename
+        or "\\" in filename
+        or filename in ("", ".", "..")
+        or Path(filename).name != filename
+    ):
+        return None
+
+    try:
+        target = (target_dir / filename).resolve()
+    except OSError:
+        return None
+    if not target.is_relative_to(base):
+        return None
+    return target
 
 
 # ─── Initialisation : patcher PromptServer.add_routes ───
@@ -316,10 +418,13 @@ if PromptServer is not None:
 
         # ── GET /api/modal/status ──
         async def get_status(request):
+            # Les checks subprocess tournent dans un thread pour ne pas
+            # bloquer l'event loop de ComfyUI (modal list peut prendre 10s)
             status = {
-                "modal_installed": _check_modal_installed(),
-                "modal_authenticated": _check_modal_auth(),
-                "volume_exists": _check_volume_exists(),
+                "modal_installed": await asyncio.to_thread(_check_modal_installed),
+                "modal_authenticated": await asyncio.to_thread(_check_modal_auth),
+                "volume_exists": await asyncio.to_thread(_check_volume_exists),
+                "secret_exists": await asyncio.to_thread(_check_secret_exists),
             }
             config = load_config()
             status["last_sync"] = config.get("last_sync")
@@ -329,13 +434,77 @@ if PromptServer is not None:
 
         # ── POST /api/modal/sync — lance la sync en arrière-plan ──
         async def post_sync(request):
+            if _OP_LOCK.locked():
+                return web.json_response(
+                    {"ok": False, "error": "Une opération Modal est déjà en cours"},
+                    status=409,
+                )
             asyncio.create_task(_run_async("sync", ["modal", "run", "sync.py"]))
             return web.json_response({"ok": True, "message": "Sync lancée"})
 
         # ── POST /api/modal/deploy — lance le déploiement ──
         async def post_deploy(request):
+            if _OP_LOCK.locked():
+                return web.json_response(
+                    {"ok": False, "error": "Une opération Modal est déjà en cours"},
+                    status=409,
+                )
             asyncio.create_task(_run_async("deploy", ["modal", "deploy", "apps/all_in_one.py"]))
             return web.json_response({"ok": True, "message": "Déploiement lancé"})
+
+        # ── POST /api/modal/token — enregistre le token Modal (remplace modal token set en CLI) ──
+        async def post_token(request):
+            """Configure les credentials Modal du serveur (Token ID + Token Secret du site Modal).
+
+            Exécute ``modal token set`` qui vérifie les credentials (--verify par défaut)
+            puis confirme avec ``modal token info``. Les credentials sont stockés par le
+            CLI Modal lui-même (~/.modal), pas dans config.json.
+            """
+            try:
+                data = await request.json()
+            except Exception:
+                return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
+
+            token_id = str(data.get("token_id", "")).strip()
+            token_secret = str(data.get("token_secret", "")).strip()
+            if not token_id or not token_secret:
+                return web.json_response(
+                    {"ok": False, "error": "token_id and token_secret are required"},
+                    status=400,
+                )
+
+            try:
+                result = await asyncio.to_thread(
+                    subprocess.run,
+                    ["modal", "token", "set", "--token-id", token_id, "--token-secret", token_secret],
+                    capture_output=True, text=True, timeout=60,
+                )
+            except FileNotFoundError:
+                return web.json_response({"ok": False, "error": "modal CLI not installed"}, status=500)
+            except subprocess.TimeoutExpired:
+                return web.json_response({"ok": False, "error": "modal token set timed out"}, status=500)
+
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout or "").strip()
+                return web.json_response(
+                    {"ok": False, "error": f"modal token set failed: {detail[:500]}"},
+                    status=500,
+                )
+
+            # Confirmer que le token fonctionne
+            authenticated = False
+            try:
+                info = await asyncio.to_thread(
+                    subprocess.run,
+                    ["modal", "token", "info"],
+                    capture_output=True, text=True, timeout=15,
+                )
+                authenticated = info.returncode == 0
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                pass
+
+            print(f"[Modal Gateway] Token Modal enregistré (authentifié: {authenticated})")
+            return web.json_response({"ok": True, "authenticated": authenticated})
 
         # ── GET /api/modal/logs — récupère les logs de la dernière opération ──
         async def get_logs(request):
@@ -524,14 +693,16 @@ if PromptServer is not None:
                 comfy_root = PROJECT_ROOT.parent.parent
                 output_dir = comfy_root / "output"
 
-            # Build target path preserving subfolder structure
-            if subfolder:
-                target_dir = output_dir / subfolder
-            else:
-                target_dir = output_dir
+            # ── Sanitisation anti path traversal ───────────────────────
+            target_path = _sanitize_save_path(output_dir, subfolder, filename)
+            if target_path is None:
+                return web.json_response(
+                    {"ok": False, "error": "Invalid filename or subfolder"},
+                    status=400,
+                )
 
+            target_dir = target_path.parent
             target_dir.mkdir(parents=True, exist_ok=True)
-            target_path = target_dir / filename
 
             # Write the file
             try:
@@ -565,6 +736,11 @@ if PromptServer is not None:
 
         # ── POST /api/modal/sync-user ──
         async def post_sync_user(request):
+            if _OP_LOCK.locked():
+                return web.json_response(
+                    {"ok": False, "error": "Une opération Modal est déjà en cours"},
+                    status=409,
+                )
             asyncio.create_task(_run_async("sync_user", ["modal", "run", "sync.py"]))
             return web.json_response({"ok": True, "message": "Sync user settings lancée"})
 
@@ -582,6 +758,7 @@ if PromptServer is not None:
             ("GET", "/api/modal/status", get_status),
             ("POST", "/api/modal/sync", post_sync),
             ("POST", "/api/modal/deploy", post_deploy),
+            ("POST", "/api/modal/token", post_token),
             ("GET", "/api/modal/logs", get_logs),
             ("GET", "/api/modal/logs/stream", get_logs_stream),
             ("POST", "/api/modal/save-local", post_save_local),

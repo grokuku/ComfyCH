@@ -20,6 +20,13 @@
          */
         API_URL: localStorage.getItem('modal-api-url') || '',
 
+        /**
+         * Clé API envoyée dans l'en-tête X-API-Key à l'API Modal Gateway.
+         * Doit correspondre au Secret Modal "comfy-gateway-secret".
+         * @type {string}
+         */
+        API_KEY: localStorage.getItem('modal-api-key') || '',
+
         /** Clé de stockage localStorage pour persister le choix du GPU. */
         STORAGE_KEY: 'modal-gateway-mode',
 
@@ -43,6 +50,10 @@
                 CONFIG.API_URL = config.api_url;
                 localStorage.setItem('modal-api-url', config.api_url);
             }
+            if (config.api_key) {
+                CONFIG.API_KEY = config.api_key;
+                localStorage.setItem('modal-api-key', config.api_key);
+            }
 
         })
         .catch(function () {
@@ -59,6 +70,11 @@
         nextId: 1,
         processing: false,
 
+        /** Génère un identifiant unique par rendu (idempotence côté serveur). */
+        _newRequestId: function () {
+            return 'req-' + Date.now().toString(36) + '-' + Math.random().toString(36).substring(2, 10);
+        },
+
         enqueue: function (number, workflow, options, gpu) {
             var self = this;
             // Deep clone workflow — ComfyUI may mutate it after queuePrompt returns
@@ -70,6 +86,7 @@
                 workflow: clonedWorkflow,
                 options: options,
                 gpu: gpu,
+                requestId: self._newRequestId(),
                 status: 'pending',
                 error: null,
                 addedAt: Date.now(),
@@ -120,11 +137,20 @@
                     self.activeCount--;
                     self.processing = false;
                     self.updateUI();
-                    // Clean up old completed/failed items (keep last 50)
+                    // Clean up old completed/failed items (keep last 50) —
+                    // sans dupliquer les items actifs encore dans les 50 derniers
                     if (self.items.length > 50) {
-                        self.items = self.items.filter(function (i) {
+                        var activeItems = self.items.filter(function (i) {
                             return i.status === 'pending' || i.status === 'processing';
-                        }).concat(self.items.slice(-50));
+                        });
+                        var activeIds = {};
+                        for (var ai = 0; ai < activeItems.length; ai++) {
+                            activeIds[activeItems[ai].id] = true;
+                        }
+                        var recentCompleted = self.items.slice(-50).filter(function (i) {
+                            return !activeIds[i.id];
+                        });
+                        self.items = activeItems.concat(recentCompleted);
                     }
                     self.process();
                 });
@@ -309,12 +335,20 @@
 
         var response = await fetch(CONFIG.API_URL + '/upload/image' + gpuParam, {
             method: 'POST',
+            headers: {
+                'X-API-Key': CONFIG.API_KEY,
+            },
             body: formData,
         });
 
         if (!response.ok) {
             var errText = '';
-            try { errText = await response.text(); } catch (_) {}
+            try {
+                var errJson = await response.json();
+                errText = errJson.detail || errJson.error || JSON.stringify(errJson);
+            } catch (_) {
+                try { errText = await response.text(); } catch (_2) {}
+            }
             throw new Error('Upload failed: HTTP ' + response.status + ' ' + errText);
         }
 
@@ -529,10 +563,12 @@
                         method: 'POST',
                         headers: {
                             'Content-Type': 'application/json',
+                            'X-API-Key': CONFIG.API_KEY,
                         },
                         body: JSON.stringify({
                             workflow: enrichedWorkflow,
                             gpu: gpu,
+                            request_id: item.requestId,
                         }),
                         signal: controller.signal,
                     });
@@ -561,7 +597,12 @@
 
             if (!response.ok) {
                 var errorText = '';
-                try { errorText = await response.text(); } catch (_) { errorText = '(erreur de lecture)'; }
+                try {
+                    var errJson = await response.json();
+                    errorText = errJson.detail || errJson.error || JSON.stringify(errJson);
+                } catch (_) {
+                    try { errorText = await response.text(); } catch (_2) { errorText = '(erreur de lecture)'; }
+                }
                 throw new Error('HTTP ' + response.status + ': ' + errorText);
             }
 
@@ -894,7 +935,7 @@
         var style = document.createElement('style');
         style.id = 'modal-settings-styles';
         style.textContent = [
-            // ─── Drodown du sélecteur GPU (ex-web/modal_gateway.css) ───
+            // ─── Drodown du sélecteur GPU ───
             '#modal-gateway-container {',
             '  display: inline-flex;',
             '  align-items: center;',
@@ -1232,11 +1273,12 @@
             .then(function (r) { return r.json(); })
             .then(function (status) {
                 var items = document.querySelectorAll('.status-item');
-                if (items.length >= 4) {
+                if (items.length >= 5) {
                     items[0].textContent = '🔧 Modal CLI : ' + (status.modal_installed ? '✅' : '❌');
                     items[1].textContent = '🔐 Authentifié : ' + (status.modal_authenticated ? '✅' : '❌');
                     items[2].textContent = '💾 Volume comfy-models : ' + (status.volume_exists ? '✅' : '❌');
                     items[3].textContent = '🌐 API configurée : ' + (status.api_configured ? '✅' : '❌');
+                    items[4].textContent = '🔑 Secret Modal : ' + (status.secret_exists ? '✅' : '❌');
                 }
             })
             .catch(function () {});
@@ -1263,7 +1305,12 @@
             var opResp = await fetch('/api/modal/' + operation, { method: 'POST' });
             if (!opResp.ok) {
                 var errText = '';
-                try { errText = await opResp.text(); } catch (_) {}
+                try {
+                    var errJson = await opResp.json();
+                    errText = errJson.error || JSON.stringify(errJson);
+                } catch (_) {
+                    try { errText = await opResp.text(); } catch (_2) {}
+                }
                 throw new Error('HTTP ' + opResp.status + ' ' + errText);
             }
 
@@ -1421,7 +1468,22 @@
             '      <h3>🔌 Connexion API Modal</h3>',
             '      <label>URL de l\'API</label>',
             '      <input type="text" id="cfg-api-url" value="' + escapeHtml(config.api_url || '') + '" placeholder="https://xxx.modal.run" />',
-            '      <button id="cfg-save-connection" class="modal-btn modal-btn-primary">💾 Sauvegarder</button>',
+            '      <label>Clé API (X-API-Key)</label>',
+            '      <input type="password" id="cfg-api-key" value="' + escapeHtml(config.api_key || '') + '" placeholder="Collez votre clé API" autocomplete="off" />',
+            '      <div class="modal-plugin-actions">',
+            '        <button id="cfg-generate-key" class="modal-btn">🔑 Générer une clé</button>',
+            '        <button id="cfg-save-connection" class="modal-btn modal-btn-primary">💾 Sauvegarder</button>',
+            '      </div>',
+            '      <div class="modal-plugin-note" id="cfg-secret-hint">🔑 Cette clé protège votre endpoint /generate — n\'importe quelle chaîne aléatoire convient (générez-en une ou collez un mot de passe). Elle doit être identique dans le Secret Modal et ici.</div>',
+            '    </section>',
+            '    <section>',
+            '      <h3>🔑 Token Modal (compte)</h3>',
+            '      <p style="font-size:12px;color:#999;margin:0 0 8px 0;">Token API créé sur le site Modal (Settings → API Tokens). À saisir ici une seule fois — remplace la commande <code>modal token set</code>. Le token est stocké dans les credentials Modal (~/.modal), pas dans la config.</p>',
+            '      <label>Token ID</label>',
+            '      <input type="text" id="cfg-token-id" placeholder="ak-..." autocomplete="off" />',
+            '      <label>Token Secret</label>',
+            '      <input type="password" id="cfg-token-secret" placeholder="as-..." autocomplete="off" />',
+            '      <button id="cfg-save-token" class="modal-btn modal-btn-action">✅ Enregistrer le token</button>',
             '    </section>',
             '    <section>',
             '      <h3>📦 Modèles</h3>',
@@ -1472,6 +1534,7 @@
             '        <div class="status-item">🔐 Authentifié : ' + (status.modal_authenticated ? '✅' : '❌') + '</div>',
             '        <div class="status-item">💾 Volume comfy-models : ' + (status.volume_exists ? '✅' : '❌') + '</div>',
             '        <div class="status-item">🌐 API configurée : ' + (status.api_configured ? '✅' : '❌') + '</div>',
+            '        <div class="status-item">🔑 Secret Modal : ' + (status.secret_exists ? '✅' : '❌') + '</div>',
             '      </div>',
             '    </section>',
             '    <section>',
@@ -1546,22 +1609,97 @@
 
         document.getElementById('cfg-save-connection').onclick = async function () {
             var apiUrl = document.getElementById('cfg-api-url').value.trim();
+            var apiKey = document.getElementById('cfg-api-key').value.trim();
             try {
                 var saveResp = await fetch('/api/modal/config', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ api_url: apiUrl }),
+                    body: JSON.stringify({ api_url: apiUrl, api_key: apiKey }),
                 });
                 if (!saveResp.ok) {
                     throw new Error('HTTP ' + saveResp.status);
                 }
                 // Mettre à jour les constantes
                 CONFIG.API_URL = apiUrl;
+                CONFIG.API_KEY = apiKey;
                 // Persister en localStorage
                 if (apiUrl) localStorage.setItem('modal-api-url', apiUrl);
+                if (apiKey) localStorage.setItem('modal-api-key', apiKey);
+                else localStorage.removeItem('modal-api-key');
                 showNotification('✅ Configuration sauvegardée', 'success');
             } catch (e) {
                 showNotification('❌ Erreur lors de la sauvegarde : ' + e.message, 'error');
+            }
+        };
+
+        // ── Clé API : génération + hint CLI en direct ──
+        var apiKeyInput = document.getElementById('cfg-api-key');
+        var secretHint = document.getElementById('cfg-secret-hint');
+
+        function updateSecretHint() {
+            var key = apiKeyInput.value.trim();
+            if (key) {
+                secretHint.textContent = '🔑 Créez le Secret Modal "comfy-gateway-secret" (variable API_KEY) sur le site Modal (Dashboard → Secrets) ou en CLI : modal secret create comfy-gateway-secret API_KEY=' + key +
+                    ' — puis redéployez (🚀 Deploy API). La clé du Secret et celle ici doivent être identiques.';
+            } else {
+                secretHint.textContent = '🔑 Cette clé protège votre endpoint /generate — n\'importe quelle chaîne aléatoire convient (générez-en une ou collez un mot de passe). Elle doit être identique dans le Secret Modal et ici.';
+            }
+        }
+        apiKeyInput.addEventListener('input', updateSecretHint);
+
+        document.getElementById('cfg-generate-key').onclick = function () {
+            var arr = new Uint8Array(24);
+            if (window.crypto && crypto.getRandomValues) {
+                crypto.getRandomValues(arr);
+            } else {
+                for (var gi = 0; gi < arr.length; gi++) arr[gi] = Math.floor(Math.random() * 256);
+            }
+            var key = '';
+            for (var gi = 0; gi < arr.length; gi++) key += arr[gi].toString(16).padStart(2, '0');
+            apiKeyInput.value = key;
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(key).catch(function () {});
+            }
+            updateSecretHint();
+            showNotification('🔑 Clé générée (48 hex). Créez le Secret Modal avec la commande affichée, puis collez-la ici.', 'info');
+        };
+
+        updateSecretHint();
+
+        // ─── Token Modal : enregistrement (remplace modal token set en CLI) ───
+        document.getElementById('cfg-save-token').onclick = async function () {
+            var tokenId = document.getElementById('cfg-token-id').value.trim();
+            var tokenSecret = document.getElementById('cfg-token-secret').value.trim();
+            if (!tokenId || !tokenSecret) {
+                showNotification('⚠️ Renseignez le Token ID et le Token Secret (site Modal → Settings → API Tokens)', 'error');
+                return;
+            }
+            var btn = document.getElementById('cfg-save-token');
+            btn.disabled = true;
+            btn.textContent = '⏳ Enregistrement + vérification...';
+            try {
+                var resp = await fetch('/api/modal/token', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ token_id: tokenId, token_secret: tokenSecret }),
+                });
+                var data = {};
+                try { data = await resp.json(); } catch (_) {}
+                if (!resp.ok || !data.ok) {
+                    throw new Error(data.error || ('HTTP ' + resp.status));
+                }
+                showNotification(
+                    '✅ Token Modal enregistré' + (data.authenticated ? ' — connexion vérifiée ✅' : ' — vérifiez le statut ci-dessous'),
+                    'success'
+                );
+                document.getElementById('cfg-token-id').value = '';
+                document.getElementById('cfg-token-secret').value = '';
+                refreshStatus();
+            } catch (e) {
+                showNotification('❌ ' + e.message, 'error');
+            } finally {
+                btn.disabled = false;
+                btn.textContent = '✅ Enregistrer le token';
             }
         };
 
