@@ -29,3 +29,6 @@ logs/
 
 # ─── Modal ────────────────────────────────────────────────────────
 modal.toml
+
+# ─── Config locale (contient la clé API — ne jamais committer) ────
+config.json

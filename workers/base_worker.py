@@ -28,6 +28,7 @@ Usage (Phase 4 — ``apps/all_in_one.py``)
 
 from __future__ import annotations
 
+import base64
 import shutil
 import socket
 import subprocess
@@ -237,6 +238,16 @@ class ComfyWorker:
         try to parse them as nodes and fail with a ``missing_node_type``
         error.
         """
+        # ── Extraire extra_data avant le filtrage (il contient les images base64) ──
+        extra_data = workflow.pop("extra_data", None) or {}
+
+        # Restaurer les images embarquées (<4 Mo) dans le dossier input de ComfyUI
+        for img in extra_data.get("images", []) or []:
+            try:
+                await self._restore_embedded_image(img)
+            except Exception as e:
+                print(f"[ComfyWorker] Failed to restore embedded image: {e}")
+
         # Filter out non-node keys (metadata like "workflow", "extra_data", "version", etc.)
         clean_workflow = {
             k: v for k, v in workflow.items()
@@ -247,16 +258,58 @@ class ComfyWorker:
         print(f"[ComfyWorker] Has SaveImage? {'SaveImage' in str(clean_workflow)}")
         if len(clean_workflow) != len(workflow):
             print(f"[ComfyWorker] Filtered {len(workflow) - len(clean_workflow)} non-node keys from workflow")
+
+        # Passthrough de extra_data SANS la clé "images" (déjà restaurées ci-dessus)
+        payload = {"prompt": clean_workflow, "client_id": "modal-gateway"}
+        passthrough_extra = {k: v for k, v in extra_data.items() if k != "images"}
+        if passthrough_extra:
+            payload["extra_data"] = passthrough_extra
+
         async with httpx.AsyncClient() as client:
             resp = await client.post(
                 "http://127.0.0.1:8000/prompt",
-                json={"prompt": clean_workflow, "client_id": "modal-gateway"},
+                json=payload,
             )
             if resp.status_code != 200:
                 error_text = resp.text
                 print(f"[ComfyWorker] /prompt error {resp.status_code}: {error_text}")
                 return {"error": f"ComfyUI returned {resp.status_code}: {error_text}"}
             return resp.json()
+
+    async def _restore_embedded_image(self, img: dict) -> None:
+        """Restore a base64-embedded image into ComfyUI's input folder.
+
+        The JS extension stores small (<4 Mo) images base64-encoded inside
+        ``extra_data.images[]``. ComfyUI's ``/prompt`` cannot read those
+        directly, so each image is re-uploaded via ``/upload/image`` before
+        submitting the prompt.
+
+        Raises
+        ------
+        RuntimeError
+            If ComfyUI's /upload/image returns a non-200 status.
+        """
+        imagebase64 = img.get("imagebase64", "")
+        if not imagebase64:
+            return
+        content = base64.b64decode(imagebase64)
+        filename = img.get("filename") or img.get("name") or "image.png"
+        subfolder = img.get("subfolder", "")
+
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                "http://127.0.0.1:8000/upload/image",
+                files={"image": (filename, content)},
+                data={
+                    "subfolder": subfolder,
+                    "type": "input",
+                    "overwrite": "true",
+                },
+            )
+            if resp.status_code != 200:
+                raise RuntimeError(
+                    f"/upload/image returned {resp.status_code}: {resp.text}"
+                )
 
     @modal.method()
     async def history(self, job_id: str) -> dict:

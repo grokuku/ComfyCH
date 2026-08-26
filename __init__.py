@@ -17,6 +17,7 @@ import sys
 import threading
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 # La racine du projet est le dossier de ce __init__.py
 # custom_nodes/modal_gateway/ = PROJECT_ROOT
@@ -394,6 +395,66 @@ except ImportError:
     PromptServer = None  # type: ignore
     web = None
 
+def _request_guard(request):
+    """Retourne ``None`` si la requête est autorisée, sinon une réponse 403.
+
+    Protège les endpoints locaux contre drive-by / DNS rebinding en
+    vérifiant le Host et l'Origin de la requête. Seules les origines
+    locales (loopback, réseau privé, ``.local``) et same-origin sont
+    acceptées.
+    """
+    host = request.headers.get("Host", "")
+    origin = request.headers.get("Origin", "")
+
+    def _hostname(netloc: str) -> str:
+        n = netloc.strip().lower()
+        if n.startswith("["):  # IPv6 [::1]:port
+            return n.split("]")[0] + "]"
+        if ":" in n:  # hostname:port
+            return n.rsplit(":", 1)[0]
+        return n
+
+    def _is_local(hostname: str) -> bool:
+        h = hostname.strip().lower()
+        if h in ("localhost", "::1", "[::1]") or h.endswith(".local"):
+            return True
+        if h.startswith("127."):
+            return True
+        if h.startswith("10.") or h.startswith("192.168."):
+            return True
+        if h.startswith("172."):
+            try:
+                return 16 <= int(h.split(".")[1]) <= 31
+            except (IndexError, ValueError):
+                return False
+        return False
+
+    if host:
+        if not _is_local(_hostname(host)):
+            return web.json_response(
+                {"error": "Forbidden: non-local Host"}, status=403
+            )
+
+    if origin:
+        origin_hostname = ""
+        try:
+            origin_hostname = _hostname(urlsplit(origin).netloc)
+        except ValueError:
+            origin_hostname = ""
+
+        if origin_hostname:
+            if host and _hostname(host) == origin_hostname:
+                pass  # same-origin OK (notamment accès LAN)
+            elif _is_local(origin_hostname):
+                pass  # origine locale OK
+            else:
+                return web.json_response(
+                    {"error": "Forbidden: non-local Origin"}, status=403
+                )
+
+    return None
+
+
 if PromptServer is not None:
     _original_add_routes = PromptServer.add_routes
 
@@ -522,7 +583,6 @@ if PromptServer is not None:
                     "Content-Type": "text/event-stream",
                     "Cache-Control": "no-cache",
                     "Connection": "keep-alive",
-                    "Access-Control-Allow-Origin": "*",
                 },
             )
             await response.prepare(request)
@@ -766,7 +826,12 @@ if PromptServer is not None:
             ("POST", "/api/modal/sync-user", post_sync_user),
         ]
         for method, path, handler in routes:
-            self.app.router.add_route(method, path, handler)
+            async def _guarded(request, _handler=handler):
+                denied = _request_guard(request)
+                if denied is not None:
+                    return denied
+                return await _handler(request)
+            self.app.router.add_route(method, path, _guarded)
 
         print(f"[Modal Gateway] Routes API configurées ({len(routes)} endpoints)")
         return result
