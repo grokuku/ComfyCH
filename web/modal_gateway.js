@@ -1545,6 +1545,7 @@
             '        <button id="cfg-save-plugins" class="modal-btn modal-btn-primary" disabled>💾 Save Plugins</button>',
             '        <a id="cfg-toggle-plugins" style="font-size:12px;color:#6a6aff;cursor:pointer;margin-left:8px;display:none;">Tout sélectionner</a>',
             '        <label style="font-size:12px;color:#999;display:block;margin-top:8px;"><input type="checkbox" id="cfg-plugins-workflow-only" style="vertical-align:middle;"> 📋 Workflow seulement</label>',
+            '        <button id="cfg-sync-custom-nodes" class="modal-btn modal-btn-action" style="margin-top:8px;">📦 Sync Custom Nodes</button>',
             '      </div>',
             '      <div id="modal-plugins-list" class="modal-plugins-list" style="display:none;">',
             '      </div>',
@@ -2186,6 +2187,9 @@
 
         document.getElementById('cfg-sync-user').onclick = function() {
             runOperation('sync-user');
+        };
+        document.getElementById('cfg-sync-custom-nodes').onclick = function() {
+            runOperation('sync-custom-nodes');
         };
     }
 

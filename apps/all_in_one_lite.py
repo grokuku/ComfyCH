@@ -34,6 +34,7 @@ app = modal.App(
     volumes={
         "/cache": modal.Volume.from_name("comfy-models", create_if_missing=True),
         "/user-settings": modal.Volume.from_name("comfy-user-settings", create_if_missing=True),
+        "/custom_nodes": modal.Volume.from_name("comfy-custom-nodes", create_if_missing=True),
     },
     scaledown_window=L4Worker.scaledown_window,
     enable_memory_snapshot=True,
@@ -48,6 +49,7 @@ class L4(L4Worker):
     volumes={
         "/cache": modal.Volume.from_name("comfy-models", create_if_missing=True),
         "/user-settings": modal.Volume.from_name("comfy-user-settings", create_if_missing=True),
+        "/custom_nodes": modal.Volume.from_name("comfy-custom-nodes", create_if_missing=True),
     },
     scaledown_window=L40SWorker.scaledown_window,
     enable_memory_snapshot=True,
@@ -62,6 +64,7 @@ class L40S(L40SWorker):
     volumes={
         "/cache": modal.Volume.from_name("comfy-models", create_if_missing=True),
         "/user-settings": modal.Volume.from_name("comfy-user-settings", create_if_missing=True),
+        "/custom_nodes": modal.Volume.from_name("comfy-custom-nodes", create_if_missing=True),
     },
     scaledown_window=A100Worker.scaledown_window,
     enable_memory_snapshot=True,

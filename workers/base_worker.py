@@ -96,6 +96,9 @@ class ComfyWorker:
         # ── Create model symlinks from volume manifest ────────────────
         self._link_models_from_manifest()
 
+        # ── Symlink custom nodes from volume ──────────────────────────
+        self._sync_custom_nodes_from_volume()
+
         # ── Restore user uploads from volume ──────────────────────────
         self._restore_uploads_from_volume()
 
@@ -189,6 +192,28 @@ class ComfyWorker:
 
         print(f"[ComfyWorker] Created {linked} model symlinks from manifest")
 
+    def _sync_custom_nodes_from_volume(self):
+        """Symlink each custom node from /custom_nodes volume into ComfyUI."""
+        vol_path = Path("/custom_nodes")
+        comfy_path = Path("/root/comfy/ComfyUI/custom_nodes")
+
+        if not vol_path.is_dir():
+            print("[ComfyWorker] No custom_nodes volume mounted — skipping")
+            return
+
+        comfy_path.mkdir(parents=True, exist_ok=True)
+        linked = 0
+        for item in vol_path.iterdir():
+            if item.name.startswith(".") or not item.is_dir():
+                continue
+            dst = comfy_path / item.name
+            if dst.exists() or dst.is_symlink():
+                continue
+            dst.symlink_to(item)
+            linked += 1
+
+        print(f"[ComfyWorker] Linked {linked} custom node(s) from volume")
+
     @modal.enter(snap=False)
     def start_restore(self) -> None:
         """Wait for ComfyUI to be ready after restoring from a snapshot.
@@ -209,6 +234,7 @@ class ComfyWorker:
             print("[ComfyWorker] ComfyUI cold-started successfully")
 
         self._link_models_from_manifest()
+        self._sync_custom_nodes_from_volume()
         self._restore_uploads_from_volume()
         self._sync_user_settings_from_volume()
         print("[ComfyWorker] App restored from snapshot!")

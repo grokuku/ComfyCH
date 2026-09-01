@@ -25,6 +25,11 @@
 - **Sécurité & fiabilité** : anti path traversal sur `/save-local`, idempotence
   (pas de double facturation), verrous sur les opérations Modal, subprocess en
   thread (event loop non bloquée), tests automatisés (`tests/test_gateway.py`).
+- **Sync modèles par upload chunké** : les modèles locaux sont streamés par chunks
+  de 100 Mo directement dans le volume (plus de rebuild d'image à chaque sync).
+- **Custom nodes synchronisés par volume** : packaging tar.gz (protection path
+  traversal + swap atomique) vers le volume `comfy-custom-nodes`, symlinkés par
+  les workers au démarrage — plus besoin de redeploy pour changer un node.
 
 ---
 

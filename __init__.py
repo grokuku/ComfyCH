@@ -804,6 +804,16 @@ if PromptServer is not None:
             asyncio.create_task(_run_async("sync_user", ["modal", "run", "sync.py"]))
             return web.json_response({"ok": True, "message": "Sync user settings lancée"})
 
+        # ── POST /api/modal/sync-custom-nodes ──
+        async def post_sync_custom_nodes(request):
+            if _OP_LOCK.locked():
+                return web.json_response(
+                    {"ok": False, "error": "Une opération Modal est déjà en cours"},
+                    status=409,
+                )
+            asyncio.create_task(_run_async("sync_custom_nodes", ["modal", "run", "sync.py", "--custom-nodes"]))
+            return web.json_response({"ok": True, "message": "Sync custom nodes lancée"})
+
         # Ensuite nos routes Modal Gateway
         routes = [
             ("GET", "/api/modal/config", get_config),
@@ -824,6 +834,7 @@ if PromptServer is not None:
             ("POST", "/api/modal/save-local", post_save_local),
             ("GET", "/api/modal/user-settings/status", get_user_settings_status),
             ("POST", "/api/modal/sync-user", post_sync_user),
+            ("POST", "/api/modal/sync-custom-nodes", post_sync_custom_nodes),
         ]
         for method, path, handler in routes:
             async def _guarded(request, _handler=handler):

@@ -28,7 +28,7 @@ le cloud ne sert que pour les rendus ponctuels (paiement à la seconde).
 | `auth.py` | Auth du gateway (Secret Modal `comfy-gateway-secret`) |
 | `workers/` | `ComfyWorker` de base + sous-classes par GPU (L4, L40S, A100, H100) |
 | `apps/all_in_one*.py` | Apps Modal déployables (4 / 3 / 1 workers) |
-| `sync.py` | Sync CPU des modèles locaux + HuggingFace vers le volume |
+| `sync.py` | Sync CPU des modèles locaux + HuggingFace vers le volume ; upload chunké des modèles locaux (100 Mo) directement dans le volume (plus de rebuild d'image) ; sync des custom nodes par tar.gz vers le volume dédié `comfy-custom-nodes` |
 | `image.py` | Image Docker partagée des workers |
 | `models.py` / `plugins.py` | Listes de modèles / custom nodes |
 
@@ -46,6 +46,9 @@ le cloud ne sert que pour les rendus ponctuels (paiement à la seconde).
 6. **Synchroniser les modèles** : détecter et sélectionner vos modèles locaux dans
    les paramètres, puis « 📥 Sync Models » (upload CPU vers le volume).
 
+> 💡 Le worker monte désormais aussi le volume `comfy-custom-nodes` (créé
+> automatiquement au premier déploiement) pour servir les custom nodes synchronisés.
+
 ## Utilisation
 
 - Choisissez **Local** (gratuit) ou un GPU cloud dans le dropdown.
@@ -53,6 +56,17 @@ le cloud ne sert que pour les rendus ponctuels (paiement à la seconde).
   et affiche les images reçues (sauvegardées aussi dans `ComfyUI/output/`).
 - La file d'attente (badge 🎮) gère les rendus un par un ; le `request_id`
   d'idempotence évite la double facturation lors des retries réseau.
+
+### Synchronisation
+
+- **Sync des modèles** : les modèles locaux sont streamés par **chunks de 100 Mo**
+  directement dans le volume `comfy-models` — **plus de rebuild d'image** à chaque
+  sync (bouton « 📥 Sync Models » de la modale).
+- **Sync des custom nodes** : le bouton « 📦 Sync Custom Nodes » de la modale (ou
+  `modal run sync.py --custom-nodes`) empaquette les custom nodes locaux en
+  `tar.gz` (protection path traversal + swap atomique) et les pousse vers le
+  volume `comfy-custom-nodes`. Les workers les **symlinkent au démarrage** —
+  **sans redeploy** pour changer un node.
 
 ## Sécurité
 
