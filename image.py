@@ -91,6 +91,10 @@ def _install_ext_plugin(image: modal.Image, plugin: dict) -> modal.Image:
     If a local directory with the same node name exists, it is staged as a
     fallback — if the git clone fails (e.g. private repo, no auth), the local
     copy is used instead.
+
+    If no local fallback exists and the git clone fails (e.g. missing/private
+    repo, bad URL), the failure is ignored with a warning and the node is
+    simply not installed — it does not fail the whole image build.
     """
     nodes_dir = "/root/comfy/ComfyUI/custom_nodes"
     url = plugin["url"]
@@ -121,8 +125,9 @@ def _install_ext_plugin(image: modal.Image, plugin: dict) -> modal.Image:
     else:
         # No local fallback available, just try git clone
         image = image.run_commands(
-            f"cd {nodes_dir} && git clone --recurse-submodules --single-branch "
-            f"{branch_opt}{shlex.quote(url)}"
+            f"cd {nodes_dir} && (git clone --recurse-submodules --single-branch "
+            f"{branch_opt}{shlex.quote(url)} 2>/dev/null || "
+            f"echo '⚠️ Failed to clone {name} — node not installed (check URL or repo access)')"
         )
 
     # Install requirements — from config OR auto-detect requirements.txt
@@ -131,7 +136,7 @@ def _install_ext_plugin(image: modal.Image, plugin: dict) -> modal.Image:
         files = " ".join(f"-r {shlex.quote(f)}" for f in requirements)
         image = image.run_commands(
             f"cd {work_dir} && uv pip install --no-deps "
-            f"--python $(command -v python) --compile-bytecode {files}"
+            f"--python $(command -v python) --compile-bytecode {files} || true"
         )
     else:
         # Auto-detect and install requirements.txt if it exists
@@ -145,7 +150,7 @@ def _install_ext_plugin(image: modal.Image, plugin: dict) -> modal.Image:
     if install:
         if install.endswith(".py"):
             image = image.run_commands(
-                f"cd {work_dir} && python {shlex.quote(install)}"
+                f"cd {work_dir} && python {shlex.quote(install)} || true"
             )
         else:
             print(f"Unsupported installation script: {install}")
