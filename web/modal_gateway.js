@@ -1229,6 +1229,13 @@
             '  font-size: 13px; color: #777; text-align: center;',
             '  padding: 20px; font-style: italic;',
             '}',
+            '.modal-plugin-item-status {',
+            '  font-size: 11px; margin-top: 3px;',
+            '}',
+            '.modal-plugin-item-status--installed { color: #6fce7f; }',
+            '.modal-plugin-item-status--new { color: #ffc860; }',
+            '.modal-plugin-item-status--removed { color: #e06c5a; }',
+            '.modal-plugin-item-status--none { color: #777; }',
             '',
             // ─── Models detection section (reuses plugin styles) ───
             '.modal-models-list {',
@@ -1454,27 +1461,19 @@
 
     /**
      * Ouvre la modale de configuration Modal Gateway.
-     * Charge la config et le statut depuis l'API ComfyUI.
+     * L'overlay est créé immédiatement (affichage instantané) puis rempli
+     * en arrière-plan depuis /api/modal/config et /api/modal/status.
      */
     async function openSettingsModal() {
-        // Empêcher l'ouverture de multiples modales
+        // ── Verrou synchrone anti double-ouverture ──────────────────────
+        if (window._modalSettingsOpen) return;
         if (document.getElementById('modal-settings-overlay')) return;
+        window._modalSettingsOpen = true;
 
-        // Charger la config depuis l'API ComfyUI
-        var config = { api_url: CONFIG.API_URL };
-        try {
-            var resp = await fetch('/api/modal/config');
-            if (resp.ok) config = await resp.json();
-        } catch (e) { /* mode dégradé : utiliser les constantes */ }
+        // Config partagée avec les handlers (remplie en arrière-plan)
+        var modalConfig = null;
 
-        // Charger le statut
-        var status = {};
-        try {
-            var statusResp = await fetch('/api/modal/status');
-            if (statusResp.ok) status = await statusResp.json();
-        } catch (e) {}
-
-        // Créer l'overlay
+        // ── Créer l'overlay IMMÉDIATEMENT (avant les fetches réseau) ─────
         var overlay = document.createElement('div');
         overlay.id = 'modal-settings-overlay';
         overlay.innerHTML = [
@@ -1487,11 +1486,14 @@
             '    <section>',
             '      <h3>🔌 Connexion API Modal</h3>',
             '      <label>URL de l\'API</label>',
-            '      <input type="text" id="cfg-api-url" value="' + escapeHtml(config.api_url || '') + '" placeholder="https://xxx.modal.run" />',
+            '      <input type="text" id="cfg-api-url" value="" placeholder="https://xxx.modal.run" />',
             '      <label>Clé API (X-API-Key)</label>',
-            '      <input type="password" id="cfg-api-key" value="' + escapeHtml(config.api_key || '') + '" placeholder="Collez votre clé API" autocomplete="off" />',
+            '      <input type="password" id="cfg-api-key" value="" placeholder="Collez votre clé API" autocomplete="off" />',
+            '      <label>Hôtes autorisés (reverse proxy)</label>',
+            '      <input type="text" id="cfg-allowed-hosts" value="" placeholder="comfy.example.com, autre.domaine" autocomplete="off" />',
             '      <div class="modal-plugin-actions">',
             '        <button id="cfg-generate-key" class="modal-btn">🔑 Générer une clé</button>',
+            '        <button id="cfg-create-secret" class="modal-btn modal-btn-action">☁️ Créer/Mettre à jour le Secret sur Modal</button>',
             '        <button id="cfg-save-connection" class="modal-btn modal-btn-primary">💾 Sauvegarder</button>',
             '      </div>',
             '      <div class="modal-plugin-note" id="cfg-secret-hint">🔑 Cette clé protège votre endpoint /generate — n\'importe quelle chaîne aléatoire convient (générez-en une ou collez un mot de passe). Elle doit être identique dans le Secret Modal et ici.</div>',
@@ -1520,7 +1522,7 @@
             '      <div id="modal-models-empty" class="modal-plugin-empty" style="display:none;">Aucun modèle détecté.</div>',
             '      <div class="modal-status-row" style="margin-top:12px;">',
             '        <span>🔄 Synchronisation des modèles</span>',
-            '        <span class="status-badge" id="status-sync">' + (config.last_sync ? '✅ ' + escapeHtml(config.last_sync) : '⏳ Jamais') + '</span>',
+            '        <span class="status-badge" id="status-sync">⏳ Jamais</span>',
             '      </div>',
             '      <button id="cfg-run-sync" class="modal-btn modal-btn-action">📥 Sync Models</button>',
             '      <div class="modal-plugin-note">ℹ️ Sauvegardez votre sélection puis cliquez sur <strong>Sync Models</strong> pour uploader vers Modal.</div>',
@@ -1544,18 +1546,18 @@
             '      <div id="modal-auth-warning" class="modal-auth-warning" style="display:none;">⚠️ <strong>Aucun token Modal actif</strong> — le déploiement échouera. Renseignez votre token dans la section “Token Modal (compte)” ci-dessus puis appuyez sur “✅ Enregistrer le token”.</div>',
             '      <div class="modal-status-row">',
             '        <span>🌐 API Gateway déployée</span>',
-            '        <span class="status-badge" id="status-deploy">' + (config.last_deploy ? '✅ ' + escapeHtml(config.last_deploy) : '⏳ Jamais') + '</span>',
+            '        <span class="status-badge" id="status-deploy">⏳ Jamais</span>',
             '      </div>',
             '      <button id="cfg-run-deploy" class="modal-btn modal-btn-action">🚀 Deploy API</button>',
             '    </section>',
             '    <section>',
             '      <h3>📊 Statut Modal</h3>',
             '      <div class="modal-status-grid">',
-            '        <div class="status-item">🔧 Modal CLI : ' + (status.modal_installed ? '✅' : '❌') + '</div>',
-            '        <div class="status-item">🔐 Authentifié : ' + (status.modal_authenticated ? '✅' : '❌') + '</div>',
-            '        <div class="status-item">💾 Volume comfy-models : ' + (status.volume_exists ? '✅' : '❌') + '</div>',
-            '        <div class="status-item">🌐 API configurée : ' + (status.api_configured ? '✅' : '❌') + '</div>',
-            '        <div class="status-item">🔑 Secret Modal : ' + (status.secret_exists ? '✅' : '❌') + '</div>',
+            '        <div class="status-item">🔧 Modal CLI : ...</div>',
+            '        <div class="status-item">🔐 Authentifié : ...</div>',
+            '        <div class="status-item">💾 Volume comfy-models : ...</div>',
+            '        <div class="status-item">🌐 API configurée : ...</div>',
+            '        <div class="status-item">🔑 Secret Modal : ...</div>',
             '      </div>',
             '    </section>',
             '    <section>',
@@ -1583,14 +1585,11 @@
         ].join('\n');
         document.body.appendChild(overlay);
 
-        // ─── Bandeau d'avertissement si l'auth Modal manque (déploiement) ───
-        var authWarningEl = document.getElementById('modal-auth-warning');
-        if (authWarningEl) {
-            authWarningEl.style.display = status.modal_authenticated ? 'none' : 'block';
-        }
-
         // Gestionnaires d'événements
-        overlay.querySelector('.modal-settings-close').onclick = function () { overlay.remove(); };
+        overlay.querySelector('.modal-settings-close').onclick = function () {
+            window._modalSettingsOpen = false;
+            overlay.remove();
+        };
         // NOTE: clicking on the overlay background no longer closes the modal
         // overlay.onclick = function (e) { if (e.target === overlay) overlay.remove(); };
 
@@ -1638,11 +1637,19 @@
         document.getElementById('cfg-save-connection').onclick = async function () {
             var apiUrl = document.getElementById('cfg-api-url').value.trim();
             var apiKey = document.getElementById('cfg-api-key').value.trim();
+            var allowedHosts = (document.getElementById('cfg-allowed-hosts').value || '')
+                .split(',')
+                .map(function (h) { return h.trim(); })
+                .filter(function (h) { return h.length > 0; });
             try {
                 var saveResp = await fetch('/api/modal/config', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ api_url: apiUrl, api_key: apiKey }),
+                    body: JSON.stringify({
+                        api_url: apiUrl,
+                        api_key: apiKey,
+                        allowed_hosts: allowedHosts,
+                    }),
                 });
                 if (!saveResp.ok) {
                     throw new Error('HTTP ' + saveResp.status);
@@ -1690,6 +1697,37 @@
             }
             updateSecretHint();
             showNotification('🔑 Clé générée (48 hex). Créez le Secret Modal avec la commande affichée, puis collez-la ici.', 'info');
+        };
+
+        // ── Secret Modal : création / mise à jour depuis l'UI ──
+        document.getElementById('cfg-create-secret').onclick = async function () {
+            var apiKey = document.getElementById('cfg-api-key').value.trim();
+            if (!apiKey) {
+                showNotification('⚠️ Saisissez d\'abord une Clé API dans le champ ci-dessus (ou générez-en une)', 'error');
+                return;
+            }
+            var btn = document.getElementById('cfg-create-secret');
+            btn.disabled = true;
+            btn.textContent = '⏳ Création du Secret...';
+            try {
+                var resp = await fetch('/api/modal/secret', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ api_key: apiKey }),
+                });
+                var data = {};
+                try { data = await resp.json(); } catch (_) {}
+                if (!resp.ok || !data.ok) {
+                    throw new Error(data.error || ('HTTP ' + resp.status));
+                }
+                showNotification('✅ Secret Modal créé/mis à jour — redéployez (🚀 Deploy API)', 'success');
+                refreshStatus();
+            } catch (e) {
+                showNotification('❌ ' + e.message, 'error');
+            } finally {
+                btn.disabled = false;
+                btn.textContent = '☁️ Créer/Mettre à jour le Secret sur Modal';
+            }
         };
 
         updateSecretHint();
@@ -1787,6 +1825,20 @@
                     }
                 }
 
+                // Nodes déjà déployés sur Modal (config.last_deployed_custom_nodes)
+                var deployedSet = {};
+                if (!modalConfig) {
+                    try {
+                        var cfgResp = await fetch('/api/modal/config');
+                        if (cfgResp.ok) modalConfig = await cfgResp.json();
+                    } catch (e) {}
+                }
+                if (modalConfig && Array.isArray(modalConfig.last_deployed_custom_nodes)) {
+                    for (var d = 0; d < modalConfig.last_deployed_custom_nodes.length; d++) {
+                        deployedSet[modalConfig.last_deployed_custom_nodes[d]] = true;
+                    }
+                }
+
                 listEl.innerHTML = '';
                 for (var i = 0; i < detectedPlugins.length; i++) {
                     (function (plugin) {
@@ -1816,6 +1868,30 @@
                         nameEl.textContent = plugin.name;
                         content.appendChild(nameEl);
 
+                        // Badge de statut installé / sera installé / sera retiré
+                        var statusEl = document.createElement('div');
+                        statusEl.className = 'modal-plugin-item-status';
+
+                        function updatePluginStatus() {
+                            var isDeployed = !!deployedSet[plugin.name];
+                            if (checkbox.checked && isDeployed) {
+                                statusEl.textContent = '✅ déjà installé';
+                                statusEl.className = 'modal-plugin-item-status modal-plugin-item-status--installed';
+                            } else if (checkbox.checked && !isDeployed) {
+                                statusEl.textContent = '🆕 sera installé';
+                                statusEl.className = 'modal-plugin-item-status modal-plugin-item-status--new';
+                            } else if (!checkbox.checked && isDeployed) {
+                                statusEl.textContent = '🗑️ sera retiré';
+                                statusEl.className = 'modal-plugin-item-status modal-plugin-item-status--removed';
+                            } else {
+                                statusEl.textContent = '—';
+                                statusEl.className = 'modal-plugin-item-status modal-plugin-item-status--none';
+                            }
+                        }
+                        checkbox.addEventListener('change', updatePluginStatus);
+                        content.appendChild(statusEl);
+                        updatePluginStatus();
+
                         checkbox.dataset.pluginIsLocal = 'false';
                         if (plugin.has_git && plugin.git_url) {
                             var urlEl = document.createElement('div');
@@ -1843,7 +1919,10 @@
                 toggleBtn.onclick = function () {
                     allChecked = !allChecked;
                     var cbs = listEl.querySelectorAll('input[type="checkbox"]:not([disabled])');
-                    for (var t = 0; t < cbs.length; t++) cbs[t].checked = allChecked;
+                    for (var t = 0; t < cbs.length; t++) {
+                        cbs[t].checked = allChecked;
+                        cbs[t].dispatchEvent(new Event('change'));
+                    }
                     toggleBtn.textContent = allChecked ? 'Tout désélectionner' : 'Tout sélectionner';
                 };
 
@@ -2177,40 +2256,60 @@
             }
         };
 
-        // ─── User Settings ────────────────────────────────────────────────
-        // Fetch status
+        // ── Remplissage en arrière-plan ───────────────────────────────────
+        // Charger la config puis peupler les champs + badges
+        var config = { api_url: CONFIG.API_URL, api_key: CONFIG.API_KEY };
+        try {
+            var resp = await fetch('/api/modal/config');
+            if (resp.ok) config = await resp.json();
+        } catch (e) { /* mode dégradé : utiliser les constantes */ }
+        modalConfig = config;
+
+        // Champs de connexion API Modal
+        var apiUrlEl = document.getElementById('cfg-api-url');
+        if (apiUrlEl) apiUrlEl.value = config.api_url || '';
+        var apiKeyEl = document.getElementById('cfg-api-key');
+        if (apiKeyEl) apiKeyEl.value = config.api_key || '';
+
+        // Hôtes autorisés (reverse proxy)
+        var allowedHostsEl = document.getElementById('cfg-allowed-hosts');
+        if (allowedHostsEl && Array.isArray(config.allowed_hosts)) {
+            allowedHostsEl.value = config.allowed_hosts.join(', ');
+        }
+
+        // Badges de date (sync / deploy / user sync)
+        var syncBadge = document.getElementById('status-sync');
+        if (syncBadge) {
+            syncBadge.textContent = config.last_sync ? '✅ ' + config.last_sync : '⏳ Jamais';
+        }
+        var deployBadge = document.getElementById('status-deploy');
+        if (deployBadge) {
+            deployBadge.textContent = config.last_deploy ? '✅ ' + config.last_deploy : '⏳ Jamais';
+        }
+        var userSyncBadge = document.getElementById('status-user-sync');
+        if (userSyncBadge) {
+            userSyncBadge.textContent = config.last_user_sync ? '✅ ' + config.last_user_sync : '⏳ Jamais';
+        }
+
+        // ─── User Settings : statut du dossier user/ local ───
         var userStatusEl = document.getElementById('status-user-settings');
-        var userSyncEl = document.getElementById('status-user-sync');
-        
         if (userStatusEl) {
             fetch('/api/modal/user-settings/status')
-                .then(function(r) { return r.json(); })
-                .then(function(status) {
+                .then(function (r) { return r.json(); })
+                .then(function (status) {
                     if (status.exists) {
                         userStatusEl.textContent = '✅ ' + status.file_count + ' fichiers (' + status.size_mb + ' MB)';
                     } else {
                         userStatusEl.textContent = '❌ Non trouvé';
                     }
                 })
-                .catch(function() {
+                .catch(function () {
                     userStatusEl.textContent = '❌ Erreur';
                 });
         }
-        
-        if (userSyncEl) {
-            fetch('/api/modal/config')
-                .then(function(r) { return r.json(); })
-                .then(function(config) {
-                    if (config.last_user_sync) {
-                        userSyncEl.textContent = '✅ ' + escapeHtml(config.last_user_sync);
-                    } else {
-                        userSyncEl.textContent = '⏳ Jamais';
-                    }
-                })
-                .catch(function() {
-                    userSyncEl.textContent = '❌ Erreur';
-                });
-        }
+
+        // ─── Grille de statut Modal + bandeau auth (fetch /api/modal/status) ──
+        refreshStatus();
 
         document.getElementById('cfg-sync-user').onclick = function() {
             runOperation('sync-user');

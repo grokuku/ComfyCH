@@ -10,7 +10,6 @@ container).  This image **must not** download any models.
 from __future__ import annotations
 
 import json
-import shlex
 from pathlib import Path
 
 import modal
@@ -63,17 +62,26 @@ def _build_image() -> modal.Image:
             "API endpoint might not work without a workflow."
         )
 
-    # ── Built-in custom nodes (ComfyUI Registry) ────────────────────────
-    if comfy_plugins:
-        image = image.run_commands("comfy node install " + " ".join(comfy_plugins))
-
-    # ── External custom nodes (from git) ────────────────────────────────
-    for plugin in comfy_plugins_ext:
-        image = _install_ext_plugin(image, plugin)
-
-    # ── Local custom nodes (non-git, copied from filesystem) ───────────
-    for node_name in custom_nodes_local:
-        image = _install_local_node(image, node_name)
+    # ── Custom node dependencies (pip) — code lives on the volume ──────
+    # Install pip deps of selected custom nodes (read local requirements.txt)
+    # so the worker can load node code from the volume without a redeploy.
+    local_custom_nodes_dir = root_dir.parent  # ComfyUI/custom_nodes
+    selected_names = set()
+    for p in comfy_plugins_ext:
+        url = p.get("url", "") if isinstance(p, dict) else str(p)
+        name = url.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
+        if name:
+            selected_names.add(name)
+    selected_names.update(custom_nodes_local)
+    selected_names.update(comfy_plugins)  # registry ids (best-effort)
+    for name in sorted(selected_names):
+        req_file = local_custom_nodes_dir / name / "requirements.txt"
+        if req_file.is_file():
+            image = image.add_local_file(str(req_file), f"/deps/{name}/requirements.txt", copy=True)
+            image = image.run_commands(
+                f"pip install -r /deps/{name}/requirements.txt || "
+                f"echo '⚠️ Failed to install deps for {name}'"
+            )
 
     # ── Reverse-proxy fix so workflow save works behind Modal's edge proxy
     image = image.add_local_dir(
@@ -81,106 +89,6 @@ def _build_image() -> modal.Image:
         "/root/comfy/ComfyUI/custom_nodes/reverse_proxy_fix",
         copy=True,
     )
-
-    return image
-
-
-def _install_ext_plugin(image: modal.Image, plugin: dict) -> modal.Image:
-    """Install one external custom node from git into ComfyUI's custom_nodes.
-
-    If a local directory with the same node name exists, it is staged as a
-    fallback — if the git clone fails (e.g. private repo, no auth), the local
-    copy is used instead.
-
-    If no local fallback exists and the git clone fails (e.g. missing/private
-    repo, bad URL), the failure is ignored with a warning and the node is
-    simply not installed — it does not fail the whole image build.
-    """
-    nodes_dir = "/root/comfy/ComfyUI/custom_nodes"
-    url = plugin["url"]
-    name = url.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
-    work_dir = f"{nodes_dir}/{shlex.quote(name)}"
-
-    branch = plugin.get("branch", "").strip()
-    branch_opt = f"--branch {shlex.quote(branch)} " if branch else ""
-
-    # Check if a local copy exists (for fallback)
-    local_source = Path(__file__).resolve().parent.parent / name
-    has_local_fallback = local_source.is_dir()
-
-    if has_local_fallback:
-        # Stage local copy as fallback
-        image = image.add_local_dir(
-            str(local_source),
-            f"/local_nodes_backup/{name}",
-            copy=True,
-            ignore=["*.sqlite", "*.db", "*.sqlite-wal", "*.sqlite-shm"],
-        )
-        # Try git clone, fall back to local copy on failure
-        image = image.run_commands(
-            f"cd {nodes_dir} && git clone --recurse-submodules --single-branch "
-            f"{branch_opt}{shlex.quote(url)} 2>/dev/null || "
-            f"(cp -r /local_nodes_backup/{name} {work_dir} && echo 'Used local fallback for {name}')"
-        )
-    else:
-        # No local fallback available, just try git clone
-        image = image.run_commands(
-            f"cd {nodes_dir} && (git clone --recurse-submodules --single-branch "
-            f"{branch_opt}{shlex.quote(url)} 2>/dev/null || "
-            f"echo '⚠️ Failed to clone {name} — node not installed (check URL or repo access)')"
-        )
-
-    # Install requirements — from config OR auto-detect requirements.txt
-    requirements = plugin.get("requirements") or []
-    if requirements:
-        files = " ".join(f"-r {shlex.quote(f)}" for f in requirements)
-        image = image.run_commands(
-            f"cd {work_dir} && uv pip install --no-deps "
-            f"--python $(command -v python) --compile-bytecode {files} || true"
-        )
-    else:
-        # Auto-detect and install requirements.txt if it exists
-        image = image.run_commands(
-            f"cd {work_dir} && [ -f requirements.txt ] && "
-            f"uv pip install --no-deps --python $(command -v python) "
-            f"--compile-bytecode -r requirements.txt || true"
-        )
-
-    install = plugin.get("install", "").strip()
-    if install:
-        if install.endswith(".py"):
-            image = image.run_commands(
-                f"cd {work_dir} && python {shlex.quote(install)} || true"
-            )
-        else:
-            print(f"Unsupported installation script: {install}")
-
-    ext_deps = plugin.get("ext_deps") or []
-    if ext_deps:
-        image = image.uv_pip_install(ext_deps, extra_options="--no-deps")
-
-    return image
-
-
-def _install_local_node(image: modal.Image, node_name: str) -> modal.Image:
-    """Copy a local non-git custom node directory into the Modal image."""
-    source_dir = Path(__file__).resolve().parent.parent / node_name
-    if not source_dir.is_dir():
-        print(f"Warning: local custom node '{node_name}' not found at {source_dir}, skipping.")
-        return image
-
-    dest_dir = f"/root/comfy/ComfyUI/custom_nodes/{shlex.quote(node_name)}"
-    image = image.add_local_dir(
-        str(source_dir), dest_dir, copy=True,
-        ignore=["*.sqlite", "*.db", "*.sqlite-wal", "*.sqlite-shm"],
-    )
-
-    req_file = source_dir / "requirements.txt"
-    if req_file.is_file():
-        image = image.run_commands(
-            f"cd {dest_dir} && uv pip install --no-deps "
-            f"--python $(command -v python) --compile-bytecode -r requirements.txt"
-        )
 
     return image
 

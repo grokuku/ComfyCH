@@ -41,6 +41,8 @@ DEFAULT_CONFIG = {
     "custom_nodes_local": [],
     "models_to_sync": [],
     "local_output_dir": "",
+    "allowed_hosts": [],
+    "last_deployed_custom_nodes": [],
 }
 
 
@@ -143,6 +145,15 @@ async def _run_async_inner(operation: str, cmd: list[str]):
             config["last_sync"] = now
         elif operation == "deploy":
             config["last_deploy"] = now
+            # Liste des nodes réellement déployés sur Modal (ext + local)
+            deployed = []
+            for p in config.get("custom_nodes_ext", []):
+                url = p.get("url", "") if isinstance(p, dict) else str(p)
+                name = url.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
+                if name:
+                    deployed.append(name)
+            deployed.extend(config.get("custom_nodes_local", []))
+            config["last_deployed_custom_nodes"] = deployed
         elif operation == "sync_user":
             config["last_user_sync"] = now
         save_config(config)
@@ -399,14 +410,13 @@ def _request_guard(request):
     """Retourne ``None`` si la requête est autorisée, sinon une réponse 403.
 
     Protège les endpoints locaux contre drive-by / DNS rebinding en
-    vérifiant le Host et l'Origin de la requête. Seules les origines
-    locales (loopback, réseau privé, ``.local``) et same-origin sont
-    acceptées.
+    vérifiant le Host et l'Origin de la requête. Sont acceptées : les
+    origines locales (loopback, réseau privé, ``.local``), les requêtes
+    same-origin, et les hôtes/origines listés dans ``config["allowed_hosts"]``
+    (utile quand ComfyUI est derrière un reverse proxy).
     """
-    host = request.headers.get("Host", "")
-    origin = request.headers.get("Origin", "")
 
-    def _hostname(netloc: str) -> str:
+    def _hostname_of(netloc: str) -> str:
         n = netloc.strip().lower()
         if n.startswith("["):  # IPv6 [::1]:port
             return n.split("]")[0] + "]"
@@ -414,7 +424,7 @@ def _request_guard(request):
             return n.rsplit(":", 1)[0]
         return n
 
-    def _is_local(hostname: str) -> bool:
+    def _is_local_hostname(hostname: str) -> bool:
         h = hostname.strip().lower()
         if h in ("localhost", "::1", "[::1]") or h.endswith(".local"):
             return True
@@ -429,28 +439,32 @@ def _request_guard(request):
                 return False
         return False
 
-    if host:
-        if not _is_local(_hostname(host)):
-            return web.json_response(
-                {"error": "Forbidden: non-local Host"}, status=403
-            )
+    host = request.headers.get("Host", "")
+    origin = request.headers.get("Origin", "")
+    allowed = {
+        str(a).strip().lower()
+        for a in (load_config().get("allowed_hosts", []) or [])
+        if str(a).strip()
+    }
+
+    if host and not _is_local_hostname(_hostname_of(host)) \
+            and host not in allowed and _hostname_of(host) not in allowed:
+        return web.json_response(
+            {"error": f"Forbidden host: {host}"}, status=403
+        )
 
     if origin:
-        origin_hostname = ""
-        try:
-            origin_hostname = _hostname(urlsplit(origin).netloc)
-        except ValueError:
-            origin_hostname = ""
-
-        if origin_hostname:
-            if host and _hostname(host) == origin_hostname:
-                pass  # same-origin OK (notamment accès LAN)
-            elif _is_local(origin_hostname):
-                pass  # origine locale OK
-            else:
-                return web.json_response(
-                    {"error": "Forbidden: non-local Origin"}, status=403
-                )
+        origin_netloc = urlsplit(origin).netloc
+        if origin_netloc:
+            if origin_netloc == host:
+                return None  # same-origin OK
+            if _is_local_hostname(_hostname_of(origin_netloc)):
+                return None  # origine locale OK
+            if origin_netloc in allowed or _hostname_of(origin_netloc) in allowed:
+                return None  # origine autorisée (reverse proxy)
+            return web.json_response(
+                {"error": f"Forbidden origin: {origin}"}, status=403
+            )
 
     return None
 
@@ -566,6 +580,56 @@ if PromptServer is not None:
 
             print(f"[Modal Gateway] Token Modal enregistré (authentifié: {authenticated})")
             return web.json_response({"ok": True, "authenticated": authenticated})
+
+        # ── POST /api/modal/secret — crée/màj le Secret Modal (débloque le 503) ──
+        async def post_secret(request):
+            """Create or update the Modal Secret holding the gateway API key.
+
+            Supprime d'abord le Secret s'il existe (les erreurs sont ignorées),
+            puis le recrée avec la nouvelle clé — le tout depuis l'UI, sans CLI.
+            Résout le 503 « API key non configurée sur le serveur ».
+            """
+            try:
+                data = await request.json()
+            except Exception:
+                return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
+
+            api_key = str(data.get("api_key", "")).strip()
+            if not api_key:
+                return web.json_response(
+                    {"ok": False, "error": "api_key is required"}, status=400
+                )
+
+            env = os.environ.copy()
+            env["PATH"] = f"{os.path.dirname(sys.executable)}:{env.get('PATH', '')}"
+
+            try:
+                # Supprimer le Secret existant s'il y en a un (ignorer les erreurs)
+                await asyncio.to_thread(
+                    subprocess.run,
+                    ["modal", "secret", "delete", "comfy-gateway-secret"],
+                    capture_output=True, text=True, timeout=60, env=env,
+                )
+                # (Re)créer le Secret avec la nouvelle clé
+                result = await asyncio.to_thread(
+                    subprocess.run,
+                    ["modal", "secret", "create", "comfy-gateway-secret", f"API_KEY={api_key}"],
+                    capture_output=True, text=True, timeout=60, env=env,
+                )
+            except FileNotFoundError:
+                return web.json_response({"ok": False, "error": "modal CLI not installed"}, status=500)
+            except subprocess.TimeoutExpired:
+                return web.json_response({"ok": False, "error": "modal secret create timed out"}, status=500)
+
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout or "").strip()
+                return web.json_response(
+                    {"ok": False, "error": f"modal secret create failed: {detail[:500]}"},
+                    status=500,
+                )
+
+            print("[Modal Gateway] Secret Modal comfy-gateway-secret créé/mis à jour")
+            return web.json_response({"ok": True})
 
         # ── GET /api/modal/logs — récupère les logs de la dernière opération ──
         async def get_logs(request):
@@ -829,6 +893,7 @@ if PromptServer is not None:
             ("POST", "/api/modal/sync", post_sync),
             ("POST", "/api/modal/deploy", post_deploy),
             ("POST", "/api/modal/token", post_token),
+            ("POST", "/api/modal/secret", post_secret),
             ("GET", "/api/modal/logs", get_logs),
             ("GET", "/api/modal/logs/stream", get_logs_stream),
             ("POST", "/api/modal/save-local", post_save_local),

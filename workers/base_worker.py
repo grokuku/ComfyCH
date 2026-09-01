@@ -32,6 +32,7 @@ import base64
 import shutil
 import socket
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -193,7 +194,15 @@ class ComfyWorker:
         print(f"[ComfyWorker] Created {linked} model symlinks from manifest")
 
     def _sync_custom_nodes_from_volume(self):
-        """Symlink each custom node from /custom_nodes volume into ComfyUI."""
+        """Symlink each custom node from /custom_nodes volume into ComfyUI.
+
+        Le code des nodes vit sur le volume (plus installé dans l'image). Au
+        démarrage on symlink chaque dossier node dans ComfyUI, on installe ses
+        dépendances pip (requirements.txt — généralement déjà présentes via le
+        build de l'image, donc idempotent et rapide) et on exécute son
+        install.py s'il existe. Les échecs sont loggés en warning sans jamais
+        faire échouer le démarrage du worker.
+        """
         vol_path = Path("/custom_nodes")
         comfy_path = Path("/root/comfy/ComfyUI/custom_nodes")
 
@@ -207,12 +216,52 @@ class ComfyWorker:
             if item.name.startswith(".") or not item.is_dir():
                 continue
             dst = comfy_path / item.name
-            if dst.exists() or dst.is_symlink():
-                continue
-            dst.symlink_to(item)
-            linked += 1
+            if not (dst.exists() or dst.is_symlink()):
+                dst.symlink_to(item)
+                linked += 1
+
+            # Install node deps + run install.py (best-effort)
+            self._install_node_requirements(item)
+            self._run_node_install_script(item)
 
         print(f"[ComfyWorker] Linked {linked} custom node(s) from volume")
+
+    def _install_node_requirements(self, node_dir: Path) -> None:
+        """Install a custom node's pip dependencies from its requirements.txt.
+
+        Best-effort : pip est idempotent, donc re-installer des deps déjà
+        cuites dans l'image au build est un no-op rapide. Les échecs sont
+        loggés, jamais levés.
+        """
+        req_file = node_dir / "requirements.txt"
+        if not req_file.is_file():
+            return
+        try:
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "-r", str(req_file)],
+                capture_output=True, timeout=600,
+            )
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout or b"").decode(errors="replace").strip()
+                print(f"[ComfyWorker] ⚠️ Failed to install deps for {node_dir.name}: {detail[-500:]}")
+        except (subprocess.TimeoutExpired, OSError) as e:
+            print(f"[ComfyWorker] ⚠️ Error installing deps for {node_dir.name}: {e}")
+
+    def _run_node_install_script(self, node_dir: Path) -> None:
+        """Run a custom node's install.py if present (best-effort)."""
+        install_py = node_dir / "install.py"
+        if not install_py.is_file():
+            return
+        try:
+            result = subprocess.run(
+                [sys.executable, str(install_py)],
+                capture_output=True, timeout=600,
+            )
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout or b"").decode(errors="replace").strip()
+                print(f"[ComfyWorker] ⚠️ install.py failed for {node_dir.name}: {detail[-500:]}")
+        except (subprocess.TimeoutExpired, OSError) as e:
+            print(f"[ComfyWorker] ⚠️ Error running install.py for {node_dir.name}: {e}")
 
     @modal.enter(snap=False)
     def start_restore(self) -> None:
