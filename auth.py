@@ -49,6 +49,22 @@ def get_modal_secrets() -> list[modal.Secret]:
             f"    modal secret create {SECRET_NAME} {SECRET_ENV_KEY}=<votre-clé>"
         )
         return []
+    except modal.exception.AuthError:
+        print(
+            "⚠️  Authentification Modal requise : exécutez "
+            "`modal token set --token-id <id> --token-secret <secret>` "
+            "ou renseignez le token dans les paramètres ComfyUI "
+            "(Paramètres ⚙️ → Token Modal (compte) → ✅ Enregistrer le token). "
+            "Les routes protégées répondront 503 tant que le secret n'est pas monté."
+        )
+        return []
+    except Exception as exc:  # noqa: BLE001 — ConnectionError, timeouts, etc.
+        print(
+            f"⚠️  Impossible de vérifier le Modal Secret '{SECRET_NAME}' "
+            f"({type(exc).__name__}: {exc}) — les routes protégées répondront 503. "
+            "Vérifiez votre connexion réseau puis redéployez (modal deploy apps/all_in_one.py)."
+        )
+        return []
 
 
 def _configured_key() -> str:

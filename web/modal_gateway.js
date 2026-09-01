@@ -1147,6 +1147,21 @@
             '  padding: 8px 12px; background: #1a1a1e;',
             '  border-radius: 6px; font-size: 13px;',
             '}',
+            '/* Bandeau d\'avertissement — auth Modal manquante */',
+            '.modal-auth-warning {',
+            '  background: #4a2b1d;',
+            '  border: 1px solid #c0392b;',
+            '  border-left: 4px solid #e74c3c;',
+            '  border-radius: 6px;',
+            '  color: #f5c6c0;',
+            '  padding: 10px 12px;',
+            '  margin-bottom: 12px;',
+            '  font-size: 13px;',
+            '  line-height: 1.5;',
+            '}',
+            '.modal-auth-warning strong {',
+            '  color: #ffb3a7;',
+            '}',
             '/* Logs */',
             '.modal-log-output {',
             '  background: #111; color: #0f0;',
@@ -1279,6 +1294,11 @@
                     items[2].textContent = '💾 Volume comfy-models : ' + (status.volume_exists ? '✅' : '❌');
                     items[3].textContent = '🌐 API configurée : ' + (status.api_configured ? '✅' : '❌');
                     items[4].textContent = '🔑 Secret Modal : ' + (status.secret_exists ? '✅' : '❌');
+                }
+                // Bandeau d'avertissement — masqué dès que l'auth Modal est présente
+                var authWarning = document.getElementById('modal-auth-warning');
+                if (authWarning) {
+                    authWarning.style.display = status.modal_authenticated ? 'none' : 'block';
                 }
             })
             .catch(function () {});
@@ -1521,6 +1541,7 @@
             '    </section>',
             '    <section>',
             '      <h3>🚀 Déploiement</h3>',
+            '      <div id="modal-auth-warning" class="modal-auth-warning" style="display:none;">⚠️ <strong>Aucun token Modal actif</strong> — le déploiement échouera. Renseignez votre token dans la section “Token Modal (compte)” ci-dessus puis appuyez sur “✅ Enregistrer le token”.</div>',
             '      <div class="modal-status-row">',
             '        <span>🌐 API Gateway déployée</span>',
             '        <span class="status-badge" id="status-deploy">' + (config.last_deploy ? '✅ ' + escapeHtml(config.last_deploy) : '⏳ Jamais') + '</span>',
@@ -1561,6 +1582,12 @@
             '</div>',
         ].join('\n');
         document.body.appendChild(overlay);
+
+        // ─── Bandeau d'avertissement si l'auth Modal manque (déploiement) ───
+        var authWarningEl = document.getElementById('modal-auth-warning');
+        if (authWarningEl) {
+            authWarningEl.style.display = status.modal_authenticated ? 'none' : 'block';
+        }
 
         // Gestionnaires d'événements
         overlay.querySelector('.modal-settings-close').onclick = function () { overlay.remove(); };
