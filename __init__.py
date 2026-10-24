@@ -66,6 +66,20 @@ def save_config(config: dict) -> None:
         CONFIG_PATH.write_text(json.dumps(current, indent=2))
 
 
+def _mask_config(config: dict) -> dict:
+    """Retourne une copie sûre de la config pour l'API HTTP.
+
+    ``api_key`` n'est JAMAIS renvoyée en clair au navigateur : elle est
+    remplacée par une chaîne vide et l'information utile (présence ou non
+    d'une clé) est exposée via le booléen ``api_key_set``.
+    """
+    masked = dict(config)
+    api_key = str(masked.get("api_key") or "")
+    masked["api_key"] = ""
+    masked["api_key_set"] = bool(api_key)
+    return masked
+
+
 # ─── Helpers ───
 
 LOG_DIR = Path(__file__).resolve().parent / "logs"
@@ -82,6 +96,63 @@ def _status_path() -> Path:
 
 
 _OP_LOCK = asyncio.Lock()  # sérialise les opérations Modal (sync/deploy/sync-user)
+
+# Garde d'entrée anti-concurrence (M11).
+# ``_OP_LOCK.locked()`` ne peut pas servir de test d'entrée : entre le check et
+# l'acquisition réelle (faite dans la tâche de fond), deux requêtes peuvent
+# franchir le test et lancer deux opérations. On réserve donc le slot de façon
+# synchrone, sans ``await`` entre le test et l'affectation.
+_op_in_progress = False
+
+# Références fortes aux tâches de fond : l'event loop n'en garde qu'une
+# référence faible, une tâche non retenue peut être collectée en cours de route.
+_background_tasks: set = set()
+
+
+def _op_busy_response():
+    """Réponse HTTP 409 standard lorsqu'une opération Modal est déjà en cours."""
+    return web.json_response(
+        {"ok": False, "error": "Une opération Modal est déjà en cours"},
+        status=409,
+    )
+
+
+def _try_acquire_op() -> bool:
+    """Réserve atomiquement le slot d'opération Modal. False si déjà occupé."""
+    global _op_in_progress
+    if _op_in_progress:
+        return False
+    _op_in_progress = True
+    return True
+
+
+def _release_op() -> None:
+    """Libère le slot d'opération Modal (idempotent)."""
+    global _op_in_progress
+    _op_in_progress = False
+
+
+def _on_op_task_done(task) -> None:
+    """Callback de fin de tâche : oublie la tâche et libère le slot.
+
+    Appelé dans tous les cas (succès, exception, annulation).
+    """
+    _background_tasks.discard(task)
+    _release_op()
+
+
+def _spawn_op(operation: str, cmd: list[str]) -> bool:
+    """Réserve le slot puis lance l'opération en tâche de fond.
+
+    Returns:
+        False si une opération est déjà en cours (rien n'est lancé), True sinon.
+    """
+    if not _try_acquire_op():
+        return False
+    task = asyncio.create_task(_run_async(operation, cmd))
+    _background_tasks.add(task)
+    task.add_done_callback(_on_op_task_done)
+    return True
 
 
 async def _run_async(operation: str, cmd: list[str]):
@@ -479,8 +550,8 @@ if PromptServer is not None:
 
         # ── GET /api/modal/config ──
         async def get_config(request):
-            config = load_config()
-            return web.json_response(config)
+            # La clé API n'est jamais renvoyée en clair (voir _mask_config).
+            return web.json_response(_mask_config(load_config()))
 
         # ── POST /api/modal/config ──
         async def post_config(request):
@@ -489,7 +560,9 @@ if PromptServer is not None:
             except Exception:
                 data = {}
             save_config(data)
-            return web.json_response({"ok": True, "config": load_config()})
+            return web.json_response(
+                {"ok": True, "config": _mask_config(load_config())}
+            )
 
         # ── GET /api/modal/status ──
         async def get_status(request):
@@ -509,22 +582,14 @@ if PromptServer is not None:
 
         # ── POST /api/modal/sync — lance la sync en arrière-plan ──
         async def post_sync(request):
-            if _OP_LOCK.locked():
-                return web.json_response(
-                    {"ok": False, "error": "Une opération Modal est déjà en cours"},
-                    status=409,
-                )
-            asyncio.create_task(_run_async("sync", ["modal", "run", "sync.py"]))
+            if not _spawn_op("sync", ["modal", "run", "sync.py"]):
+                return _op_busy_response()
             return web.json_response({"ok": True, "message": "Sync lancée"})
 
         # ── POST /api/modal/deploy — lance le déploiement ──
         async def post_deploy(request):
-            if _OP_LOCK.locked():
-                return web.json_response(
-                    {"ok": False, "error": "Une opération Modal est déjà en cours"},
-                    status=409,
-                )
-            asyncio.create_task(_run_async("deploy", ["modal", "deploy", "apps/all_in_one.py"]))
+            if not _spawn_op("deploy", ["modal", "deploy", "apps/all_in_one.py"]):
+                return _op_busy_response()
             return web.json_response({"ok": True, "message": "Déploiement lancé"})
 
         # ── POST /api/modal/token — enregistre le token Modal (remplace modal token set en CLI) ──
@@ -860,22 +925,18 @@ if PromptServer is not None:
 
         # ── POST /api/modal/sync-user ──
         async def post_sync_user(request):
-            if _OP_LOCK.locked():
-                return web.json_response(
-                    {"ok": False, "error": "Une opération Modal est déjà en cours"},
-                    status=409,
-                )
-            asyncio.create_task(_run_async("sync_user", ["modal", "run", "sync.py"]))
+            if not _spawn_op(
+                "sync_user", ["modal", "run", "sync.py", "--sync-user-only"]
+            ):
+                return _op_busy_response()
             return web.json_response({"ok": True, "message": "Sync user settings lancée"})
 
         # ── POST /api/modal/sync-custom-nodes ──
         async def post_sync_custom_nodes(request):
-            if _OP_LOCK.locked():
-                return web.json_response(
-                    {"ok": False, "error": "Une opération Modal est déjà en cours"},
-                    status=409,
-                )
-            asyncio.create_task(_run_async("sync_custom_nodes", ["modal", "run", "sync.py", "--sync-custom-nodes"]))
+            if not _spawn_op(
+                "sync_custom_nodes", ["modal", "run", "sync.py", "--sync-custom-nodes"]
+            ):
+                return _op_busy_response()
             return web.json_response({"ok": True, "message": "Sync custom nodes lancée"})
 
         # Ensuite nos routes Modal Gateway

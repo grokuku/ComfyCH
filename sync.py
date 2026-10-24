@@ -8,12 +8,15 @@ Supports two sync modes:
 
 Usage::
 
-    modal run sync.py
+    modal run sync.py                    # modèles locaux + HF + user settings
+    modal run sync.py --sync-custom-nodes # archive des custom nodes seulement
+    modal run sync.py --sync-user-only    # user settings seulement (étape 3)
 """
 
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import modal
@@ -30,6 +33,68 @@ vol = modal.Volume.from_name("comfy-models", create_if_missing=True)
 custom_nodes_vol = modal.Volume.from_name("comfy-custom-nodes", create_if_missing=True)
 
 CHUNK_SIZE = 100 * 1024 * 1024  # 100 MB
+
+_CACHE_ROOT = Path("/cache")
+
+
+# ── Path / archive validation helpers ────────────────────────────────────
+
+
+def _safe_model_filename(filename: str) -> str:
+    """Validate a model *filename* against path traversal and return it.
+
+    The name must be a bare file name: no path separator (``/`` or ``\\``),
+    no ``.``/``..`` component, and ``Path(filename).name`` must be the name
+    itself. Raises :class:`ValueError` otherwise.
+    """
+    if not filename:
+        raise ValueError("Model filename is empty")
+    if "/" in filename or "\\" in filename:
+        raise ValueError(f"Model filename '{filename}' must not contain a path separator")
+    if filename in (".", ".."):
+        raise ValueError(f"Model filename '{filename}' is not a valid file name")
+    if Path(filename).name != filename:
+        raise ValueError(f"Model filename '{filename}' is not a bare file name")
+    return filename
+
+
+def _model_dest(filename: str) -> Path:
+    """Return the validated volume path (``/cache/<filename>``) for *filename*.
+
+    Validates the name with :func:`_safe_model_filename` and double-checks that
+    the resolved path stays under the volume root (belt + braces).
+    """
+    _safe_model_filename(filename)
+    dest = _CACHE_ROOT / filename
+    if not dest.resolve().is_relative_to(_CACHE_ROOT.resolve()):
+        raise ValueError(f"Model filename '{filename}' escapes the volume root")
+    return dest
+
+
+def _validate_tar_members(members, staging_dir: str) -> None:
+    """Validate tar members before extraction into *staging_dir*.
+
+    Rejects, in order:
+
+    1. links — symlink/hardlink members can have an innocuous ``name`` while
+       ``linkname`` points outside the staging directory (extraction escape);
+    2. absolute names and ``..`` components;
+    3. any member whose resolved path would land outside *staging_dir*.
+
+    Raises :class:`ValueError` on the first offending member.
+    """
+    staging_root = os.path.normpath(staging_dir)
+    for member in members:
+        if member.issym() or member.islnk():
+            raise ValueError(f"Tar member '{member.name}' is a link — rejected")
+        if member.name.startswith("/") or ".." in member.name.split("/"):
+            raise ValueError(f"Tar member '{member.name}' contains unsafe path")
+        member_path = os.path.normpath(os.path.join(staging_root, member.name))
+        if not member_path.startswith(staging_root + os.sep):
+            raise ValueError(
+                f"Tar member '{member.name}' would extract outside target directory"
+            )
+
 
 # ── Read config.json for local models to sync ────────────────────────────
 
@@ -82,7 +147,7 @@ def _link_and_update_manifest(filename: str, model_dir: str) -> None:
     """
     import json as _json
 
-    dst = Path("/cache") / filename
+    dst = _model_dest(filename)
 
     # Create symlink in ComfyUI model directory
     target_dir = resolve_model_dir(model_dir)
@@ -114,7 +179,7 @@ def _link_and_update_manifest(filename: str, model_dir: str) -> None:
 )
 def check_model_exists(filename: str, size: int) -> dict:
     """Check whether a model file already exists on the volume with the same size."""
-    dst = Path("/cache") / filename
+    dst = _model_dest(filename)
     exists = dst.exists() and dst.stat().st_size == size
     return {"exists": exists}
 
@@ -138,9 +203,7 @@ def upload_model_chunk(
     first chunk). On the last chunk, the symlink + manifest are updated and
     the volume is committed.
     """
-    import os
-
-    dest = Path("/cache") / filename
+    dest = _model_dest(filename)
 
     mode = "ab" if offset > 0 else "wb"
     with open(dest, mode) as f:
@@ -162,6 +225,7 @@ def upload_model_chunk(
 )
 def link_model(filename: str, model_dir: str) -> dict:
     """Re-create symlink + manifest entry for a model already on the volume."""
+    _model_dest(filename)  # validate the name before touching the volume
     _link_and_update_manifest(filename, model_dir)
     vol.commit()
     return {"ok": True, "filename": filename, "linked": True}
@@ -183,7 +247,6 @@ def sync_custom_nodes_to_volume(archive_data: bytes) -> dict:
     protection, then an atomic swap replaces the volume content.
     """
     import io
-    import os
     import shutil as _shutil
     import tarfile
 
@@ -198,14 +261,8 @@ def sync_custom_nodes_to_volume(archive_data: bytes) -> dict:
     # Extract to staging with path traversal protection
     buf = io.BytesIO(archive_data)
     with tarfile.open(fileobj=buf, mode="r:gz") as tar:
-        for member in tar.getmembers():
-            # Reject absolute paths and parent references
-            if member.name.startswith("/") or ".." in member.name.split("/"):
-                raise ValueError(f"Tar member '{member.name}' contains unsafe path")
-            # Verify resolved path stays within staging directory
-            member_path = os.path.normpath(os.path.join(staging_dir, member.name))
-            if not member_path.startswith(os.path.normpath(staging_dir) + os.sep):
-                raise ValueError(f"Tar member '{member.name}' would extract outside target directory")
+        # Reject links, absolute paths, parent references and escapes
+        _validate_tar_members(tar.getmembers(), staging_dir)
         # Reset buffer and extract after validation
         buf.seek(0)
         with tarfile.open(fileobj=buf, mode="r:gz") as tar2:
@@ -259,12 +316,68 @@ def sync_hf_models() -> None:
 
 
 @app.local_entrypoint()
-def main(sync_custom_nodes: bool = False) -> None:
+def main(sync_custom_nodes: bool = False, sync_user_only: bool = False) -> None:
     """Local entrypoint — uploads local models, then syncs HuggingFace models.
 
     With ``--custom-nodes``, only the custom nodes archive is synced to the
     dedicated ``comfy-custom-nodes`` volume (other steps are skipped).
+    With ``--sync-user-only``, only step 3 (user settings) runs.
     """
+
+    def _sync_user_settings() -> None:
+        """Step 3 — upload the local ``user/`` directory to its Volume."""
+        print(f"\n{'='*60}")
+        print(f"👤 Syncing user settings to volume")
+        print(f"{'='*60}\n")
+
+        user_vol = modal.Volume.from_name("comfy-user-settings", create_if_missing=True)
+
+        user_dir = Path(__file__).resolve().parent.parent.parent / "user"
+        if user_dir.is_dir():
+            # Build a filtered list of files to upload (skip .db files)
+            files_to_upload = []
+            for f in user_dir.rglob("*"):
+                if not f.is_file():
+                    continue
+                # Skip database and cache files that might be locked/modified during upload
+                if f.suffix.lower() in (".db", ".sqlite", ".sqlite-wal", ".sqlite-shm", ".log", ".tmp", ".temp"):
+                    continue
+                # Skip cache directories
+                if "cache" in f.parts or "__manager" in f.parts:
+                    continue
+                files_to_upload.append(f)
+
+            print(f"📁 Uploading {len(files_to_upload)} user setting file(s) from {user_dir}...")
+
+            uploaded = 0
+            skipped = 0
+            # Un SEUL batch_upload pour tous les fichiers : chaque
+            # ``with user_vol.batch_upload()`` ouvre une session réseau, la
+            # rouvrir par fichier rendait l'upload très lent.
+            try:
+                with user_vol.batch_upload() as batch:
+                    for f in files_to_upload:
+                        rel_path = f.relative_to(user_dir)
+                        try:
+                            batch.put_file(str(f), f"/{rel_path}")
+                            uploaded += 1
+                        except FileExistsError:
+                            skipped += 1
+            except FileExistsError:
+                # Batch refusé d'emblée (ex. conflit signalé hors put_file)
+                skipped += 1
+
+            print(f"✅ User settings synced to volume ({uploaded} uploaded, {skipped} already present)")
+        else:
+            print(f"❌ Local user/ directory not found at {user_dir}")
+
+    # ── User settings only mode ────────────────────────────────────────
+    if sync_user_only:
+        _sync_user_settings()
+        print(f"\n{'='*60}")
+        print("✅ Sync terminée !")
+        print(f"{'='*60}")
+        return
 
     # ── Custom nodes only mode ─────────────────────────────────────────
     if sync_custom_nodes:
@@ -391,43 +504,7 @@ def main(sync_custom_nodes: bool = False) -> None:
         sync_hf_models.remote()
 
     # ── Step 3: Sync user settings to volume ───────────────────────────────
-    print(f"\n{'='*60}")
-    print(f"👤 Step 3: Syncing user settings to volume")
-    print(f"{'='*60}\n")
-
-    user_vol = modal.Volume.from_name("comfy-user-settings", create_if_missing=True)
-
-    user_dir = Path(__file__).resolve().parent.parent.parent / "user"
-    if user_dir.is_dir():
-        # Build a filtered list of files to upload (skip .db files)
-        files_to_upload = []
-        for f in user_dir.rglob("*"):
-            if not f.is_file():
-                continue
-            # Skip database and cache files that might be locked/modified during upload
-            if f.suffix.lower() in (".db", ".sqlite", ".sqlite-wal", ".sqlite-shm", ".log", ".tmp", ".temp"):
-                continue
-            # Skip cache directories
-            if "cache" in f.parts or "__manager" in f.parts:
-                continue
-            files_to_upload.append(f)
-
-        print(f"📁 Uploading {len(files_to_upload)} user setting file(s) from {user_dir}...")
-
-        uploaded = 0
-        skipped = 0
-        for f in files_to_upload:
-            rel_path = f.relative_to(user_dir)
-            try:
-                with user_vol.batch_upload() as batch:
-                    batch.put_file(str(f), f"/{rel_path}")
-                uploaded += 1
-            except FileExistsError:
-                skipped += 1
-
-        print(f"✅ User settings synced to volume ({uploaded} uploaded, {skipped} already present)")
-    else:
-        print(f"❌ Local user/ directory not found at {user_dir}")
+    _sync_user_settings()
 
     print(f"\n{'='*60}")
     print("✅ Sync terminée !")

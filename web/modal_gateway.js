@@ -30,8 +30,14 @@
         /** Clé de stockage localStorage pour persister le choix du GPU. */
         STORAGE_KEY: 'modal-gateway-mode',
 
-        /** Timeout par défaut pour les requêtes vers Modal (en ms). */
-        TIMEOUT_MS: 300000, // 5 minutes — workflows longs (FLUX, vidéo, cold start)
+        /**
+         * Timeout par défaut des requêtes vers Modal (en ms).
+         * 11 min : doit rester AU-DESSUS du budget de polling serveur
+         * (600 s dans gateway_router.py) pour que le serveur puisse répondre
+         * une erreur propre (504) avant que le navigateur n'abandonne.
+         * Surchargeable : localStorage.setItem('modal-timeout-ms', '900000').
+         */
+        TIMEOUT_MS: parseInt(localStorage.getItem('modal-timeout-ms'), 10) || 660000,
 
         /** Intervalle entre les tentatives d'interception de l'API (en ms). */
         RETRY_INTERVAL: 800,
@@ -46,6 +52,9 @@
     fetch('/api/modal/config')
         .then(function (r) { return r.json(); })
         .then(function (config) {
+            // La clé n'est plus transmise en clair par le serveur : on ne
+            // mémorise que sa présence (voir F3, __init__.py).
+            window._apiKeySet = !!config.api_key_set;
             if (config.api_url) {
                 CONFIG.API_URL = config.api_url;
                 localStorage.setItem('modal-api-url', config.api_url);
@@ -611,10 +620,15 @@
             // Step 3: process response — save locally + display
             if (result.images && result.images.length > 0) {
                 var imageCount = 0;
+                // Toutes les images affichables sont collectées pendant la
+                // boucle puis affichées en UNE seule passe : sinon l'overlay
+                // se déclenche sur la 1re image et les suivantes restent en
+                // attente jusqu'au rendu suivant.
+                var pendingDisplay = [];
                 for (var i = 0; i < result.images.length; i++) {
                     var img = result.images[i];
                     if (img.data) {
-                        // Save all files locally
+                        // Save all files locally (images ET sideloads)
                         fetch('/api/modal/save-local', {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
@@ -631,9 +645,15 @@
                         // Only display image files (skip .txt, .json sideloads)
                         if (!img.is_sideload) {
                             imageCount++;
-                            displayImageInCanvas(img.data, img.filename || 'output_' + i + '.png', imageCount === 1);
+                            pendingDisplay.push({
+                                data: img.data,
+                                filename: img.filename || ('output_' + i + '.png'),
+                            });
                         }
                     }
+                }
+                if (pendingDisplay.length > 0) {
+                    displayImagesInCanvas(pendingDisplay);
                 }
                 showNotification('✅  ' + imageCount + ' image(s) + ' + (result.images.length - imageCount) + ' fichier(s) — Render #' + item.id, 'success');
             } else {
@@ -705,7 +725,7 @@
      * @param {boolean} [isLast=false] - Si true, affiche l'overlay avec toutes les images collectées.
      */
     function displayImageInCanvas(base64Data, filename, isLast) {
-        // Store images and show overlay when the last one arrives
+        // Compatibilité : collecte image par image, affiche quand isLast.
         if (!window._modalGatewayImages) {
             window._modalGatewayImages = [];
         }
@@ -716,9 +736,18 @@
 
         if (!isLast) return;
 
-        // Show the overlay with all collected images
         var images = window._modalGatewayImages;
         window._modalGatewayImages = []; // reset for next batch
+        displayImagesInCanvas(images);
+    }
+
+    /**
+     * Affiche un lot complet d'images dans l'overlay, en une seule passe.
+     *
+     * @param {Array<{data: string, filename: string}>} images
+     */
+    function displayImagesInCanvas(images) {
+        if (!images || images.length === 0) return;
 
         // Remove any existing overlay
         var existing = document.getElementById('modal-image-overlay');
@@ -836,6 +865,13 @@
 
     // ─── Indicateur de chargement ───────────────────────────────────────────
 
+    // Handlers du drag de l'overlay de chargement.
+    // Retenus ici pour pouvoir être retirés par hideLoading() : sinon chaque
+    // showLoading() accumule deux listeners document qui retiennent des nœuds
+    // détachés (fuite mémoire sur session longue).
+    var _loadingDragMove = null;
+    var _loadingDragUp = null;
+
     /**
      * Affiche un overlay semi-transparent avec un message de chargement.
      * @param {string} msg - Message à afficher.
@@ -873,26 +909,36 @@
                 inner.style.cursor = 'grabbing';
                 e.preventDefault();
             });
-            document.addEventListener('mousemove', function(e) {
+            _loadingDragMove = function(e) {
                 if (!isDragging) return;
                 inner.style.left = Math.max(0, e.clientX - offsetX) + 'px';
                 inner.style.top = Math.max(0, e.clientY - offsetY) + 'px';
-            });
-            document.addEventListener('mouseup', function() {
+            };
+            _loadingDragUp = function() {
                 if (isDragging) {
                     isDragging = false;
                     inner.style.cursor = 'grab';
                 }
-            });
+            };
+            document.addEventListener('mousemove', _loadingDragMove);
+            document.addEventListener('mouseup', _loadingDragUp);
         })();
 
         document.body.appendChild(overlay);
     }
 
     /**
-     * Supprime l'overlay de chargement.
+     * Supprime l'overlay de chargement (et ses listeners document).
      */
     function hideLoading() {
+        if (_loadingDragMove) {
+            document.removeEventListener('mousemove', _loadingDragMove);
+            _loadingDragMove = null;
+        }
+        if (_loadingDragUp) {
+            document.removeEventListener('mouseup', _loadingDragUp);
+            _loadingDragUp = null;
+        }
         var el = document.getElementById('modal-loading-overlay');
         if (el) el.remove();
     }
@@ -1585,20 +1631,44 @@
         ].join('\n');
         document.body.appendChild(overlay);
 
-        // Gestionnaires d'événements
-        overlay.querySelector('.modal-settings-close').onclick = function () {
-            window._modalSettingsOpen = false;
-            overlay.remove();
-        };
-        // NOTE: clicking on the overlay background no longer closes the modal
-        // overlay.onclick = function (e) { if (e.target === overlay) overlay.remove(); };
-
         // ── Make modal draggable by header ──
         var panel = overlay.querySelector('.modal-settings-panel');
         var header = overlay.querySelector('.modal-settings-header');
         var isDragging = false;
         var dragOffsetX = 0;
         var dragOffsetY = 0;
+
+        // Handlers document nommés : ils sont retirés à la fermeture de la
+        // modale, sinon chaque ouverture laisse deux listeners orphelins qui
+        // retiennent panel/overlay détachés (fuite mémoire).
+        function onModalDragMove(e) {
+            if (!isDragging || !panel) return;
+            var x = e.clientX - dragOffsetX;
+            var y = e.clientY - dragOffsetY;
+            // Keep within viewport bounds
+            x = Math.max(0, Math.min(x, window.innerWidth - 100));
+            y = Math.max(0, Math.min(y, window.innerHeight - 50));
+            panel.style.left = x + 'px';
+            panel.style.top = y + 'px';
+        }
+
+        function onModalDragUp() {
+            isDragging = false;
+        }
+
+        function detachModalDragListeners() {
+            document.removeEventListener('mousemove', onModalDragMove);
+            document.removeEventListener('mouseup', onModalDragUp);
+        }
+
+        // Gestionnaires d'événements
+        overlay.querySelector('.modal-settings-close').onclick = function () {
+            detachModalDragListeners();
+            window._modalSettingsOpen = false;
+            overlay.remove();
+        };
+        // NOTE: clicking on the overlay background no longer closes the modal
+        // overlay.onclick = function (e) { if (e.target === overlay) overlay.remove(); };
 
         if (header && panel) {
             header.style.cursor = 'move';
@@ -1618,49 +1688,49 @@
                 e.preventDefault();
             });
 
-            document.addEventListener('mousemove', function (e) {
-                if (!isDragging) return;
-                var x = e.clientX - dragOffsetX;
-                var y = e.clientY - dragOffsetY;
-                // Keep within viewport bounds
-                x = Math.max(0, Math.min(x, window.innerWidth - 100));
-                y = Math.max(0, Math.min(y, window.innerHeight - 50));
-                panel.style.left = x + 'px';
-                panel.style.top = y + 'px';
-            });
-
-            document.addEventListener('mouseup', function () {
-                isDragging = false;
-            });
+            document.addEventListener('mousemove', onModalDragMove);
+            document.addEventListener('mouseup', onModalDragUp);
         }
 
         document.getElementById('cfg-save-connection').onclick = async function () {
             var apiUrl = document.getElementById('cfg-api-url').value.trim();
             var apiKey = document.getElementById('cfg-api-key').value.trim();
+            // Le serveur ne renvoie plus la clé en clair : un champ vide alors
+            // qu'une clé est déjà enregistrée signifie « conserver l'existante ».
+            var keepStoredKey = !apiKey && !!window._apiKeySet;
             var allowedHosts = (document.getElementById('cfg-allowed-hosts').value || '')
                 .split(',')
                 .map(function (h) { return h.trim(); })
                 .filter(function (h) { return h.length > 0; });
             try {
+                var payload = {
+                    api_url: apiUrl,
+                    allowed_hosts: allowedHosts,
+                };
+                // Ne PAS envoyer une clé vide : cela écraserait la clé stockée.
+                if (apiKey) payload.api_key = apiKey;
                 var saveResp = await fetch('/api/modal/config', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        api_url: apiUrl,
-                        api_key: apiKey,
-                        allowed_hosts: allowedHosts,
-                    }),
+                    body: JSON.stringify(payload),
                 });
                 if (!saveResp.ok) {
                     throw new Error('HTTP ' + saveResp.status);
                 }
                 // Mettre à jour les constantes
                 CONFIG.API_URL = apiUrl;
-                CONFIG.API_KEY = apiKey;
-                // Persister en localStorage
                 if (apiUrl) localStorage.setItem('modal-api-url', apiUrl);
-                if (apiKey) localStorage.setItem('modal-api-key', apiKey);
-                else localStorage.removeItem('modal-api-key');
+                if (apiKey) {
+                    CONFIG.API_KEY = apiKey;
+                    window._apiKeySet = true;
+                    localStorage.setItem('modal-api-key', apiKey);
+                } else if (!keepStoredKey) {
+                    // Aucune clé enregistrée et champ vide → rien à conserver.
+                    CONFIG.API_KEY = '';
+                    window._apiKeySet = false;
+                    localStorage.removeItem('modal-api-key');
+                }
+                // La clé déjà enregistrée reste utilisée (localStorage).
                 showNotification('✅ Configuration sauvegardée', 'success');
             } catch (e) {
                 showNotification('❌ Erreur lors de la sauvegarde : ' + e.message, 'error');
@@ -1676,6 +1746,8 @@
             if (key) {
                 secretHint.textContent = '🔑 Créez le Secret Modal "comfy-gateway-secret" (variable API_KEY) sur le site Modal (Dashboard → Secrets) ou en CLI : modal secret create comfy-gateway-secret API_KEY=' + key +
                     ' — puis redéployez (🚀 Deploy API). La clé du Secret et celle ici doivent être identiques.';
+            } else if (window._apiKeySet) {
+                secretHint.textContent = '🔑 Une clé est déjà enregistrée côté serveur. Laissez ce champ vide pour la conserver, ou saisissez une nouvelle clé pour la remplacer.';
             } else {
                 secretHint.textContent = '🔑 Cette clé protège votre endpoint /generate — n\'importe quelle chaîne aléatoire convient (générez-en une ou collez un mot de passe). Elle doit être identique dans le Secret Modal et ici.';
             }
@@ -1703,7 +1775,12 @@
         document.getElementById('cfg-create-secret').onclick = async function () {
             var apiKey = document.getElementById('cfg-api-key').value.trim();
             if (!apiKey) {
-                showNotification('⚠️ Saisissez d\'abord une Clé API dans le champ ci-dessus (ou générez-en une)', 'error');
+                // La clé existante n'est pas récupérable : il faut la ressaisir.
+                if (window._apiKeySet) {
+                    showNotification('⚠️ La clé enregistrée n\'est pas réaffichable : ressaisissez-la pour recréer le Secret Modal', 'error');
+                } else {
+                    showNotification('⚠️ Saisissez d\'abord une Clé API dans le champ ci-dessus (ou générez-en une)', 'error');
+                }
                 return;
             }
             var btn = document.getElementById('cfg-create-secret');
@@ -2258,7 +2335,7 @@
 
         // ── Remplissage en arrière-plan ───────────────────────────────────
         // Charger la config puis peupler les champs + badges
-        var config = { api_url: CONFIG.API_URL, api_key: CONFIG.API_KEY };
+        var config = { api_url: CONFIG.API_URL, api_key_set: !!CONFIG.API_KEY };
         try {
             var resp = await fetch('/api/modal/config');
             if (resp.ok) config = await resp.json();
@@ -2269,7 +2346,15 @@
         var apiUrlEl = document.getElementById('cfg-api-url');
         if (apiUrlEl) apiUrlEl.value = config.api_url || '';
         var apiKeyEl = document.getElementById('cfg-api-key');
-        if (apiKeyEl) apiKeyEl.value = config.api_key || '';
+        if (apiKeyEl) {
+            // api_key n'est jamais renvoyée en clair : on ne pré-remplit pas le
+            // champ et on signale uniquement qu'une clé existe déjà.
+            window._apiKeySet = !!config.api_key_set;
+            if (window._apiKeySet) {
+                apiKeyEl.placeholder = '●●●●● (clé enregistrée — laisser vide pour conserver)';
+            }
+            updateSecretHint();
+        }
 
         // Hôtes autorisés (reverse proxy)
         var allowedHostsEl = document.getElementById('cfg-allowed-hosts');

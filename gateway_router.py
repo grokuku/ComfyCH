@@ -34,6 +34,18 @@ import auth
 _IDEMPOTENCY_TTL_SECONDS = 3600  # 1 heure
 _IDEMPOTENCY_MAX_ENTRIES = 10
 
+# Budget de polling du leader (secondes). Le résultat doit rester disponible
+# pour les followers un peu plus longtemps que ce budget, le temps que le
+# leader termine de récupérer les images (/view) et les sideloads.
+_MAX_POLL_ATTEMPTS = 600  # 600 * 1s = 10 minutes
+# Marge de 30 s au-dessus du poll, mais toujours sous le timeout navigateur
+# (660 s) : le serveur peut ainsi répondre un 504 propre avant l'abandon client.
+_FOLLOWER_WAIT_TIMEOUT_SECONDS = _MAX_POLL_ATTEMPTS + 30  # 630s
+
+# Timeout côté navigateur (web/modal_gateway.js) : 660 000 ms (11 min).
+# Le serveur doit rester en dessous pour pouvoir répondre une erreur propre
+# (504) avant que le client n'abandonne la requête.
+
 # request_id -> (timestamp, result)
 _idempotency_cache: dict[str, tuple[float, dict]] = {}
 # request_id -> {"event": asyncio.Event, "result": dict | None, "error": Response | None}
@@ -72,8 +84,12 @@ def _idempotency_finish(request_id: str, entry: dict | None, result, error):
             entry["result"] = result
         elif error is not None:
             entry["error"] = error
+        # set() sur un Event déjà levé est un no-op : l'appel reste idempotent.
         entry["event"].set()
-        _idempotency_inflight.pop(request_id, None)
+        # Pop défensif : ne retirer que si l'entrée est toujours celle en vol
+        # (un follower peut avoir nettoyé puis remplacé l'entrée après timeout).
+        if _idempotency_inflight.get(request_id) is entry:
+            _idempotency_inflight.pop(request_id, None)
     return result if result is not None else error
 
 
@@ -139,7 +155,6 @@ def build_router(
             )
         # Stocke le GPU utilisé par défaut pour les appels suivants
         last_gpu["default"] = req.gpu
-        worker = worker_cls()
 
         request_id = (req.request_id or "").strip()
 
@@ -163,14 +178,49 @@ def build_router(
                     is_leader = False
 
             if not is_leader:
-                # Un appel identique est déjà en cours → attendre sa conclusion
+                # Un appel identique est déjà en cours → attendre sa conclusion.
+                # Le wait est borné : si le leader meurt sans clôturer l'entrée
+                # (déconnexion client, crash container, redéploiement), on ne
+                # bloque pas les followers à vie et on nettoie l'entrée.
                 print(f"[Gateway] Idempotence: job déjà en cours pour {request_id} — attente du résultat")
-                await entry["event"].wait()
+                try:
+                    await asyncio.wait_for(
+                        entry["event"].wait(),
+                        timeout=_FOLLOWER_WAIT_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    print(
+                        f"[Gateway] Idempotence: timeout en attente du leader pour {request_id} "
+                        f"({_FOLLOWER_WAIT_TIMEOUT_SECONDS}s) — nettoyage de l'entrée"
+                    )
+                    async with _idempotency_lock:
+                        if _idempotency_inflight.get(request_id) is entry:
+                            _idempotency_inflight.pop(request_id, None)
+                    entry["event"].set()  # libère d'éventuels autres followers
+                    return JSONResponse(
+                        {
+                            "error": (
+                                "Le job précédent n'a pas abouti "
+                                "(timeout en attente du résultat)"
+                            )
+                        },
+                        status_code=504,
+                    )
                 if entry["result"] is not None:
                     return entry["result"]
-                return entry["error"]
+                if entry["error"] is not None:
+                    return entry["error"]
+                # Cas défensif : entrée clôturée sans résultat ni erreur.
+                return JSONResponse(
+                    {"error": "Le job précédent s'est terminé sans résultat"},
+                    status_code=503,
+                )
 
         try:
+            # Instanciation dans le try : toute exception (ou annulation) est
+            # capturée par les handlers ci-dessous et clôture l'entrée.
+            worker = worker_cls()
+
             # ── 1. Envoyer le workflow et récupérer le prompt_id ──────────
             prompt_result = await worker.prompt.remote.aio(req.workflow)
             print(f"[Gateway] prompt_result = {prompt_result}")
@@ -187,8 +237,8 @@ def build_router(
                     JSONResponse({"error": "No prompt_id returned by worker"}, status_code=500),
                 )
 
-            # ── 2. Poller l'historique jusqu'à complétion (timeout: 5 min) ──
-            max_attempts = 300  # 300 * 1s = 5 minutes
+            # ── 2. Poller l'historique jusqu'à complétion (timeout: 10 min) ──
+            max_attempts = _MAX_POLL_ATTEMPTS  # 600 * 1s = 10 minutes
             outputs = None
             for attempt in range(max_attempts):
                 await asyncio.sleep(1)
@@ -282,12 +332,33 @@ def build_router(
                 None,
             )
 
+        except asyncio.CancelledError:
+            # Annulation (déconnexion client, redéploiement, arrêt du serveur) :
+            # clôturer coûte que coûte pour réveiller les followers et éviter
+            # une entrée inflight fantôme, puis propager l'annulation.
+            print(f"[Modal Gateway] Generate annulé pour {request_id or '(sans id)'}")
+            _idempotency_finish(
+                request_id, entry, None,
+                JSONResponse(
+                    {"error": "Job interrompu (déconnexion client ou redéploiement)"},
+                    status_code=503,
+                ),
+            )
+            raise
         except Exception as e:
             print(f"[Modal Gateway] Error in generate: {e}")
             return _idempotency_finish(
                 request_id, entry, None,
                 JSONResponse({"error": str(e)}, status_code=500),
             )
+        except BaseException as e:
+            # Filet de sécurité (SystemExit, KeyboardInterrupt…) : clôturer
+            # l'entrée avant de propager, sinon les followers attendraient à vie.
+            _idempotency_finish(
+                request_id, entry, None,
+                JSONResponse({"error": f"Job interrompu: {e}"}, status_code=500),
+            )
+            raise
 
     # ─── POST /upload/image ────────────────────────────────────────────────
 

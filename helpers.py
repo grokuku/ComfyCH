@@ -57,11 +57,8 @@ def hf_download(
     target_path = target_dir / local_filename
     if target_path.exists() or target_path.is_symlink():
         target_path.unlink()
-    _ = subprocess.run(
-        f"ln -s {model} {target_path}",
-        shell=True,
-        check=True,
-    )
+    # Path-based symlink (no shell): *model* may contain spaces or quotes
+    Path(target_path).symlink_to(model)
     print(f"Downloaded {repo_id}/{filename} to {target_path}")
 
 

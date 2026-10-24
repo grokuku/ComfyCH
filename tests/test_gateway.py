@@ -4,6 +4,7 @@ Couvre :
 - l'idempotence de /generate (pas de double exécution au retry)
 - la sanitisation anti path traversal de /api/modal/save-local
 - l'extraction AST des NODE_CLASS_MAPPINGS
+- la sanitisation des noms de modèles et le rejet des liens tar (sync.py)
 
 Usage ::
 
@@ -82,11 +83,54 @@ class Secret:
     @classmethod
     def from_name(cls, name):
         s = cls(); s._name = name; return s
+    @classmethod
+    def from_dict(cls, d):
+        s = cls(); s._dict = d; return s
     def hydrate(self): raise modal.exception.NotFoundError("nope")
 class exception:
     class NotFoundError(Exception): pass
+
+class _StubBatch:
+    def __enter__(self): return self
+    def __exit__(self, *exc): return False
+    def put_file(self, path, dest): return None
+
+class Volume:
+    def __init__(self, name=""):
+        self.name = name; self.committed = False
+    @classmethod
+    def from_name(cls, name, create_if_missing=False):
+        return cls(name)
+    def commit(self): self.committed = True
+    def batch_upload(self): return _StubBatch()
+
+class Image:
+    @classmethod
+    def debian_slim(cls, python_version="3.11"):
+        return cls()
+    def add_local_python_source(self, *names, copy=False): return self
+    def apt_install(self, *pkgs): return self
+    def pip_install(self, *pkgs): return self
+
+class App:
+    def __init__(self, name="", image=None):
+        self.name = name; self.image = image; self.functions = {}
+    def function(self, **kw):
+        def deco(fn):
+            self.functions[fn.__name__] = fn
+            return fn
+        return deco
+    def local_entrypoint(self, **kw):
+        def deco(fn):
+            self.functions[fn.__name__] = fn
+            return fn
+        return deco
+
 modal.Secret = Secret
 modal.exception = exception
+modal.Volume = Volume
+modal.Image = Image
+modal.App = App
 sys.modules["modal"] = modal
 
 # ─────────────────────────── Import du code réel ───────────────────────────
@@ -201,6 +245,105 @@ def _test_cache_after_success():
           FakeWorker.submit_count == 1 and r2.get("job_id") == "job-1")
 
 
+# ─────────────────────── Robustesse idempotence (M2) ───────────────────────
+
+class HangingWorker(FakeWorker):
+    """Worker dont la soumission ne rend jamais la main (leader bloqué)."""
+
+    async def _prompt(self, workflow):
+        FakeWorker.submit_count += 1
+        await asyncio.Event().wait()
+
+
+async def _test_follower_timeout():
+    """Un follower ne doit pas attendre à vie si le leader meurt."""
+    router = make_router()
+    generate = router.handlers[("POST", "/generate")]
+    rid = "req-FOLLOWER-TIMEOUT"
+    entry = {"event": asyncio.Event(), "result": None, "error": None}
+    gateway_router._idempotency_inflight[rid] = entry
+
+    old_timeout = gateway_router._FOLLOWER_WAIT_TIMEOUT_SECONDS
+    gateway_router._FOLLOWER_WAIT_TIMEOUT_SECONDS = 0.05
+    try:
+        resp = await generate(req(request_id=rid))
+    finally:
+        gateway_router._FOLLOWER_WAIT_TIMEOUT_SECONDS = old_timeout
+
+    check("follower : timeout du leader → 504",
+          isinstance(resp, JSONResponse) and resp.status_code == 504)
+    check("follower : timeout du leader → entrée inflight nettoyée",
+          rid not in gateway_router._idempotency_inflight)
+
+
+async def _test_leader_cancelled_wakes_followers():
+    """Une annulation du leader clôt l'entrée au lieu de la laisser fuiter."""
+    router = gateway_router.build_router(
+        {"L4": HangingWorker}, cors_origins=["*"], title="test"
+    )
+    generate = router.handlers[("POST", "/generate")]
+    rid = "req-LEADER-CANCEL"
+
+    task = asyncio.create_task(generate(req(request_id=rid)))
+    entry = None
+    for _ in range(200):
+        await asyncio.sleep(0.005)
+        entry = gateway_router._idempotency_inflight.get(rid)
+        if entry is not None:
+            break
+    # Laisser la tâche entrer dans le try (await du worker bloquant)
+    await asyncio.sleep(0.02)
+    check("leader : entrée inflight créée avant annulation", entry is not None)
+
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    check("leader annulé → entrée inflight nettoyée",
+          rid not in gateway_router._idempotency_inflight)
+    check("leader annulé → event levé + erreur renseignée",
+          entry is not None and entry["event"].is_set() and entry["error"] is not None)
+
+
+async def _test_idempotency_finish_idempotent():
+    """_idempotency_finish doit être appelable deux fois sans casse."""
+    rid = "req-FINISH-TWICE"
+    entry = {"event": asyncio.Event(), "result": None, "error": None}
+    gateway_router._idempotency_inflight[rid] = entry
+    r1 = gateway_router._idempotency_finish(rid, entry, {"job_id": "j"}, None)
+    r2 = gateway_router._idempotency_finish(rid, entry, {"job_id": "j"}, None)
+    check("finish deux fois → même résultat, pas d'exception",
+          r1 == r2 == {"job_id": "j"} and entry["event"].is_set())
+    check("finish → entrée inflight retirée",
+          rid not in gateway_router._idempotency_inflight)
+
+
+# ─────────────────────────── Tests masquage config (F3) ────────────────────
+
+def _test_mask_config():
+    spec = importlib.util.spec_from_file_location("comfych", str(PROJECT_ROOT / "__init__.py"))
+    comfych = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(comfych)
+
+    src = {
+        "api_url": "https://xxx.modal.run",
+        "api_key": "super-secret",
+        "allowed_hosts": ["comfy.example.com"],
+    }
+    masked = comfych._mask_config(src)
+    check("mask : api_key jamais renvoyée en clair",
+          masked["api_key"] == "" and "super-secret" not in str(masked))
+    check("mask : api_key_set=true quand une clé existe", masked["api_key_set"] is True)
+    check("mask : autres clés intactes",
+          masked["api_url"] == "https://xxx.modal.run"
+          and masked["allowed_hosts"] == ["comfy.example.com"])
+    check("mask : api_key_set=false quand aucune clé",
+          comfych._mask_config({"api_url": ""})["api_key_set"] is False)
+    check("mask : config d'origine non mutée", src["api_key"] == "super-secret")
+
+
 # ─────────────────────────── Tests path traversal ──────────────────────────
 
 def _test_sanitize_save_path():
@@ -232,6 +375,90 @@ def _test_sanitize_save_path():
         check("symlink sortant rejeté", s(out, "link", "img.png") is None)
     except OSError:
         print("ℹ️  symlinks non supportés ici — test sauté")
+
+
+# ─────────────────── Tests sanitisation sync.py (path traversal) ────────────
+
+def _load_sync_module():
+    spec = importlib.util.spec_from_file_location("comfych_sync", str(PROJECT_ROOT / "sync.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _raises(fn, *args, **kwargs):
+    """True si fn(*args) lève ValueError."""
+    try:
+        fn(*args, **kwargs)
+    except ValueError:
+        return True
+    return False
+
+
+def _test_safe_model_filename():
+    sync_mod = _load_sync_module()
+    safe = sync_mod._safe_model_filename
+
+    check("filename simple accepté", safe("model.safetensors") == "model.safetensors")
+    check("filename avec espaces accepté", safe("my model.safetensors") == "my model.safetensors")
+    bad_names = ["", ".", "..", "../x", "sub/x", "a\\b", "/etc/passwd", "..\\x"]
+    check("filenames dangereux rejetés",
+          all(_raises(safe, n) for n in bad_names))
+
+    check("_model_dest : chemin valide sous /cache",
+          sync_mod._model_dest("model.safetensors") == Path("/cache") / "model.safetensors")
+    check("_model_dest : filename dangereux rejeté",
+          all(_raises(sync_mod._model_dest, n) for n in bad_names))
+
+
+# ─────────────────── Tests rejet des liens dans l'archive ──────────────────
+
+def _tar_members(members):
+    """Construit un tar.gz et retourne ses membres (aller-retour réel)."""
+    import io
+    import tarfile
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for m in members:
+            tar.addfile(m)
+    with tarfile.open(fileobj=io.BytesIO(buf.getvalue()), mode="r:gz") as tar:
+        return tar.getmembers()
+
+
+def _test_tar_member_validation():
+    import tarfile
+
+    sync_mod = _load_sync_module()
+    validate = sync_mod._validate_tar_members
+    staging = str(Path(tempfile.mkdtemp()) / ".staging")
+
+    symlink = tarfile.TarInfo("innocent.txt")
+    symlink.type = tarfile.SYMTYPE
+    symlink.linkname = "/etc/passwd"
+    check("tar : membre symlink rejeté",
+          _raises(validate, _tar_members([symlink]), staging))
+
+    hardlink = tarfile.TarInfo("innocent.txt")
+    hardlink.type = tarfile.LNKTYPE
+    hardlink.linkname = "../../etc/passwd"
+    check("tar : membre hardlink rejeté",
+          _raises(validate, _tar_members([hardlink]), staging))
+
+    absolute = tarfile.TarInfo("/etc/passwd")
+    check("tar : chemin absolu rejeté",
+          _raises(validate, _tar_members([absolute]), staging))
+
+    parent = tarfile.TarInfo("../evil.txt")
+    check("tar : composant '..' rejeté",
+          _raises(validate, _tar_members([parent]), staging))
+
+    directory = tarfile.TarInfo("node_a")
+    directory.type = tarfile.DIRTYPE
+    regular = tarfile.TarInfo("node_a/__init__.py")
+    regular.size = 0
+    check("tar : membres normaux acceptés",
+          validate(_tar_members([directory, regular]), staging) is None)
 
 
 # ─────────────────────────── Tests extraction AST ──────────────────────────
@@ -267,7 +494,13 @@ def main():
     _test_no_request_id()
     _test_unknown_gpu()
     _test_cache_after_success()
+    asyncio.run(_test_follower_timeout())
+    asyncio.run(_test_leader_cancelled_wakes_followers())
+    asyncio.run(_test_idempotency_finish_idempotent())
+    _test_mask_config()
     _test_sanitize_save_path()
+    _test_safe_model_filename()
+    _test_tar_member_validation()
     _test_extract_class_mappings()
 
     print(f"\n{'='*50}")
