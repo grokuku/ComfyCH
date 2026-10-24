@@ -15,7 +15,9 @@ Usage ::
     python3 tests/test_gateway.py
 """
 import asyncio
+import contextlib
 import importlib.util
+import io
 import sys
 import tempfile
 import time
@@ -137,7 +139,35 @@ modal.exception = exception
 modal.Volume = Volume
 modal.Image = Image
 modal.App = App
+
+
+def _passthrough_decorator(*a, **kw):
+    """``@modal.enter(snap=True)`` / ``@modal.exit()`` / ``@modal.method()``."""
+    def deco(fn):
+        return fn
+    return deco
+
+
+modal.enter = _passthrough_decorator
+modal.exit = _passthrough_decorator
+modal.method = _passthrough_decorator
+modal.concurrent = _passthrough_decorator
 sys.modules["modal"] = modal
+
+httpx = types.ModuleType("httpx")
+
+
+class _StubAsyncClient:
+    """Client httpx factice — aucun worker n'émet de requête dans ces tests."""
+
+    async def __aenter__(self): return self
+    async def __aexit__(self, *exc): return False
+    async def post(self, *a, **kw): raise AssertionError("no HTTP call expected")
+    async def get(self, *a, **kw): raise AssertionError("no HTTP call expected")
+
+
+httpx.AsyncClient = _StubAsyncClient
+sys.modules["httpx"] = httpx
 
 # ─────────────────────────── Import du code réel ───────────────────────────
 
@@ -1040,6 +1070,207 @@ def _test_extract_class_mappings():
     check("AST : fichier invalide → set vide", comfych._extract_class_mappings(bad) == set())
 
 
+# ─────────── Tests cycle de vie du worker (ordre des custom nodes) ──────────
+
+def _load_base_worker():
+    """Importe workers/base_worker.py (modal + httpx stubbés en tête de fichier)."""
+    spec = importlib.util.spec_from_file_location(
+        "comfych_base_worker", str(PROJECT_ROOT / "workers" / "base_worker.py")
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class _FakeProc:
+    """Process ComfyUI factice — aucun lancement réel."""
+
+    def __init__(self):
+        self.terminated = False
+        self.killed = False
+
+    def terminate(self): self.terminated = True
+    def wait(self, timeout=None): return 0
+    def kill(self): self.killed = True
+
+
+def _fake_subprocess(calls, label):
+    """Module ``subprocess`` factice qui enregistre chaque Popen dans *calls*."""
+    fake = types.ModuleType("fake_subprocess")
+
+    class TimeoutExpired(Exception): pass
+
+    def Popen(*args, **kwargs):
+        calls.append(label)
+        return _FakeProc()
+
+    fake.TimeoutExpired = TimeoutExpired
+    fake.Popen = Popen
+    return fake
+
+
+def _test_start_checkpoint_order():
+    """ComfyUI ne scanne custom_nodes/ qu'au démarrage → liants d'abord."""
+    bw = _load_base_worker()
+    calls = []
+
+    class W(bw.ComfyWorker):
+        def _link_models_from_manifest(self): calls.append("link_models")
+        def _sync_custom_nodes_from_volume(self):
+            calls.append("custom_nodes")
+            return 0
+        def _restore_uploads_from_volume(self): calls.append("uploads")
+        def _sync_user_settings_from_volume(self): calls.append("user_settings")
+
+    real_subprocess, real_wait = bw.subprocess, bw.wait_for_port
+    bw.subprocess = _fake_subprocess(calls, "popen")
+    bw.wait_for_port = lambda port, timeout=60: calls.append(f"wait:{timeout}")
+    try:
+        worker = W()
+        worker.start_checkpoint()
+    finally:
+        bw.subprocess, bw.wait_for_port = real_subprocess, real_wait
+
+    helpers = ["link_models", "custom_nodes", "uploads", "user_settings"]
+    check("start_checkpoint : les 4 helpers tournent avant Popen",
+          calls[:4] == helpers and "popen" in calls)
+    check("start_checkpoint : Popen avant l'attente du port",
+          calls.index("popen") < calls.index("wait:300"))
+    check("start_checkpoint : le process est mémorisé sur self.proc",
+          isinstance(getattr(worker, "proc", None), _FakeProc))
+
+
+def _test_custom_nodes_sync():
+    """Comptage des liens + logs de diagnostic (volume absent / vide / plein)."""
+    bw = _load_base_worker()
+    tmp = Path(tempfile.mkdtemp())
+    real_vol, real_dir = bw.CUSTOM_NODES_VOLUME_PATH, bw.COMFY_CUSTOM_NODES_DIR
+    bw.COMFY_CUSTOM_NODES_DIR = tmp / "comfy_custom_nodes"
+
+    def _sync():
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            result = bw.ComfyWorker()._sync_custom_nodes_from_volume()
+        return result, buf.getvalue()
+
+    try:
+        bw.CUSTOM_NODES_VOLUME_PATH = tmp / "missing"
+        rc, out = _sync()
+        check("custom nodes : volume absent → 0", rc == 0)
+        check("custom nodes : volume absent → avertissement explicite",
+              "NON MONTÉ" in out and "modal deploy" in out)
+        check("custom nodes : volume absent → rien créé",
+              not bw.COMFY_CUSTOM_NODES_DIR.exists())
+
+        empty = tmp / "empty"
+        empty.mkdir()
+        bw.CUSTOM_NODES_VOLUME_PATH = empty
+        rc, out = _sync()
+        check("custom nodes : volume vide → 0", rc == 0)
+        check("custom nodes : volume vide → log dédié", "est vide" in out)
+
+        vol = tmp / "nodes"
+        _make_node(vol, "node_a")
+        _make_node(vol, "node_b")
+        bw.CUSTOM_NODES_VOLUME_PATH = vol
+        rc, out = _sync()
+        check("custom nodes : 2 nouveaux liens comptés", rc == 2)
+        check("custom nodes : noms des nodes loggués",
+              "node_a" in out and "node_b" in out)
+        try:
+            check("custom nodes : symlinks créés dans ComfyUI",
+                  (bw.COMFY_CUSTOM_NODES_DIR / "node_a").is_symlink()
+                  and (bw.COMFY_CUSTOM_NODES_DIR / "node_b").is_symlink())
+        except OSError:
+            print("ℹ️  symlinks non supportés ici — test sauté")
+
+        rc, out = _sync()
+        check("custom nodes : déjà présents → 0 nouveau", rc == 0)
+        check("custom nodes : log lié(s)/déjà présent(s)",
+              "0 lié(s), 2 déjà présent(s)" in out)
+    finally:
+        bw.CUSTOM_NODES_VOLUME_PATH, bw.COMFY_CUSTOM_NODES_DIR = real_vol, real_dir
+
+
+def _test_start_restore_restart():
+    """Redémarrage de ComfyUI uniquement si de nouveaux nodes ont été liés."""
+    bw = _load_base_worker()
+
+    def _run(new_nodes, port_ok=True):
+        calls = []
+
+        class W(bw.ComfyWorker):
+            def _link_models_from_manifest(self): calls.append("link_models")
+            def _restore_uploads_from_volume(self): calls.append("uploads")
+            def _sync_user_settings_from_volume(self): calls.append("user_settings")
+            def _sync_custom_nodes_from_volume(self):
+                calls.append("custom_nodes")
+                return new_nodes
+            def _shutdown_comfy(self, timeout=10): calls.append("shutdown")
+
+        def fake_wait(port, timeout=60):
+            calls.append(f"wait:{timeout}")
+            if not port_ok and timeout == 30:
+                raise TimeoutError("snapshot KO")
+
+        real_subprocess, real_wait = bw.subprocess, bw.wait_for_port
+        bw.subprocess = _fake_subprocess(calls, "popen")
+        bw.wait_for_port = fake_wait
+        try:
+            W().start_restore()
+        finally:
+            bw.subprocess, bw.wait_for_port = real_subprocess, real_wait
+        return calls
+
+    calls = _run(new_nodes=2)
+    check("start_restore : symlinks faits avant le test du port",
+          calls.index("custom_nodes") < calls.index("wait:30"))
+    check("start_restore : nouveaux nodes → ComfyUI arrêté", "shutdown" in calls)
+    check("start_restore : nouveaux nodes → relance + attente du port",
+          "popen" in calls and calls[-1] == "wait:300")
+
+    calls = _run(new_nodes=0)
+    check("start_restore : aucun nouveau node → pas de redémarrage",
+          "shutdown" not in calls and "popen" not in calls)
+    check("start_restore : snapshot sain → pas d'attente de relance",
+          "wait:300" not in calls)
+
+    calls = _run(new_nodes=0, port_ok=False)
+    check("start_restore : ComfyUI muet → cold restart",
+          "popen" in calls and "wait:300" in calls and "shutdown" not in calls)
+
+
+def _test_shutdown_comfy():
+    """terminate → wait, kill en secours, no-op sans process."""
+    bw = _load_base_worker()
+    worker = bw.ComfyWorker()
+
+    proc = _FakeProc()
+    worker.proc = proc
+    worker._shutdown_comfy()
+    check("_shutdown_comfy : terminate + oubli du process",
+          proc.terminated and not proc.killed and worker.proc is None)
+
+    class HangingProc(_FakeProc):
+        def wait(self, timeout=None):
+            raise bw.subprocess.TimeoutExpired("comfy launch", timeout)
+
+    hanging = HangingProc()
+    worker.proc = hanging
+    worker._shutdown_comfy(timeout=0.1)
+    check("_shutdown_comfy : kill si arrêt trop long", hanging.killed)
+
+    worker.proc = None
+    worker._shutdown_comfy()
+    check("_shutdown_comfy : sans process → no-op", True)
+
+    proc = _FakeProc()
+    worker.proc = proc
+    worker.cleanup()
+    check("cleanup : passe par _shutdown_comfy",
+          proc.terminated and worker.proc is None)
+
+
 # ─────────────────────────── Main ──────────────────────────────────────────
 
 def main():
@@ -1071,6 +1302,10 @@ def main():
     _test_node_size_report()
     _test_archive_guards()
     _test_extract_class_mappings()
+    _test_start_checkpoint_order()
+    _test_custom_nodes_sync()
+    _test_start_restore_restart()
+    _test_shutdown_comfy()
 
     print(f"\n{'='*50}")
     print(f"Résultat : {PASS}/{TOTAL} tests OK")

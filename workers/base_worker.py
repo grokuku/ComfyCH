@@ -40,6 +40,15 @@ import httpx
 
 import modal
 
+# ── Emplacements (constantes patchables en test) ─────────────────────────
+
+CUSTOM_NODES_VOLUME_PATH = Path("/custom_nodes")
+"""Volume Modal qui porte le code des custom nodes (monté dans les 3 apps)."""
+
+COMFY_CUSTOM_NODES_DIR = Path("/root/comfy/ComfyUI/custom_nodes")
+"""Dossier scanné par ComfyUI — une seule fois, à son démarrage."""
+
+
 # ── Helpers ──────────────────────────────────────────────────────────────
 
 
@@ -83,28 +92,30 @@ class ComfyWorker:
 
     @modal.enter(snap=True)
     def start_checkpoint(self) -> None:
-        """Launch ComfyUI headless and wait for it to be ready.
+        """Prepare the filesystem from the volumes, then launch ComfyUI.
+
+        Contrainte forte : ComfyUI ne scanne ``custom_nodes/`` qu'UNE SEULE
+        FOIS, au moment de son démarrage. Tout symlink créé après le lancement
+        est ignoré — le node reste introuvable (``missing_node_type``) alors
+        même qu'il est bien présent sur le volume. D'où l'ordre imposé :
+        liens/copies d'abord, ``subprocess.Popen`` ensuite.
 
         This method runs *before* the GPU snapshot is taken, so the snapshot
         captures ComfyUI in a fully-loaded state ready to serve requests.
         """
+        # ── Préparer le système de fichiers AVANT de lancer ComfyUI ──
+        # ComfyUI ne scanne custom_nodes/ qu'une seule fois à son démarrage :
+        # tout symlink créé après le lancement est ignoré (missing_node_type).
+        self._link_models_from_manifest()
+        self._sync_custom_nodes_from_volume()
+        self._restore_uploads_from_volume()
+        self._sync_user_settings_from_volume()
+
         self.proc = subprocess.Popen(
             "comfy launch --background -- --listen 0.0.0.0 --port 8000",
             shell=True,
         )
         wait_for_port(8000, timeout=300)
-
-        # ── Create model symlinks from volume manifest ────────────────
-        self._link_models_from_manifest()
-
-        # ── Symlink custom nodes from volume ──────────────────────────
-        self._sync_custom_nodes_from_volume()
-
-        # ── Restore user uploads from volume ──────────────────────────
-        self._restore_uploads_from_volume()
-
-        # ── Sync user settings from volume ────────────────────────────
-        self._sync_user_settings_from_volume()
 
     def _restore_uploads_from_volume(self):
         """Copy user-uploaded images from the volume to the ComfyUI input dir.
@@ -193,7 +204,7 @@ class ComfyWorker:
 
         print(f"[ComfyWorker] Created {linked} model symlinks from manifest")
 
-    def _sync_custom_nodes_from_volume(self):
+    def _sync_custom_nodes_from_volume(self) -> int:
         """Symlink each custom node from /custom_nodes volume into ComfyUI.
 
         Le code des nodes vit sur le volume (plus installé dans l'image). Au
@@ -202,29 +213,57 @@ class ComfyWorker:
         build de l'image, donc idempotent et rapide) et on exécute son
         install.py s'il existe. Les échecs sont loggés en warning sans jamais
         faire échouer le démarrage du worker.
+
+        Returns
+        -------
+        int
+            Nombre de symlinks **créés** par cet appel (les nodes déjà présents
+            ne sont pas comptés : ComfyUI les a déjà chargés au démarrage
+            courant). Un retour > 0 signifie donc que ComfyUI doit être
+            (re)démarré pour voir ces nouveaux nodes.
         """
-        vol_path = Path("/custom_nodes")
-        comfy_path = Path("/root/comfy/ComfyUI/custom_nodes")
+        vol_path = CUSTOM_NODES_VOLUME_PATH
+        comfy_path = COMFY_CUSTOM_NODES_DIR
 
         if not vol_path.is_dir():
-            print("[ComfyWorker] No custom_nodes volume mounted — skipping")
-            return
+            print(
+                "[ComfyWorker] ⚠️ volume /custom_nodes NON MONTÉ — aucun custom node "
+                "ne sera chargé. Redéployez (modal deploy apps/all_in_one.py)."
+            )
+            return 0
+
+        names = sorted(
+            p.name for p in vol_path.iterdir()
+            if p.is_dir() and not p.name.startswith(".")
+        )
+        if not names:
+            print("[ComfyWorker] /custom_nodes est vide — aucun node à lier")
+            return 0
+
+        print(f"[ComfyWorker] Nodes trouvés sur le volume : {names}")
 
         comfy_path.mkdir(parents=True, exist_ok=True)
         linked = 0
-        for item in vol_path.iterdir():
-            if item.name.startswith(".") or not item.is_dir():
-                continue
-            dst = comfy_path / item.name
-            if not (dst.exists() or dst.is_symlink()):
-                dst.symlink_to(item)
-                linked += 1
+        existing = 0
+        for name in names:
+            item = vol_path / name
+            dst = comfy_path / name
+            if dst.exists() or dst.is_symlink():
+                existing += 1
+            else:
+                try:
+                    dst.symlink_to(item)
+                    linked += 1
+                except OSError as e:
+                    print(f"[ComfyWorker] ⚠️ Impossible de lier {name} : {e}")
+                    continue
 
             # Install node deps + run install.py (best-effort)
             self._install_node_requirements(item)
             self._run_node_install_script(item)
 
-        print(f"[ComfyWorker] Linked {linked} custom node(s) from volume")
+        print(f"[ComfyWorker] Custom nodes : {linked} lié(s), {existing} déjà présent(s)")
+        return linked
 
     def _install_node_requirements(self, node_dir: Path) -> None:
         """Install a custom node's pip dependencies from its requirements.txt.
@@ -265,39 +304,70 @@ class ComfyWorker:
 
     @modal.enter(snap=False)
     def start_restore(self) -> None:
-        """Wait for ComfyUI to be ready after restoring from a snapshot.
+        """Restore the filesystem from the volumes, then ensure ComfyUI is up.
 
-        If ComfyUI is not responding (e.g. it crashed before the snapshot
-        was taken), restart it automatically instead of failing.
+        Le snapshot contient ComfyUI déjà lancé. Les liens sont donc créés ici
+        AVANT le test du port : si de nouveaux custom nodes ont été
+        synchronisés depuis la prise du snapshot, le delta est connu avant de
+        décider du redémarrage (ComfyUI ne rescanne ``custom_nodes/`` qu'à son
+        démarrage).
+
+        Si ComfyUI ne répond pas (crash avant le snapshot), il est relancé.
         """
+        self._link_models_from_manifest()
+        self._restore_uploads_from_volume()
+        self._sync_user_settings_from_volume()
+        new_nodes = self._sync_custom_nodes_from_volume()
+
+        comfy_already_running = False
         try:
             wait_for_port(8000, timeout=30)
+            comfy_already_running = True
             print("[ComfyWorker] ComfyUI is running from snapshot")
         except (TimeoutError, OSError):
             print("[ComfyWorker] ComfyUI not responding after snapshot — cold restarting...")
+
+        # ComfyUI n'a scanné custom_nodes/ qu'au moment du snapshot :
+        # si de nouveaux nodes ont été synchronisés depuis, il faut le relancer.
+        if comfy_already_running and new_nodes > 0:
+            print(
+                f"[ComfyWorker] {new_nodes} nouveau(x) node(s) détecté(s) — "
+                "redémarrage de ComfyUI pour les charger"
+            )
+            self._shutdown_comfy()
+            comfy_already_running = False
+
+        if not comfy_already_running:
             self.proc = subprocess.Popen(
                 "comfy launch --background -- --listen 0.0.0.0 --port 8000",
                 shell=True,
             )
             wait_for_port(8000, timeout=300)
-            print("[ComfyWorker] ComfyUI cold-started successfully")
+            print("[ComfyWorker] ComfyUI (re)démarré — custom nodes chargés")
 
-        self._link_models_from_manifest()
-        self._sync_custom_nodes_from_volume()
-        self._restore_uploads_from_volume()
-        self._sync_user_settings_from_volume()
         print("[ComfyWorker] App restored from snapshot!")
+
+    def _shutdown_comfy(self, timeout: float = 10) -> None:
+        """Arrête proprement le process ComfyUI (terminate, puis kill en secours)."""
+        proc = getattr(self, "proc", None)
+        if proc is None:
+            return
+        self.proc = None
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                print("[ComfyWorker] ComfyUI ne s'est pas arrêté proprement — kill")
+            print("[ComfyWorker] ComfyUI process terminated")
+        except (ProcessLookupError, OSError) as e:
+            print(f"[ComfyWorker] ComfyUI shutdown: {e}")
 
     @modal.exit()
     def cleanup(self) -> None:
         """Terminate the ComfyUI process on container shutdown."""
-        proc = getattr(self, "proc", None)
-        if proc is not None:
-            try:
-                proc.terminate()
-                print("[ComfyWorker] ComfyUI process terminated")
-            except (ProcessLookupError, OSError):
-                pass
+        self._shutdown_comfy()
 
     # ── Proxy methods (called by the router via .remote()) ───────────────
 
