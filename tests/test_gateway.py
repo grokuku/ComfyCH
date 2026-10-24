@@ -5,6 +5,8 @@ Couvre :
 - la sanitisation anti path traversal de /api/modal/save-local
 - l'extraction AST des NODE_CLASS_MAPPINGS
 - la sanitisation des noms de modèles et le rejet des liens tar (sync.py)
+- le slot d'opération Modal (timeout, état exposé, libération sur slot fuité)
+- le manifeste des custom nodes sur le volume (source de vérité des badges)
 
 Usage ::
 
@@ -102,6 +104,7 @@ class Volume:
     def from_name(cls, name, create_if_missing=False):
         return cls(name)
     def commit(self): self.committed = True
+    def reload(self): self.reloaded = True
     def batch_upload(self): return _StubBatch()
 
 class Image:
@@ -322,6 +325,223 @@ async def _test_idempotency_finish_idempotent():
 
 # ─────────────────────────── Tests masquage config (F3) ────────────────────
 
+# ─────────────────── Tests slot d'opération Modal (BUG 1) ──────────────
+
+def _test_op_slot_state():
+    """Le slot expose l'opération en cours et sa durée, et se libère."""
+    import time as _time
+
+    comfych = _load_comfych_module()
+    comfych.web = _FakeWeb
+
+    check("slot : libre au départ", comfych._op_in_progress is False)
+    check("slot : acquisition → True", comfych._try_acquire_op("sync") is True)
+    check("slot : opération en cours mémorisée",
+          comfych._op_in_progress is True
+          and comfych._op_current_name == "sync"
+          and comfych._op_started_at > 0)
+    check("slot : seconde acquisition refusée", comfych._try_acquire_op("deploy") is False)
+    check("slot : refus ne change pas l'opération courante",
+          comfych._op_current_name == "sync")
+
+    busy = comfych._op_busy_response()
+    payload = busy.payload
+    check("409 : contenu explicite (opération + elapsed_seconds)",
+          busy.status == 409
+          and payload["ok"] is False
+          and payload["operation"] == "sync"
+          and isinstance(payload["elapsed_seconds"], int)
+          and "sync" in payload["error"]
+          and "depuis" in payload["error"])
+
+    comfych._release_op()
+    check("slot : libération → état remis à zéro",
+          comfych._op_in_progress is False
+          and comfych._op_current_name == ""
+          and comfych._op_started_at == 0.0)
+    check("slot : libération idempotente",
+          comfych._release_op() is None and comfych._op_in_progress is False)
+    check("slot : elapsed_seconds = 0 sans opération",
+          comfych._op_elapsed_seconds() == 0
+          and comfych._op_busy_response().payload["elapsed_seconds"] == 0)
+
+    # Slot occupé mais récent → refus
+    comfych._try_acquire_op("sync_user")
+    comfych._op_started_at = _time.time() - 10
+    check("slot : occupé < stale → toujours refusé",
+          comfych._try_acquire_op("sync") is False)
+
+    # Slot fuité (plus vieux que _OP_STALE_SECONDS) → reprise automatique
+    comfych._op_started_at = _time.time() - (comfych._OP_STALE_SECONDS + 5)
+    check("slot fuité → libération automatique + réacquisition",
+          comfych._try_acquire_op("deploy") is True
+          and comfych._op_current_name == "deploy")
+    comfych._release_op()
+    check("slot : stale > timeout (invariant)",
+          comfych._OP_STALE_SECONDS > comfych._OP_TIMEOUT_SECONDS)
+
+
+async def _test_op_reset_keeps_new_slot():
+    """Après un reset, la fin de l'ancienne tâche ne libère pas le nouveau slot."""
+    comfych = _load_comfych_module()
+    comfych._try_acquire_op("sync")
+    old_task = asyncio.create_task(asyncio.sleep(0))
+    comfych._task_op_tokens[old_task] = comfych._op_token
+
+    comfych._release_op()                 # POST /api/modal/op/reset
+    comfych._try_acquire_op("deploy")     # nouvelle opération acceptée
+    comfych._on_op_task_done(old_task)    # l'ancienne tâche se termine enfin
+
+    check("reset : la fin de l'ancienne op ne libère pas le nouveau slot",
+          comfych._op_in_progress is True and comfych._op_current_name == "deploy")
+    check("reset : jeton de la tâche oublié par le callback",
+          old_task not in comfych._task_op_tokens)
+    await old_task
+    comfych._release_op()
+
+
+async def _test_op_timeout_kills_process():
+    """Un subprocess bloqué est tué au timeout, status=1 → l'UI se débloque."""
+    comfych = _load_comfych_module()
+    tmp = Path(tempfile.mkdtemp())
+    log_path = tmp / "op.log"
+    status_path = tmp / "op.status"
+    comfych._log_path = lambda: log_path
+    comfych._status_path = lambda: status_path
+    comfych.CONFIG_PATH = tmp / "config.json"
+    comfych._OP_TIMEOUT_SECONDS = 0.2
+
+    await comfych._run_async_inner(
+        "unit-test", [sys.executable, "-c", "import time; time.sleep(10)"]
+    )
+    logs = log_path.read_text() if log_path.exists() else ""
+    check("timeout : subprocess tué et status=1 écrit",
+          status_path.exists() and status_path.read_text() == "1")
+    check("timeout : message de timeout dans les logs", "timeout" in logs)
+
+
+async def _test_op_stream_success():
+    """Le streaming des logs fonctionne et le code de retour est écrit."""
+    comfych = _load_comfych_module()
+    tmp = Path(tempfile.mkdtemp())
+    log_path = tmp / "op.log"
+    status_path = tmp / "op.status"
+    comfych._log_path = lambda: log_path
+    comfych._status_path = lambda: status_path
+    comfych.CONFIG_PATH = tmp / "config.json"
+
+    await comfych._run_async_inner(
+        "unit-test", [sys.executable, "-c", "print('hello-modal')"]
+    )
+    check("stream : ligne du subprocess écrite dans les logs",
+          "hello-modal" in (log_path.read_text() if log_path.exists() else ""))
+    check("stream : status = code de retour (0)",
+          status_path.exists() and status_path.read_text() == "0")
+
+
+# ───────────── Tests manifeste custom nodes sur le volume (BUG 2) ───────
+
+def _nodes_archive(names):
+    """Construit un tar.gz contenant ``<node>/__init__.py`` pour chaque node."""
+    import io
+    import tarfile
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for name in names:
+            info = tarfile.TarInfo(name + "/__init__.py")
+            info.size = 0
+            tar.addfile(info, io.BytesIO(b""))
+    return buf.getvalue()
+
+
+def _test_custom_nodes_manifest():
+    import json as json_mod
+
+    sync_mod = _load_sync_module()
+    root = Path(tempfile.mkdtemp())
+    # Contenu périmé qui doit être remplacé par le swap
+    (root / "old_node").mkdir()
+    (root / "stale_file.txt").write_text("x")
+    sync_mod._CUSTOM_NODES_ROOT = str(root)
+
+    result = sync_mod.sync_custom_nodes_to_volume(_nodes_archive(["node_b", "node_a"]))
+    check("manifeste : sync retourne les nodes triés",
+          result.get("status") == "ok" and result.get("nodes") == ["node_a", "node_b"])
+    check("manifeste : ancien contenu du volume remplacé",
+          not (root / "old_node").exists())
+
+    manifest = root / sync_mod.NODES_MANIFEST_NAME
+    check("manifeste : fichier écrit sur le volume", manifest.is_file())
+    data = json_mod.loads(manifest.read_text()) if manifest.is_file() else {}
+    check("manifeste : contenu {nodes, synced_at}",
+          data.get("nodes") == ["node_a", "node_b"]
+          and isinstance(data.get("synced_at"), str) and bool(data["synced_at"]))
+
+    read_back = sync_mod.get_custom_nodes_manifest()
+    check("manifeste : lecture distante = ce qui a été écrit",
+          read_back.get("nodes") == ["node_a", "node_b"]
+          and read_back.get("synced_at") == data.get("synced_at"))
+
+    empty_root = Path(tempfile.mkdtemp())
+    sync_mod._CUSTOM_NODES_ROOT = str(empty_root)
+    check("manifeste : absent → {nodes: [], synced_at: None}",
+          sync_mod.get_custom_nodes_manifest() == {"nodes": [], "synced_at": None})
+
+    (empty_root / sync_mod.NODES_MANIFEST_NAME).write_text("pas du json {{{ ")
+    check("manifeste : corrompu → fallback vide",
+          sync_mod.get_custom_nodes_manifest() == {"nodes": [], "synced_at": None})
+
+
+def _test_update_local_config():
+    import json as json_mod
+
+    sync_mod = _load_sync_module()
+    tmp = Path(tempfile.mkdtemp())
+    cfg = tmp / "config.json"
+    sync_mod._CONFIG_PATH = cfg
+
+    sync_mod._update_local_config({"synced_custom_nodes": ["a"]})
+    check("config locale : clé synced_custom_nodes écrite",
+          cfg.is_file() and json_mod.loads(cfg.read_text())["synced_custom_nodes"] == ["a"])
+
+    sync_mod._update_local_config({"last_sync_custom_nodes": "2026-01-01T00:00:00"})
+    data = json_mod.loads(cfg.read_text())
+    check("config locale : mise à jour fusionnée (pas de perte de clés)",
+          data.get("synced_custom_nodes") == ["a"]
+          and data.get("last_sync_custom_nodes") == "2026-01-01T00:00:00")
+
+    cfg.write_text("pas du json {{{ ")
+    sync_mod._update_local_config({"synced_custom_nodes": ["b"]})
+    check("config locale : JSON corrompu → réécrite sans exception",
+          json_mod.loads(cfg.read_text())["synced_custom_nodes"] == ["b"])
+
+    blocker = tmp / "afile"
+    blocker.write_text("x")
+    sync_mod._CONFIG_PATH = blocker / "config.json"  # mkdir impossible
+    try:
+        sync_mod._update_local_config({"synced_custom_nodes": ["c"]})
+        check("config locale : écriture impossible → pas d'exception", True)
+    except Exception:  # noqa: BLE001 — le sync ne doit jamais casser
+        check("config locale : écriture impossible → pas d'exception", False)
+
+
+def _load_comfych_module():
+    """Importe __init__.py (PromptServer absent → routes non enregistrées)."""
+    spec = importlib.util.spec_from_file_location("comfych", str(PROJECT_ROOT / "__init__.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class _FakeWeb:
+    """Remplace l'alias ``web`` (aiohttp) absent hors ComfyUI."""
+
+    @staticmethod
+    def json_response(payload, status=200):
+        return SimpleNamespace(payload=payload, status=status, content=payload)
+
+
 def _test_mask_config():
     spec = importlib.util.spec_from_file_location("comfych", str(PROJECT_ROOT / "__init__.py"))
     comfych = importlib.util.module_from_spec(spec)
@@ -498,6 +718,12 @@ def main():
     asyncio.run(_test_leader_cancelled_wakes_followers())
     asyncio.run(_test_idempotency_finish_idempotent())
     _test_mask_config()
+    _test_op_slot_state()
+    asyncio.run(_test_op_reset_keeps_new_slot())
+    asyncio.run(_test_op_timeout_kills_process())
+    asyncio.run(_test_op_stream_success())
+    _test_custom_nodes_manifest()
+    _test_update_local_config()
     _test_sanitize_save_path()
     _test_safe_model_filename()
     _test_tar_member_validation()

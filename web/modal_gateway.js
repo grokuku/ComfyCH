@@ -1666,6 +1666,107 @@
         'sync-custom-nodes': 'Sync custom nodes',
     };
 
+    /**
+     * Manifeste connu des custom nodes réellement présents sur le volume
+     * ``comfy-custom-nodes`` (source de vérité des badges « déjà installé »).
+     * Rempli par fetchInstalledNodes() — jamais déduit de la sélection locale.
+     * @type {{nodes: Array<string>, synced_at: (string|null), loaded: boolean}}
+     */
+    var installedNodesInfo = { nodes: [], synced_at: null, loaded: false };
+
+    /**
+     * Formate une date ISO en « JJ/MM HH:MM » (pour le hint de l'étape 2).
+     * @param {string|null} iso
+     * @returns {string} Chaîne vide si la date est absente/invalide.
+     */
+    function formatSyncDate(iso) {
+        if (!iso) return '';
+        var d = new Date(iso);
+        if (isNaN(d.getTime())) return String(iso);
+        function pad(n) { return n < 10 ? '0' + n : '' + n; }
+        return pad(d.getDate()) + '/' + pad(d.getMonth() + 1) +
+            ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+    }
+
+    /**
+     * Met à jour le badge et le hint de l'étape 2 depuis installedNodesInfo.
+     */
+    function updateInstalledBadges() {
+        var nodes = Array.isArray(installedNodesInfo.nodes) ? installedNodesInfo.nodes : [];
+        setStepBadge('step2-badge', nodes.length > 0,
+            nodes.length + ' node' + (nodes.length > 1 ? 's' : '') + ' installé' + (nodes.length > 1 ? 's' : ''),
+            'non synchronisé');
+
+        var hint = document.getElementById('step2-sync-hint');
+        if (!hint) return;
+        var when = formatSyncDate(installedNodesInfo.synced_at);
+        if (!when && nodes.length === 0) {
+            hint.style.display = 'none';
+            return;
+        }
+        hint.textContent = 'Dernier sync : ' + (when || 'inconnue') +
+            ' — ' + nodes.length + ' node(s) sur le volume comfy-custom-nodes.';
+        hint.style.display = 'block';
+    }
+
+    /**
+     * Charge le manifeste des nodes installés depuis le backend.
+     * Lecture instantanée (config.json local, pas d'appel Modal).
+     * @returns {Promise<{nodes: Array<string>, synced_at: (string|null), loaded: boolean}>}
+     */
+    async function fetchInstalledNodes() {
+        try {
+            var resp = await fetch('/api/modal/plugins/installed');
+            if (resp.ok) {
+                var data = await resp.json();
+                installedNodesInfo = {
+                    nodes: Array.isArray(data.nodes) ? data.nodes : [],
+                    synced_at: data.synced_at || null,
+                    loaded: true,
+                };
+            }
+        } catch (e) {
+            // Mode dégradé : on conserve le dernier manifeste connu.
+            console.warn('Modal Gateway: manifeste des nodes indisponible', e);
+        }
+        updateInstalledBadges();
+        return installedNodesInfo;
+    }
+
+    /**
+     * Affiche/masque le bouton de secours « 🔓 Forcer la libération ».
+     * @param {boolean} visible
+     */
+    function setForceReleaseVisible(visible) {
+        var el = document.getElementById('modal-log-force-release');
+        if (el) el.style.display = visible ? 'inline-block' : 'none';
+    }
+
+    /**
+     * Libère de force le slot d'opération Modal (POST /api/modal/op/reset).
+     * Le subprocess Modal éventuellement encore vivant n'est PAS tué.
+     */
+    async function forceReleaseOperation() {
+        var btn = document.getElementById('modal-log-force-release');
+        var logOutput = document.getElementById('modal-log-output');
+        if (btn) btn.disabled = true;
+        try {
+            var resp = await fetch('/api/modal/op/reset', { method: 'POST' });
+            var data = {};
+            try { data = await resp.json(); } catch (_) {}
+            if (!resp.ok) throw new Error(data.error || ('HTTP ' + resp.status));
+            var msg = data.message || 'Slot d\'opération libéré';
+            showNotification('🔓 ' + msg, 'success');
+            if (logOutput) logOutput.textContent += '\n🔓 ' + msg + '\n';
+            setForceReleaseVisible(false);
+            refreshStatus();
+        } catch (e) {
+            showNotification('❌ Libération impossible : ' + e.message, 'error');
+        } finally {
+            if (btn) btn.disabled = false;
+        }
+    }
+
     async function runOperation(operation) {
         var btnId = OP_BUTTON_IDS[operation] || ('cfg-run-' + operation);
         var btn = document.getElementById(btnId);
@@ -1688,6 +1789,27 @@
         try {
             // Lancer l'opération
             var opResp = await fetch('/api/modal/' + operation, { method: 'POST' });
+
+            // 409 : une autre opération occupe le slot. Message explicite
+            // (laquelle, depuis combien de temps) + bouton de secours —
+            // sinon l'utilisateur ne voit qu'un « déjà en cours » opaque.
+            if (opResp.status === 409) {
+                var busy = {};
+                try { busy = await opResp.json(); } catch (_) {}
+                var busyOp = busy.operation || 'inconnue';
+                var busySecs = (typeof busy.elapsed_seconds === 'number') ? busy.elapsed_seconds : 0;
+                var busyMsg = '⚠️ Opération « ' + busyOp + ' » en cours depuis ' +
+                    busySecs + 's — attendez ou forcez la libération.';
+                logSection.style.display = 'flex';
+                logOutput.textContent = busyMsg + '\n' +
+                    (busy.error || '') + '\n';
+                showNotification(busyMsg, 'error');
+                setForceReleaseVisible(true);
+                btn.disabled = false;
+                btn.textContent = originalLabel;
+                return;
+            }
+
             if (!opResp.ok) {
                 var errText = '';
                 try {
@@ -1698,6 +1820,9 @@
                 }
                 throw new Error('HTTP ' + opResp.status + ' ' + errText);
             }
+
+            // L'opération a bien été lancée : plus besoin du bouton de secours.
+            setForceReleaseVisible(false);
 
             // Lire les logs en SSE
             var eventSource = new EventSource('/api/modal/logs/stream');
@@ -1734,6 +1859,11 @@
                     );
                     // Rafraîchir le statut
                     setTimeout(refreshStatus, 1000);
+                    // Un sync de nodes vient de réécrire le manifeste local :
+                    // rafraîchir les badges « déjà installé » (volume réel).
+                    if (operation === 'sync-custom-nodes') {
+                        fetchInstalledNodes();
+                    }
                 } else {
                     showNotification(
                         '❌ ' + opLabel + ' échoué — voir logs',
@@ -1922,6 +2052,7 @@
             '      </div>',
             '      <div class="modal-step-body">',
             '        <div class="modal-hint">Détectez vos custom nodes locaux et synchronisez-les vers Modal. Un redeploy est nécessaire pour qu\'ils prennent effet.</div>',
+            '        <div class="modal-hint" id="step2-sync-hint" style="display:none;"></div>',
             '        <div class="modal-btnrow">',
             '          <button id="cfg-detect-plugins" class="modal-btn modal-btn--sm">🔄 Détecter</button>',
             '          <a id="cfg-toggle-plugins" class="modal-btn modal-btn--sm" style="display:none;">☑ Tout</a>',
@@ -1966,6 +2097,7 @@
             '      <span class="modal-logs-title">📋 Logs</span>',
             '      <span class="modal-logs-live">en direct</span>',
             '      <span class="modal-logs-count" id="modal-log-count">0 ligne</span>',
+            '      <button id="modal-log-force-release" class="modal-btn modal-btn--sm" style="display:none;margin:0 0 0 10px;" title="Libère le verrou d\'opération sans tuer le processus Modal en cours">🔓 Forcer la libération</button>',
             '    </div>',
             '    <pre id="modal-log-output" class="modal-logs-body"></pre>',
             '  </div>',
@@ -2009,6 +2141,10 @@
             window._modalSettingsOpen = false;
             overlay.remove();
         };
+
+        // Bouton de secours — n'apparaît qu'en cas de 409 (voir runOperation).
+        var forceReleaseBtn = document.getElementById('modal-log-force-release');
+        if (forceReleaseBtn) forceReleaseBtn.onclick = forceReleaseOperation;
         // NOTE: clicking on the overlay background no longer closes the modal
         // overlay.onclick = function (e) { if (e.target === overlay) overlay.remove(); };
 
@@ -2285,18 +2421,15 @@
                     }
                 }
 
-                // Nodes déjà déployés sur Modal (config.last_deployed_custom_nodes)
+                // Nodes réellement présents sur le volume comfy-custom-nodes
+                // (GET /api/modal/plugins/installed) — PAS la sélection en
+                // config : depuis le refactor hybride le code des nodes vit
+                // dans le volume, seule source de vérité fiable.
+                await fetchInstalledNodes();
                 var deployedSet = {};
-                if (!modalConfig) {
-                    try {
-                        var cfgResp = await fetch('/api/modal/config');
-                        if (cfgResp.ok) modalConfig = await cfgResp.json();
-                    } catch (e) {}
-                }
-                if (modalConfig && Array.isArray(modalConfig.last_deployed_custom_nodes)) {
-                    for (var d = 0; d < modalConfig.last_deployed_custom_nodes.length; d++) {
-                        deployedSet[modalConfig.last_deployed_custom_nodes[d]] = true;
-                    }
+                var installedList = Array.isArray(installedNodesInfo.nodes) ? installedNodesInfo.nodes : [];
+                for (var d = 0; d < installedList.length; d++) {
+                    deployedSet[installedList[d]] = true;
                 }
 
                 listEl.innerHTML = '';
@@ -2765,13 +2898,9 @@
             userSyncBadge.className = 'val ' + (config.last_user_sync ? 'ok' : 'muted');
         }
 
-        // Badge de l'étape 2 — custom nodes déjà déployés sur Modal
-        var deployedNodes = Array.isArray(config.last_deployed_custom_nodes)
-            ? config.last_deployed_custom_nodes
-            : [];
-        setStepBadge('step2-badge', deployedNodes.length > 0,
-            deployedNodes.length + ' node' + (deployedNodes.length > 1 ? 's' : '') + ' déployé' + (deployedNodes.length > 1 ? 's' : ''),
-            'non déployé');
+        // Badge de l'étape 2 — custom nodes réellement présents sur le volume
+        // comfy-custom-nodes (manifeste écrit par sync.py).
+        await fetchInstalledNodes();
 
         // ─── User Settings : statut du dossier user/ local ───
         var userStatusEl = document.getElementById('status-user-settings');

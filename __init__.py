@@ -15,6 +15,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -42,7 +43,14 @@ DEFAULT_CONFIG = {
     "models_to_sync": [],
     "local_output_dir": "",
     "allowed_hosts": [],
+    # Déprécié : les badges « déjà installé » se basent désormais sur
+    # ``synced_custom_nodes`` (contenu réel du volume comfy-custom-nodes).
+    # Conservé pour compatibilité des config.json existants.
     "last_deployed_custom_nodes": [],
+    # Nodes réellement présents sur le volume comfy-custom-nodes, écrits par
+    # sync.py (main → sync_custom_nodes_to_volume) après un sync réussi.
+    "synced_custom_nodes": [],
+    "last_sync_custom_nodes": None,
 }
 
 
@@ -97,6 +105,16 @@ def _status_path() -> Path:
 
 _OP_LOCK = asyncio.Lock()  # sérialise les opérations Modal (sync/deploy/sync-user)
 
+# Durée maximale d'une opération (30 min). Au-delà, le subprocess ``modal``
+# est considéré bloqué (credentials, prompt interactif, réseau) : on le tue et
+# on marque l'échec, sinon la tâche ne rendrait jamais la main.
+_OP_TIMEOUT_SECONDS = 1800
+
+# Durée au-delà de laquelle le slot est considéré comme fuité (40 min, soit
+# plus que le timeout de 30 min : une op a réellement loupé sa libération) et
+# peut être repris de force par la requête suivante.
+_OP_STALE_SECONDS = 2400
+
 # Garde d'entrée anti-concurrence (M11).
 # ``_OP_LOCK.locked()`` ne peut pas servir de test d'entrée : entre le check et
 # l'acquisition réelle (faite dans la tâche de fond), deux requêtes peuvent
@@ -104,41 +122,102 @@ _OP_LOCK = asyncio.Lock()  # sérialise les opérations Modal (sync/deploy/sync-
 # synchrone, sans ``await`` entre le test et l'affectation.
 _op_in_progress = False
 
+# Identité de l'opération en cours (exposée par /api/modal/op/status et dans
+# le message 409), pour que l'utilisateur sache QUI bloque le slot et depuis
+# combien de temps.
+_op_current_name: str = ""
+_op_started_at: float = 0.0
+
 # Références fortes aux tâches de fond : l'event loop n'en garde qu'une
 # référence faible, une tâche non retenue peut être collectée en cours de route.
 _background_tasks: set = set()
 
+# Jeton de propriété du slot : incrémenté à chaque acquisition. Une tâche de
+# fond ne libère le slot que si elle en est toujours propriétaire — sans ça, un
+# « reset » (ou une reprise de slot fuité) suivi d'une nouvelle opération
+# verrait la fin de l'ancienne tâche libérer le slot de la nouvelle.
+_op_token = 0
+_task_op_tokens: dict = {}
+
+
+def _op_elapsed_seconds() -> int:
+    """Durée écoulée (s) depuis le début de l'opération en cours (0 si aucune)."""
+    if not _op_in_progress or not _op_started_at:
+        return 0
+    return max(0, int(time.time() - _op_started_at))
+
 
 def _op_busy_response():
-    """Réponse HTTP 409 standard lorsqu'une opération Modal est déjà en cours."""
+    """Réponse HTTP 409 explicite lorsqu'une opération Modal est déjà en cours.
+
+    Indique quelle opération occupe le slot et depuis combien de temps — le
+    message générique ne permettait pas de savoir si le blocage était normal
+    (op en cours) ou un slot fuité (op morte sans libération).
+    """
+    name = _op_current_name or "inconnue"
+    elapsed = _op_elapsed_seconds()
     return web.json_response(
-        {"ok": False, "error": "Une opération Modal est déjà en cours"},
+        {
+            "ok": False,
+            "error": (
+                f"Une opération Modal est déjà en cours ({name}, depuis {elapsed}s)"
+            ),
+            "operation": name,
+            "elapsed_seconds": elapsed,
+        },
         status=409,
     )
 
 
-def _try_acquire_op() -> bool:
-    """Réserve atomiquement le slot d'opération Modal. False si déjà occupé."""
-    global _op_in_progress
+def _try_acquire_op(operation: str = "") -> bool:
+    """Réserve atomiquement le slot d'opération Modal. False si déjà occupé.
+
+    Auto-recovery : si le slot est occupé depuis plus de ``_OP_STALE_SECONDS``
+    (donc au-delà du timeout maximal d'une opération), il a fuité — on le
+    libère de force et on réacquiert, sinon l'UI resterait bloquée à vie.
+    """
+    global _op_in_progress, _op_current_name, _op_started_at, _op_token
     if _op_in_progress:
-        return False
+        elapsed = time.time() - _op_started_at if _op_started_at else float("inf")
+        if elapsed <= _OP_STALE_SECONDS:
+            return False
+        print(
+            f"[Modal Gateway] Slot d'opération considéré comme fuité "
+            f"({_op_current_name or 'inconnue'}, {int(elapsed)}s) — libération forcée"
+        )
+        _release_op()
+    _op_token += 1
     _op_in_progress = True
+    _op_current_name = operation
+    _op_started_at = time.time()
     return True
 
 
 def _release_op() -> None:
     """Libère le slot d'opération Modal (idempotent)."""
-    global _op_in_progress
+    global _op_in_progress, _op_current_name, _op_started_at
     _op_in_progress = False
+    _op_current_name = ""
+    _op_started_at = 0.0
 
 
 def _on_op_task_done(task) -> None:
     """Callback de fin de tâche : oublie la tâche et libère le slot.
 
-    Appelé dans tous les cas (succès, exception, annulation).
+    Appelé dans tous les cas (succès, exception, annulation). La libération
+    n'a lieu que si la tâche est encore propriétaire du slot (comparaison de
+    jetons) : après un reset ou une reprise de slot fuité, la tâche
+    abandonnée ne doit pas libérer le slot de l'opération suivante.
     """
     _background_tasks.discard(task)
-    _release_op()
+    token = _task_op_tokens.pop(task, None)
+    if token is None or token == _op_token:
+        _release_op()
+    else:
+        print(
+            "[Modal Gateway] Tâche d'opération abandonnée terminée "
+            "— slot déjà réattribué, pas de libération"
+        )
 
 
 def _spawn_op(operation: str, cmd: list[str]) -> bool:
@@ -147,9 +226,10 @@ def _spawn_op(operation: str, cmd: list[str]) -> bool:
     Returns:
         False si une opération est déjà en cours (rien n'est lancé), True sinon.
     """
-    if not _try_acquire_op():
+    if not _try_acquire_op(operation):
         return False
     task = asyncio.create_task(_run_async(operation, cmd))
+    _task_op_tokens[task] = _op_token
     _background_tasks.add(task)
     task.add_done_callback(_on_op_task_done)
     return True
@@ -163,6 +243,18 @@ async def _run_async(operation: str, cmd: list[str]):
     """
     async with _OP_LOCK:
         await _run_async_inner(operation, cmd)
+
+
+async def _stream_process(process, log_path: Path) -> None:
+    """Copie la sortie du subprocess dans *log_path* ligne par ligne.
+
+    Extrait de :func:`_run_async_inner` pour pouvoir être enveloppé dans
+    ``asyncio.wait_for`` (le streaming est la partie qui peut rester bloquée).
+    """
+    async for line in process.stdout:
+        decoded = line.decode(errors="replace").rstrip()
+        with open(log_path, "a") as f:
+            f.write(decoded + "\n")
 
 
 async def _run_async_inner(operation: str, cmd: list[str]):
@@ -197,11 +289,36 @@ async def _run_async_inner(operation: str, cmd: list[str]):
         status_path.write_text("1")
         return
 
-    # Lire et écrire les logs en temps réel
-    async for line in process.stdout:
-        decoded = line.decode().rstrip()
+    # Lire et écrire les logs en temps réel, avec un timeout global : sans lui,
+    # un ``modal run`` bloqué (credentials, prompt interactif, réseau) ne rend
+    # jamais la main, ``_on_op_task_done`` n'est jamais appelé et le slot
+    # d'opération reste réservé à vie (tous les boutons renverraient 409).
+    timed_out = False
+    try:
+        await asyncio.wait_for(
+            _stream_process(process, log_path), timeout=_OP_TIMEOUT_SECONDS
+        )
+    except asyncio.TimeoutError:
+        timed_out = True
+        try:
+            process.kill()
+        except Exception:  # noqa: BLE001 — le process peut déjà être mort
+            pass
         with open(log_path, "a") as f:
-            f.write(decoded + "\n")
+            f.write(
+                f"\nERROR: opération interrompue après {_OP_TIMEOUT_SECONDS}s "
+                f"(timeout)\n"
+            )
+
+    if timed_out:
+        # Reaper le process tué (évite un zombie) puis marquer l'échec : le
+        # SSE attend un status, sans quoi l'UI tournerait indéfiniment.
+        try:
+            await process.wait()
+        except Exception:  # noqa: BLE001
+            pass
+        status_path.write_text("1")
+        return
 
     await process.wait()
 
@@ -216,15 +333,10 @@ async def _run_async_inner(operation: str, cmd: list[str]):
             config["last_sync"] = now
         elif operation == "deploy":
             config["last_deploy"] = now
-            # Liste des nodes réellement déployés sur Modal (ext + local)
-            deployed = []
-            for p in config.get("custom_nodes_ext", []):
-                url = p.get("url", "") if isinstance(p, dict) else str(p)
-                name = url.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
-                if name:
-                    deployed.append(name)
-            deployed.extend(config.get("custom_nodes_local", []))
-            config["last_deployed_custom_nodes"] = deployed
+            # NOTE : la liste des nodes installés n'est plus dérivée de la
+            # sélection (custom_nodes_ext / custom_nodes_local) — elle vient du
+            # volume réel, voir ``synced_custom_nodes`` (écrit par sync.py) et
+            # GET /api/modal/plugins/installed.
         elif operation == "sync_user":
             config["last_user_sync"] = now
         save_config(config)
@@ -939,6 +1051,53 @@ if PromptServer is not None:
                 return _op_busy_response()
             return web.json_response({"ok": True, "message": "Sync custom nodes lancée"})
 
+        # ── GET /api/modal/op/status — état du slot d'opération ──
+        async def get_op_status(request):
+            return web.json_response({
+                "in_progress": _op_in_progress,
+                "operation": _op_current_name,
+                "elapsed_seconds": _op_elapsed_seconds(),
+            })
+
+        # ── POST /api/modal/op/reset — libère de force le slot d'opération ──
+        async def post_op_reset(request):
+            """Libère le verrou d'opération sans tuer le subprocess en cours.
+
+            Filet de sécurité quand une opération est restée bloquée : le
+            subprocess ``modal`` éventuellement encore vivant n'est PAS tué, il
+            continue donc en tâche de fond (ses logs restent écrits).
+            """
+            was_running = _op_in_progress
+            name = _op_current_name or "inconnue"
+            _release_op()
+            message = (
+                f"Slot d'opération libéré (opération « {name} » "
+                f"{'abandonnée' if was_running else 'aucune en cours'}) — "
+                "le processus Modal sous-jacent, s'il tourne encore, n'a pas "
+                "été tué."
+            )
+            print(f"[Modal Gateway] {message}")
+            return web.json_response({
+                "ok": True,
+                "message": message,
+                "previous_operation": name if was_running else "",
+            })
+
+        # ── GET /api/modal/plugins/installed — nodes réellement sur le volume ──
+        async def get_plugins_installed(request):
+            """Liste les custom nodes présents dans le volume comfy-custom-nodes.
+
+            Lecture instantanée : ``synced_custom_nodes`` est écrit dans
+            config.json par sync.py (local_entrypoint) après un sync réussi —
+            pas d'appel Modal ici.
+            """
+            config = load_config()
+            nodes = config.get("synced_custom_nodes", [])
+            return web.json_response({
+                "nodes": nodes if isinstance(nodes, list) else [],
+                "synced_at": config.get("last_sync_custom_nodes"),
+            })
+
         # Ensuite nos routes Modal Gateway
         routes = [
             ("GET", "/api/modal/config", get_config),
@@ -961,6 +1120,9 @@ if PromptServer is not None:
             ("GET", "/api/modal/user-settings/status", get_user_settings_status),
             ("POST", "/api/modal/sync-user", post_sync_user),
             ("POST", "/api/modal/sync-custom-nodes", post_sync_custom_nodes),
+            ("GET", "/api/modal/op/status", get_op_status),
+            ("POST", "/api/modal/op/reset", post_op_reset),
+            ("GET", "/api/modal/plugins/installed", get_plugins_installed),
         ]
         for method, path, handler in routes:
             async def _guarded(request, _handler=handler):

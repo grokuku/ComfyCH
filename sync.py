@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime
 from pathlib import Path
 
 import modal
@@ -33,6 +34,13 @@ vol = modal.Volume.from_name("comfy-models", create_if_missing=True)
 custom_nodes_vol = modal.Volume.from_name("comfy-custom-nodes", create_if_missing=True)
 
 CHUNK_SIZE = 100 * 1024 * 1024  # 100 MB
+
+# Nom du manifeste écrit dans le volume comfy-custom-nodes : liste des dossiers
+# de nodes réellement extraits (source de vérité des badges « déjà installé »).
+NODES_MANIFEST_NAME = ".nodes_manifest.json"
+
+# Point de montage du volume des custom nodes (surchargeable en test).
+_CUSTOM_NODES_ROOT = "/custom_nodes"
 
 _CACHE_ROOT = Path("/cache")
 
@@ -100,6 +108,31 @@ def _validate_tar_members(members, staging_dir: str) -> None:
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _CONFIG_PATH = _SCRIPT_DIR / "config.json"
+
+
+def _update_local_config(updates: dict) -> None:
+    """Merge *updates* into the local ``config.json`` (best-effort).
+
+    Called from the local entrypoint (``modal run``) so the ComfyUI backend can
+    serve facts about the remote volumes without a Modal round-trip.
+    A read-only/missing ``config.json`` must never break a successful sync, hence
+    the broad exception guard.
+    """
+    try:
+        current = {}
+        if _CONFIG_PATH.exists():
+            try:
+                loaded = json.loads(_CONFIG_PATH.read_text())
+                if isinstance(loaded, dict):
+                    current = loaded
+            except (json.JSONDecodeError, OSError):
+                current = {}
+        current.update(updates)
+        _CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _CONFIG_PATH.write_text(json.dumps(current, indent=2))
+    except OSError as e:  # noqa: BLE001 — le sync lui-même a réussi
+        print(f"⚠️ Impossible d'écrire {_CONFIG_PATH}: {e}")
+
 
 models_to_sync: list[dict] = []
 if _CONFIG_PATH.exists():
@@ -250,7 +283,7 @@ def sync_custom_nodes_to_volume(archive_data: bytes) -> dict:
     import shutil as _shutil
     import tarfile
 
-    base_path = "/custom_nodes"
+    base_path = _CUSTOM_NODES_ROOT
     staging_dir = os.path.join(base_path, ".staging")
 
     # Clean any leftover staging dir
@@ -284,10 +317,52 @@ def sync_custom_nodes_to_volume(archive_data: bytes) -> dict:
     # Clean up staging
     _shutil.rmtree(staging_dir)
 
+    nodes = sorted(
+        d for d in os.listdir(base_path)
+        if os.path.isdir(os.path.join(base_path, d))
+    )
+
+    # Manifest des nodes RÉELLEMENT présents sur le volume : source de vérité
+    # des badges « déjà installé » dans l'UI (le volume, pas la sélection).
+    # Écrit AVANT le commit pour être persisté avec le reste du swap.
+    manifest_path = os.path.join(base_path, NODES_MANIFEST_NAME)
+    with open(manifest_path, "w") as f:
+        json.dump({"nodes": nodes, "synced_at": datetime.now().isoformat()}, f, indent=2)
+
     custom_nodes_vol.commit()
 
-    nodes = [d for d in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, d))]
-    return {"status": "ok", "nodes": sorted(nodes)}
+    return {"status": "ok", "nodes": nodes}
+
+
+# ── Remote function: read the custom nodes manifest from the volume ─────
+
+
+@app.function(
+    cpu=1,
+    memory=512,
+    volumes={"/custom_nodes": custom_nodes_vol},
+    timeout=60,
+)
+def get_custom_nodes_manifest() -> dict:
+    """Read ``/custom_nodes/.nodes_manifest.json`` from the volume.
+
+    Returns ``{"nodes": [...], "synced_at": <iso>}``, or an empty list and
+    ``None`` when the manifest is absent (volume never synced by this code).
+    """
+    custom_nodes_vol.reload()
+    manifest_path = os.path.join(_CUSTOM_NODES_ROOT, NODES_MANIFEST_NAME)
+    if not os.path.isfile(manifest_path):
+        return {"nodes": [], "synced_at": None}
+    try:
+        with open(manifest_path) as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {"nodes": [], "synced_at": None}
+    nodes = data.get("nodes") if isinstance(data, dict) else None
+    return {
+        "nodes": nodes if isinstance(nodes, list) else [],
+        "synced_at": data.get("synced_at") if isinstance(data, dict) else None,
+    }
 
 
 # ── Remote function: download HuggingFace + external models ──────────────
@@ -319,8 +394,8 @@ def sync_hf_models() -> None:
 def main(sync_custom_nodes: bool = False, sync_user_only: bool = False) -> None:
     """Local entrypoint — uploads local models, then syncs HuggingFace models.
 
-    With ``--custom-nodes``, only the custom nodes archive is synced to the
-    dedicated ``comfy-custom-nodes`` volume (other steps are skipped).
+    With ``--sync-custom-nodes``, only the custom nodes archive is synced to
+    the dedicated ``comfy-custom-nodes`` volume (other steps are skipped).
     With ``--sync-user-only``, only step 3 (user settings) runs.
     """
 
@@ -421,6 +496,16 @@ def main(sync_custom_nodes: bool = False, sync_user_only: bool = False) -> None:
         print(f"✅ Custom nodes synced: {len(nodes)} node(s) on volume")
         for n in nodes:
             print(f"  📁 {n}")
+
+        # Le volume est la source de vérité : on en garde une copie locale dans
+        # config.json pour que le backend ComfyUI puisse répondre instantanément
+        # à GET /api/modal/plugins/installed (sans appel Modal).
+        if result.get("status") == "ok":
+            _update_local_config({
+                "synced_custom_nodes": nodes,
+                "last_sync_custom_nodes": datetime.now().isoformat(),
+            })
+            print(f"📝 Manifeste local mis à jour ({len(nodes)} node(s))")
         return
 
     # ── Step 1: Upload + link local models ───────────────────────────────
