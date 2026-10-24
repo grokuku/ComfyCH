@@ -459,24 +459,36 @@ def main(sync_custom_nodes: bool = False, sync_user_only: bool = False) -> None:
         import io
         import tarfile
 
-        print(f"\n{'='*60}")
-        print("🧩 Syncing custom nodes to volume")
-        print(f"{'='*60}\n")
+        # NOTE : tous les ``print`` de cette branche utilisent ``flush=True``.
+        # Sans flush, la sortie est bufferisée quand stdout n'est pas un TTY
+        # (cas de ``modal run`` lancé par le gateway) : l'UI resterait muette
+        # pendant tout le packaging, qui est la partie la plus longue.
+        print(f"\n{'='*60}", flush=True)
+        print("🧩 Syncing custom nodes to volume", flush=True)
+        print(f"{'='*60}\n", flush=True)
 
         custom_nodes_dir = _SCRIPT_DIR.parent  # ComfyUI/custom_nodes
         if not custom_nodes_dir.is_dir():
-            print(f"❌ Custom nodes directory not found: {custom_nodes_dir}")
+            print(f"❌ Custom nodes directory not found: {custom_nodes_dir}", flush=True)
             return
 
         EXCLUDE_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv"}
 
+        print(f"📦 Packaging des custom nodes depuis {custom_nodes_dir}…", flush=True)
+
+        # Dossiers retenus (mêmes règles de filtrage que la boucle ci-dessous).
+        node_dirs = [
+            d for d in sorted(custom_nodes_dir.iterdir())
+            if d.is_dir()
+            and not d.name.startswith(".")
+            and not d.name.startswith("__pycache__")
+        ]
+        print(f"  → {len(node_dirs)} node(s) inclus", flush=True)
+
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-            for node_dir in sorted(custom_nodes_dir.iterdir()):
-                if not node_dir.is_dir():
-                    continue
-                if node_dir.name.startswith(".") or node_dir.name.startswith("__pycache__"):
-                    continue
+            for node_dir in node_dirs:
+                print(f"  + {node_dir}", flush=True)
                 for item in node_dir.rglob("*"):
                     rel_parts = item.relative_to(node_dir).parts
                     # Skip excluded dirs anywhere in the path and hidden dirs
@@ -489,13 +501,14 @@ def main(sync_custom_nodes: bool = False, sync_user_only: bool = False) -> None:
                     tar.add(str(item), arcname=str(Path(node_dir.name) / item.relative_to(node_dir)))
 
         size_mb = buf.tell() / (1024 * 1024)
-        print(f"📦 Archive created: {size_mb:.1f} MB")
+        print(f"✅ Archive créée : {size_mb:.1f} MB", flush=True)
 
+        print("☁️  Envoi vers Modal (extraction + swap atomique)…", flush=True)
         result = sync_custom_nodes_to_volume.remote(buf.getvalue())
         nodes = result.get("nodes", [])
-        print(f"✅ Custom nodes synced: {len(nodes)} node(s) on volume")
+        print(f"✅ Sync terminé : {len(nodes)} node(s) sur le volume", flush=True)
         for n in nodes:
-            print(f"  📁 {n}")
+            print(f"  📁 {n}", flush=True)
 
         # Le volume est la source de vérité : on en garde une copie locale dans
         # config.json pour que le backend ComfyUI puisse répondre instantanément
@@ -505,7 +518,7 @@ def main(sync_custom_nodes: bool = False, sync_user_only: bool = False) -> None:
                 "synced_custom_nodes": nodes,
                 "last_sync_custom_nodes": datetime.now().isoformat(),
             })
-            print(f"📝 Manifeste local mis à jour ({len(nodes)} node(s))")
+            print(f"📝 Manifeste local mis à jour ({len(nodes)} node(s))", flush=True)
         return
 
     # ── Step 1: Upload + link local models ───────────────────────────────

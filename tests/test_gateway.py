@@ -6,6 +6,7 @@ Couvre :
 - l'extraction AST des NODE_CLASS_MAPPINGS
 - la sanitisation des noms de modèles et le rejet des liens tar (sync.py)
 - le slot d'opération Modal (timeout, état exposé, libération sur slot fuité)
+- l'encadrement des logs + heartbeat (le flux SSE ne reste jamais muet)
 - le manifeste des custom nodes sur le volume (source de vérité des badges)
 
 Usage ::
@@ -16,6 +17,7 @@ import asyncio
 import importlib.util
 import sys
 import tempfile
+import time
 import types
 from pathlib import Path
 from types import SimpleNamespace
@@ -439,6 +441,55 @@ async def _test_op_stream_success():
           status_path.exists() and status_path.read_text() == "0")
 
 
+async def _test_op_log_framing():
+    """Le log est encadré (amorce + ligne de fin) : le SSE n'est jamais muet."""
+    comfych = _load_comfych_module()
+    tmp = Path(tempfile.mkdtemp())
+    log_path = tmp / "op.log"
+    status_path = tmp / "op.status"
+    comfych._log_path = lambda: log_path
+    comfych._status_path = lambda: status_path
+    comfych.CONFIG_PATH = tmp / "config.json"
+
+    await comfych._run_async_inner(
+        "unit-test", [sys.executable, "-c", "print('corps')"]
+    )
+    logs = log_path.read_text() if log_path.exists() else ""
+    check("log : en-tête d'opération écrit avant le lancement",
+          "Opération: unit-test" in logs)
+    check("log : commande annoncée avant l'import modal",
+          "Lancement de: " in logs and "Initialisation de modal" in logs)
+    check("log : en-tête avant la sortie du subprocess",
+          "corps" in logs and logs.index("Opération: unit-test") < logs.index("corps"))
+    check("log : ligne de fin avec le code de retour",
+          "Terminé (code 0)" in logs)
+
+
+async def _test_stream_heartbeat():
+    """Un subprocess muet produit des heartbeats (sortie bufferisée de modal)."""
+    comfych = _load_comfych_module()
+    tmp = Path(tempfile.mkdtemp())
+    log_path = tmp / "op.log"
+    comfych._HEARTBEAT_SECONDS = 0.2
+
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, "-c",
+        "import time; time.sleep(0.6); print('apres-silence')",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    await asyncio.wait_for(
+        comfych._stream_process(process, log_path, time.time()), timeout=15
+    )
+    await process.wait()
+
+    logs = log_path.read_text() if log_path.exists() else ""
+    check("heartbeat : « toujours en cours » écrit pendant le silence",
+          "toujours en cours" in logs)
+    check("heartbeat : la sortie réelle est écrite après le silence",
+          "apres-silence" in logs)
+
+
 # ───────────── Tests manifeste custom nodes sur le volume (BUG 2) ───────
 
 def _nodes_archive(names):
@@ -722,6 +773,8 @@ def main():
     asyncio.run(_test_op_reset_keeps_new_slot())
     asyncio.run(_test_op_timeout_kills_process())
     asyncio.run(_test_op_stream_success())
+    asyncio.run(_test_op_log_framing())
+    asyncio.run(_test_stream_heartbeat())
     _test_custom_nodes_manifest()
     _test_update_local_config()
     _test_sanitize_save_path()

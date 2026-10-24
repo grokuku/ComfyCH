@@ -115,6 +115,11 @@ _OP_TIMEOUT_SECONDS = 1800
 # peut être repris de force par la requête suivante.
 _OP_STALE_SECONDS = 2400
 
+# Période du heartbeat écrit dans le log pendant le streaming (secondes).
+# ``modal run`` bufferise souvent sa sortie : sans heartbeat, le SSE resterait
+# muet pendant des minutes et l'utilisateur croirait l'opération bloquée.
+_HEARTBEAT_SECONDS = 10.0
+
 # Garde d'entrée anti-concurrence (M11).
 # ``_OP_LOCK.locked()`` ne peut pas servir de test d'entrée : entre le check et
 # l'acquisition réelle (faite dans la tâche de fond), deux requêtes peuvent
@@ -245,13 +250,38 @@ async def _run_async(operation: str, cmd: list[str]):
         await _run_async_inner(operation, cmd)
 
 
-async def _stream_process(process, log_path: Path) -> None:
+async def _stream_process(
+    process, log_path: Path, started_at: float | None = None
+) -> None:
     """Copie la sortie du subprocess dans *log_path* ligne par ligne.
 
     Extrait de :func:`_run_async_inner` pour pouvoir être enveloppé dans
     ``asyncio.wait_for`` (le streaming est la partie qui peut rester bloquée).
+
+    La lecture est faite avec un timeout : si le subprocess n'écrit rien pendant
+    ``_HEARTBEAT_SECONDS`` (sortie bufferisée par ``modal run``, import Modal,
+    attente réseau…), une ligne « … toujours en cours (Ns) » est écrite dans le
+    log. Le SSE ne reste donc jamais muet et l'UI peut distinguer « ça travaille
+    sans rien dire » de « c'est bloqué ».
     """
-    async for line in process.stdout:
+    if started_at is None:
+        started_at = time.time()
+
+    while True:
+        try:
+            line = await asyncio.wait_for(
+                process.stdout.readline(), timeout=_HEARTBEAT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            elapsed = int(time.time() - started_at)
+            try:
+                with open(log_path, "a") as f:
+                    f.write(f"… toujours en cours ({elapsed}s)\n")
+            except OSError:
+                pass  # log non inscriptible : ne pas tuer l'opération
+            continue
+        if not line:  # EOF : le subprocess a fermé sa sortie
+            break
         decoded = line.decode(errors="replace").rstrip()
         with open(log_path, "a") as f:
             f.write(decoded + "\n")
@@ -268,6 +298,15 @@ async def _run_async_inner(operation: str, cmd: list[str]):
         status_path.unlink()
 
     project_dir = str(PROJECT_ROOT)
+
+    # Amorcer le log AVANT tout : import Modal, résolution de l'app et
+    # credentials peuvent prendre plusieurs secondes pendant lesquelles le SSE
+    # n'aurait rien à afficher (l'utilisateur croit que rien ne se passe).
+    started_at = time.time()
+    with open(log_path, "a") as f:
+        f.write(f"═══ Opération: {operation} ═══\n")
+        f.write(f"Lancement de: {' '.join(cmd)}\n")
+        f.write("Initialisation de modal (import, résolution de l'app)…\n")
 
     # S'assurer que le CLI modal est dans le PATH
     env = os.environ.copy()
@@ -296,7 +335,8 @@ async def _run_async_inner(operation: str, cmd: list[str]):
     timed_out = False
     try:
         await asyncio.wait_for(
-            _stream_process(process, log_path), timeout=_OP_TIMEOUT_SECONDS
+            _stream_process(process, log_path, started_at),
+            timeout=_OP_TIMEOUT_SECONDS,
         )
     except asyncio.TimeoutError:
         timed_out = True
@@ -324,6 +364,14 @@ async def _run_async_inner(operation: str, cmd: list[str]):
 
     # Écrire le code de retour
     status_path.write_text(str(process.returncode))
+
+    # Ligne de fin : le log se termine toujours par un marqueur lisible, même
+    # si la dernière ligne du subprocess était une progression partielle.
+    with open(log_path, "a") as f:
+        f.write(
+            f"═══ Terminé (code {process.returncode}) en "
+            f"{int(time.time() - started_at)}s ═══\n"
+        )
 
     # Mettre à jour last_sync ou last_deploy dans la config
     config = load_config()

@@ -1504,6 +1504,24 @@
             '}',
             '@keyframes modal-blink { 50% { opacity: 0.25; } }',
             '.modal-logs-count { margin-left: auto; font-size: 10px; color: #777; }',
+            '/* Indicateur de progression : spinner + libellé + temps écoulé. */',
+            '.modal-log-progress {',
+            '  display: inline-flex; align-items: center; gap: 6px;',
+            '  margin-left: 4px; min-width: 0; max-width: 56%;',
+            '  font-size: 10px; color: #9fc4ff;',
+            '  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;',
+            '}',
+            '.modal-log-progress::before {',
+            '  content: ""; flex-shrink: 0; width: 9px; height: 9px;',
+            '  border: 2px solid rgba(159, 196, 255, 0.25);',
+            '  border-radius: 50%; border-top-color: #9fc4ff;',
+            '  animation: modal-spin 0.8s linear infinite;',
+            '}',
+            '/* Silence > 20 s : la sortie n\'arrive plus, peut-être bloqué. */',
+            '.modal-log-progress.is-silent { color: #ffb454; }',
+            '.modal-log-progress.is-silent::before {',
+            '  border-color: rgba(255, 180, 84, 0.25); border-top-color: #ffb454;',
+            '}',
             '.modal-logs-body {',
             '  flex: 1; min-height: 0; margin: 0; overflow-y: auto;',
             '  padding: 8px 18px; color: #9f9;',
@@ -1666,6 +1684,27 @@
         'sync-custom-nodes': 'Sync custom nodes',
     };
 
+    /** Période (ms) de la vérification de l'état serveur pendant une opération. */
+    var OP_STATUS_POLL_MS = 3000;
+
+    /**
+     * Durée (s) sans aucune ligne de log au-delà de laquelle on affiche un
+     * avertissement de silence : « ça travaille sans rien dire » ou « bloqué ».
+     */
+    var OP_SILENCE_SECONDS = 20;
+
+    /**
+     * Traduit le nom d'opération renvoyé par le serveur (`sync_custom_nodes`)
+     * en libellé lisible, en réutilisant OP_LABELS.
+     * @param {string} name
+     * @returns {string} Libellé, ou chaîne vide si `name` est vide.
+     */
+    function opLabelFromServer(name) {
+        if (!name) return '';
+        var slug = String(name).replace(/_/g, '-');
+        return OP_LABELS[slug] || String(name);
+    }
+
     /**
      * Manifeste connu des custom nodes réellement présents sur le volume
      * ``comfy-custom-nodes`` (source de vérité des badges « déjà installé »).
@@ -1773,12 +1812,110 @@
         var logSection = document.getElementById('modal-log-section');
         var logOutput = document.getElementById('modal-log-output');
         var logCountEl = document.getElementById('modal-log-count');
+        var progressEl = document.getElementById('modal-log-progress');
         var logLines = 0;
         var opLabel = OP_LABELS[operation] || operation;
 
         if (!btn || !logSection || !logOutput) return;
 
         var originalLabel = btn.textContent;
+
+        // ── État de l'indicateur de progression ──────────────────────────
+        var t0 = Date.now();          // début de l'opération (horloge client)
+        var lastLineAt = Date.now();  // date de la dernière ligne de log reçue
+        var serverElapsed = 0;        // elapsed_seconds renvoyé par le serveur
+        var serverOpLabel = '';       // libellé de l'op côté serveur (fiable)
+        var progressTimer = null;     // tick 500 ms du texte de progression
+        var statusTimer = null;       // tick 3 s de GET /api/modal/op/status
+        var eventSource = null;
+        var finished = false;
+
+        /** Temps écoulé affiché : max(client, serveur) pour ne jamais reculer. */
+        function elapsedSeconds() {
+            var local = Math.floor((Date.now() - t0) / 1000);
+            return Math.max(local, serverElapsed || 0);
+        }
+
+        /** Réécrit la zone de progression (le spinner est en CSS). */
+        function renderProgress() {
+            if (finished || !progressEl) return;
+            var silentFor = Math.floor((Date.now() - lastLineAt) / 1000);
+            var text = '⏳ ' + (serverOpLabel || opLabel) + ' — ' + elapsedSeconds() + 's';
+            if (silentFor > OP_SILENCE_SECONDS) {
+                text += ' · aucune sortie depuis ' + silentFor + 's';
+            }
+            progressEl.textContent = text;
+            progressEl.classList.toggle('is-silent', silentFor > OP_SILENCE_SECONDS);
+        }
+
+        /** Démarre le compteur local + la surveillance de l'état serveur. */
+        function startProgress() {
+            if (progressEl) {
+                progressEl.style.display = 'inline-flex';
+                progressEl.textContent = '⏳ ' + opLabel + ' — 0s';
+            }
+            progressTimer = setInterval(renderProgress, 500);
+            statusTimer = setInterval(pollOpStatus, OP_STATUS_POLL_MS);
+        }
+
+        /** Arrête et masque l'indicateur (idempotent). */
+        function stopProgress() {
+            finished = true;
+            if (progressTimer) { clearInterval(progressTimer); progressTimer = null; }
+            if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
+            if (progressEl) {
+                progressEl.style.display = 'none';
+                progressEl.textContent = '';
+                progressEl.classList.remove('is-silent');
+            }
+        }
+
+        /** Ajoute une ligne au panneau de logs (autoscroll en bas). */
+        function appendLogLine(line) {
+            logOutput.textContent += line + '\n';
+            logOutput.scrollTop = logOutput.scrollHeight;
+        }
+
+        /**
+         * Filet de sécurité : toutes les 3 s, demander l'état du slot serveur.
+         * - `in_progress === false` alors qu'on attend encore → l'opération est
+         *   finie mais le SSE n'a pas signalé la fin (flux coupé, status perdu).
+         * - sinon `operation` / `elapsed_seconds` corrigent le libellé et le
+         *   temps écoulé (plus fiable qu'un compteur reparti de zéro après un
+         *   rechargement de page).
+         */
+        async function pollOpStatus() {
+            if (finished) return;
+            try {
+                var resp = await fetch('/api/modal/op/status');
+                if (!resp.ok || finished) return;
+                var st = await resp.json();
+                if (finished) return;
+                if (typeof st.elapsed_seconds === 'number') {
+                    serverElapsed = st.elapsed_seconds;
+                }
+                var srvLabel = opLabelFromServer(st.operation);
+                if (srvLabel) serverOpLabel = srvLabel;
+                if (st.in_progress === false) finishFromServerStatus();
+            } catch (_) { /* réseau instable : on retentera au tick suivant */ }
+        }
+
+        /** Conclut l'opération quand le serveur dit qu'elle n'est plus active. */
+        function finishFromServerStatus() {
+            if (finished) return;
+            stopProgress();
+            if (eventSource) {
+                try { eventSource.close(); } catch (_) {}
+                eventSource = null;
+            }
+            btn.disabled = false;
+            btn.textContent = originalLabel;
+            appendLogLine('ℹ️ Opération terminée (le flux de logs n\'a pas signalé la fin)');
+            showNotification('ℹ️ ' + opLabel + ' terminé — voir logs', 'info');
+            setTimeout(refreshStatus, 500);
+            if (operation === 'sync-custom-nodes') fetchInstalledNodes();
+        }
+
         btn.disabled = true;
         btn.textContent = '⏳ En cours...';
         // `.modal-logs` est un conteneur flex (head fixe + corps scrollable).
@@ -1824,8 +1961,11 @@
             // L'opération a bien été lancée : plus besoin du bouton de secours.
             setForceReleaseVisible(false);
 
+            // Retour visuel immédiat (avant même la première ligne de log).
+            startProgress();
+
             // Lire les logs en SSE
-            var eventSource = new EventSource('/api/modal/logs/stream');
+            eventSource = new EventSource('/api/modal/logs/stream');
 
             eventSource.onmessage = function (event) {
                 try {
@@ -1837,12 +1977,16 @@
                         if (logCountEl) {
                             logCountEl.textContent = logLines + ' ligne' + (logLines > 1 ? 's' : '');
                         }
+                        // La sortie vit : remet à zéro le compteur de silence.
+                        lastLineAt = Date.now();
+                        renderProgress();
                     }
                 } catch (e) {}
             };
 
             eventSource.addEventListener('done', function (event) {
-                eventSource.close();
+                stopProgress();
+                if (eventSource) eventSource.close();
                 var data;
                 try {
                     data = JSON.parse(event.data);
@@ -1873,7 +2017,8 @@
             });
 
             eventSource.onerror = function () {
-                eventSource.close();
+                stopProgress();
+                if (eventSource) eventSource.close();
                 btn.disabled = false;
                 btn.textContent = '❌ Erreur connexion';
                 setTimeout(function () { btn.textContent = originalLabel; }, 2500);
@@ -1881,6 +2026,7 @@
             };
 
         } catch (e) {
+            stopProgress();
             btn.disabled = false;
             btn.textContent = '❌ Erreur';
             setTimeout(function () { btn.textContent = originalLabel; }, 2500);
@@ -2096,6 +2242,7 @@
             '    <div class="modal-logs-head">',
             '      <span class="modal-logs-title">📋 Logs</span>',
             '      <span class="modal-logs-live">en direct</span>',
+            '      <span id="modal-log-progress" class="modal-log-progress" style="display:none;"></span>',
             '      <span class="modal-logs-count" id="modal-log-count">0 ligne</span>',
             '      <button id="modal-log-force-release" class="modal-btn modal-btn--sm" style="display:none;margin:0 0 0 10px;" title="Libère le verrou d\'opération sans tuer le processus Modal en cours">🔓 Forcer la libération</button>',
             '    </div>',
