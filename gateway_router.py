@@ -424,6 +424,31 @@ def build_router(
         result = await worker.history.remote.aio(job_id)
         return result
 
+    # ─── GET /logs ──────────────────────────────────────────────
+
+    @web_app.get("/logs", dependencies=[Depends(auth.require_api_key)])
+    async def worker_logs(gpu: str | None = None, lines: int = 200):
+        """Retourne les dernières lignes du log ComfyUI du worker choisi.
+
+        Permet de diagnostiquer les erreurs d'import/installation des custom
+        nodes (tracebacks, dépendances manquantes, erreurs réseau d'un node),
+        invisibles depuis le client. Le GPU est soit passé en query param
+        (``?gpu=L40S``), soit déduit du dernier appel à /generate.
+        """
+        gpu = gpu or last_gpu.get("default", "L4")
+        worker_cls = worker_map.get(gpu)
+        if not worker_cls:
+            return JSONResponse({"error": f"Unknown GPU: {gpu}"}, status_code=400)
+
+        worker = worker_cls()
+        try:
+            result = await worker.logs_tail.remote.aio(lines)
+        except Exception as e:
+            return JSONResponse(
+                {"error": f"Worker logs unavailable: {e}"}, status_code=500
+            )
+        return result
+
     # ─── GET /gpus (public — pas de coût ni de donnée sensible) ────────────
 
     @web_app.get("/gpus")

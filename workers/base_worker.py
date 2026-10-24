@@ -34,6 +34,7 @@ import socket
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import httpx
@@ -47,6 +48,13 @@ CUSTOM_NODES_VOLUME_PATH = Path("/custom_nodes")
 
 COMFY_CUSTOM_NODES_DIR = Path("/root/comfy/ComfyUI/custom_nodes")
 """Dossier scanné par ComfyUI — une seule fois, à son démarrage."""
+
+COMFY_LOG_PATH = Path("/tmp/comfyui.log")
+"""Sortie stdout/stderr de ComfyUI (tracebacks des custom nodes inclus)."""
+
+COMFY_LOG_MAX_BYTES = 2 * 1024 * 1024
+"""Fenêtre de lecture de ``logs_tail`` (2 Mio) — un node bavard ne doit pas
+faire charger des centaines de Mo en mémoire au worker."""
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -111,11 +119,38 @@ class ComfyWorker:
         self._restore_uploads_from_volume()
         self._sync_user_settings_from_volume()
 
-        self.proc = subprocess.Popen(
-            "comfy launch --background -- --listen 0.0.0.0 --port 8000",
-            shell=True,
-        )
+        self.proc = self._launch_comfy()
         wait_for_port(8000, timeout=300)
+
+    def _launch_comfy(self):
+        """Lance ComfyUI headless en redirigeant stdout/stderr vers COMFY_LOG_PATH.
+
+        Le log permet de diagnostiquer les erreurs d'import des custom nodes
+        (tracebacks, dépendances manquantes) qui n'apparaissent nulle part
+        ailleurs : sans lui on ne voit que ``missing_node_type`` côté gateway.
+
+        Le fichier est ouvert en append (les redémarrages s'ajoutent au lieu
+        de s'écraser) et ``start_new_session=True`` détache le process du
+        groupe courant pour qu'il survive à son parent.
+
+        Returns
+        -------
+        subprocess.Popen
+            Le process ComfyUI, à mémoriser sur ``self.proc``.
+        """
+        COMFY_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(COMFY_LOG_PATH, "a") as log_file:
+            log_file.write(
+                f"\n===== ComfyUI start {datetime.now().isoformat()} =====\n"
+            )
+            log_file.flush()
+            return subprocess.Popen(
+                "comfy launch --background -- --listen 0.0.0.0 --port 8000",
+                shell=True,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
 
     def _restore_uploads_from_volume(self):
         """Copy user-uploaded images from the volume to the ComfyUI input dir.
@@ -338,10 +373,7 @@ class ComfyWorker:
             comfy_already_running = False
 
         if not comfy_already_running:
-            self.proc = subprocess.Popen(
-                "comfy launch --background -- --listen 0.0.0.0 --port 8000",
-                shell=True,
-            )
+            self.proc = self._launch_comfy()
             wait_for_port(8000, timeout=300)
             print("[ComfyWorker] ComfyUI (re)démarré — custom nodes chargés")
 
@@ -573,3 +605,45 @@ class ComfyWorker:
                 "content_type": resp.headers.get("content-type", "application/octet-stream"),
                 "filename": filename,
             }
+
+    @modal.method()
+    async def logs_tail(self, lines: int = 200) -> dict:
+        """Retourne les N dernières lignes du log ComfyUI du worker.
+
+        Le log (``COMFY_LOG_PATH``) contient la sortie de ComfyUI : c'est le
+        seul endroit où apparaissent les tracebacks d'import des custom nodes,
+        les dépendances pip manquantes ou les erreurs réseau d'un node (401,
+        timeout…) qui se traduisent côté client par un ``missing_node_type``
+        ou un HTTP 500 sans détail.
+
+        Parameters
+        ----------
+        lines : int, optional
+            Nombre de lignes demandées (borné à 2000, minimum 1).
+
+        Returns
+        -------
+        dict
+            ``{"lines": [...], "path": str, "size": int}`` ou, en cas de
+            problème, ``{"lines": [], "path": str, "error": str}``.
+        """
+        try:
+            if not COMFY_LOG_PATH.is_file():
+                return {
+                    "lines": [],
+                    "path": str(COMFY_LOG_PATH),
+                    "error": "log file not found",
+                }
+            size = COMFY_LOG_PATH.stat().st_size
+            # Lecture bornée : on ne charge que la fin du fichier (une fenêtre
+            # suffit largement pour 2000 lignes) et on jette la première ligne
+            # si elle est probablement coupée par le seek.
+            with open(COMFY_LOG_PATH, "rb") as f:
+                if size > COMFY_LOG_MAX_BYTES:
+                    f.seek(size - COMFY_LOG_MAX_BYTES)
+                    f.readline()
+                content = f.read().decode("utf-8", errors="replace")
+            tail = content.splitlines()[-max(1, min(int(lines), 2000)):]
+            return {"lines": tail, "path": str(COMFY_LOG_PATH), "size": size}
+        except (OSError, TypeError, ValueError) as e:
+            return {"lines": [], "path": str(COMFY_LOG_PATH), "error": str(e)}

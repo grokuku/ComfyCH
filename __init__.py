@@ -16,9 +16,11 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 
 # La racine du projet est le dossier de ce __init__.py
 # custom_nodes/modal_gateway/ = PROJECT_ROOT
@@ -925,6 +927,71 @@ if PromptServer is not None:
                 pass
             return response
 
+        # ── GET /api/modal/worker-logs — logs ComfyUI d'un worker Modal ──
+        async def get_worker_logs(request):
+            """Récupère les dernières lignes du log ComfyUI d'un worker Modal.
+
+            Relaie ``GET {api_url}/logs`` du gateway (X-API-Key). C'est le seul
+            moyen de voir les tracebacks d'import des custom nodes : côté
+            client on n'obtient qu'un ``missing_node_type`` ou un HTTP 500.
+
+            Query params : ``gpu`` (optionnel, défaut = dernier GPU utilisé) et
+            ``lines`` (défaut 200, borné à 2000).
+            """
+            config = load_config()
+            api_url = str(config.get("api_url") or "").rstrip("/")
+            api_key = str(config.get("api_key") or "")
+            if not api_url:
+                return web.json_response(
+                    {"ok": False, "error": "api_url non configurée"}, status=400
+                )
+
+            try:
+                lines = max(
+                    1, min(int(request.rel_url.query.get("lines", "200")), 2000)
+                )
+            except (TypeError, ValueError):
+                lines = 200
+
+            params = {"lines": str(lines)}
+            gpu = (request.rel_url.query.get("gpu") or "").strip()
+            if gpu:
+                params["gpu"] = gpu
+            url = f"{api_url}/logs?{urlencode(params)}"
+
+            # urllib (stdlib) plutôt que httpx : aucune dépendance à ajouter à
+            # l'environnement ComfyUI, et l'appel bloque un thread dédié (pas
+            # l'event loop du serveur).
+            def _fetch():
+                req = urllib.request.Request(url, headers={"X-API-Key": api_key})
+                try:
+                    with urllib.request.urlopen(req, timeout=60) as resp:
+                        return resp.status, resp.read()
+                except urllib.error.HTTPError as e:
+                    return e.code, e.read()
+
+            try:
+                status_code, raw = await asyncio.to_thread(_fetch)
+            except (urllib.error.URLError, OSError, ValueError) as e:
+                return web.json_response(
+                    {"ok": False, "error": f"Appel gateway impossible : {e}"},
+                    status=502,
+                )
+
+            text = raw.decode("utf-8", errors="replace")
+            try:
+                payload = json.loads(text)
+            except json.JSONDecodeError:
+                payload = {"lines": text.splitlines()}
+
+            if status_code != 200:
+                detail = payload.get("error") if isinstance(payload, dict) else None
+                return web.json_response(
+                    {"ok": False, "error": str(detail or f"HTTP {status_code}")},
+                    status=status_code,
+                )
+            return web.json_response(payload)
+
         async def get_plugins_detect(request):
             plugins = _detect_custom_nodes()
             return web.json_response({"plugins": plugins})
@@ -1165,6 +1232,7 @@ if PromptServer is not None:
             ("POST", "/api/modal/secret", post_secret),
             ("GET", "/api/modal/logs", get_logs),
             ("GET", "/api/modal/logs/stream", get_logs_stream),
+            ("GET", "/api/modal/worker-logs", get_worker_logs),
             ("POST", "/api/modal/save-local", post_save_local),
             ("GET", "/api/modal/user-settings/status", get_user_settings_status),
             ("POST", "/api/modal/sync-user", post_sync_user),

@@ -1782,6 +1782,82 @@
     }
 
     /**
+     * Affiche les dernières lignes du log ComfyUI du worker Modal
+     * (``GET /api/modal/worker-logs`` → ``{api_url}/logs``).
+     *
+     * Indépendant du SSE des opérations ``modal run`` : si une opération est en
+     * cours, on prévient que son flux va écraser l'affichage (on ne touche pas
+     * à l'EventSource en cours).
+     * @param {number} [lines=300] - Nombre de lignes demandées.
+     */
+    async function showWorkerLogs(lines) {
+        var logSection = document.getElementById('modal-log-section');
+        var logOutput = document.getElementById('modal-log-output');
+        var logCountEl = document.getElementById('modal-log-count');
+        var progressEl = document.getElementById('modal-log-progress');
+        var buttons = [
+            document.getElementById('modal-log-worker-logs'),
+            document.getElementById('cfg-worker-logs'),
+        ].filter(Boolean);
+        if (!logSection || !logOutput) return;
+
+        var count = lines || 300;
+        logSection.style.display = 'flex';
+        buttons.forEach(function (b) { b.disabled = true; });
+
+        // Une opération Modal tourne ? Son SSE réécrit le panneau à chaque ligne.
+        var opRunning = !!(progressEl && progressEl.style.display !== 'none');
+        var warning = '';
+        if (opRunning) {
+            warning = '⚠️ Une opération Modal est en cours : son flux de logs ' +
+                'écrasera cet affichage.\n\n';
+            showNotification(
+                '⚠️ Opération en cours — l\'affichage des logs worker sera écrasé',
+                'info'
+            );
+        }
+
+        try {
+            var resp = await fetch('/api/modal/worker-logs?lines=' + count);
+            var data = {};
+            try { data = await resp.json(); } catch (_) {}
+            if (!resp.ok || data.ok === false) {
+                throw new Error(data.error || ('HTTP ' + resp.status));
+            }
+
+            var tail = Array.isArray(data.lines) ? data.lines : [];
+            var meta = '';
+            if (data.path) {
+                meta = '  ' + data.path +
+                    (typeof data.size === 'number' ? ' — ' + data.size + ' octets' : '');
+            }
+            var body = tail.length ? tail.join('\n') : '(log vide)';
+            var text = warning +
+                '───── Logs worker (comfyui.log) ─────\n' +
+                (meta ? meta + '\n' : '') +
+                '────────────────────────────────────\n' +
+                body;
+            if (data.error) text += '\n⚠️ ' + data.error;
+
+            logOutput.textContent = text;
+            logOutput.scrollTop = logOutput.scrollHeight;
+            if (logCountEl) {
+                logCountEl.textContent = tail.length + ' ligne' + (tail.length > 1 ? 's' : '');
+            }
+            if (data.error) {
+                showNotification('⚠️ Logs worker : ' + data.error, 'error');
+            }
+        } catch (e) {
+            logOutput.textContent = warning +
+                '❌ Logs worker indisponibles : ' + (e.message || 'erreur inconnue');
+            if (logCountEl) logCountEl.textContent = '0 ligne';
+            showNotification('❌ Logs worker indisponibles : ' + (e.message || ''), 'error');
+        } finally {
+            buttons.forEach(function (b) { b.disabled = false; });
+        }
+    }
+
+    /**
      * Libère de force le slot d'opération Modal (POST /api/modal/op/reset).
      * Le subprocess Modal éventuellement encore vivant n'est PAS tué.
      */
@@ -2184,6 +2260,7 @@
             '        <div class="modal-row"><span>📁 User settings locaux</span><span class="val muted" id="status-user-settings">⏳ Vérification...</span></div>',
             '        <div class="modal-row"><span>🔄 Dernière sync user</span><span class="val muted" id="status-user-sync">⏳ Jamais</span></div>',
             '        <div class="modal-hint">Les workflows, clés API et préférences UI sont copiés vers le volume. Un redémarrage du worker est nécessaire pour appliquer les changements.</div>',
+            '        <div class="modal-row"><span>🖥️ Logs du worker (ComfyUI)</span><span class="val"><button id="cfg-worker-logs" class="modal-btn modal-btn--sm" title="Tracebacks d\'import des custom nodes, dépendances manquantes, erreurs réseau">🖥️ Voir</button></span></div>',
             '      </div>',
             '      <div class="modal-step-foot">',
             '        <button id="cfg-run-deploy" class="modal-btn modal-btn--primary modal-btn--wide">🚀 Déployer</button>',
@@ -2245,6 +2322,7 @@
             '      <span id="modal-log-progress" class="modal-log-progress" style="display:none;"></span>',
             '      <span class="modal-logs-count" id="modal-log-count">0 ligne</span>',
             '      <button id="modal-log-force-release" class="modal-btn modal-btn--sm" style="display:none;margin:0 0 0 10px;" title="Libère le verrou d\'opération sans tuer le processus Modal en cours">🔓 Forcer la libération</button>',
+            '      <button id="modal-log-worker-logs" class="modal-btn modal-btn--sm" style="margin:0 0 0 10px;" title="Affiche les dernières lignes du log ComfyUI du worker Modal (tracebacks des custom nodes)">🖥️ Logs worker</button>',
             '    </div>',
             '    <pre id="modal-log-output" class="modal-logs-body"></pre>',
             '  </div>',
@@ -2292,6 +2370,12 @@
         // Bouton de secours — n'apparaît qu'en cas de 409 (voir runOperation).
         var forceReleaseBtn = document.getElementById('modal-log-force-release');
         if (forceReleaseBtn) forceReleaseBtn.onclick = forceReleaseOperation;
+
+        // Logs ComfyUI du worker Modal (diagnostic des custom nodes).
+        var workerLogsBtn = document.getElementById('modal-log-worker-logs');
+        if (workerLogsBtn) workerLogsBtn.onclick = function () { showWorkerLogs(300); };
+        var workerLogsLink = document.getElementById('cfg-worker-logs');
+        if (workerLogsLink) workerLogsLink.onclick = function () { showWorkerLogs(300); };
         // NOTE: clicking on the overlay background no longer closes the modal
         // overlay.onclick = function (e) { if (e.target === overlay) overlay.remove(); };
 

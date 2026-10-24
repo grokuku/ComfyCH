@@ -1095,13 +1095,21 @@ class _FakeProc:
 
 
 def _fake_subprocess(calls, label):
-    """Module ``subprocess`` factice qui enregistre chaque Popen dans *calls*."""
+    """Module ``subprocess`` factice qui enregistre chaque Popen dans *calls*.
+
+    ``kwargs`` conserve les mots-clés de chaque lancement (stdout/stderr),
+    utilisés par les checks de redirection des logs ComfyUI.
+    """
     fake = types.ModuleType("fake_subprocess")
 
     class TimeoutExpired(Exception): pass
 
+    fake.STDOUT = -2  # même valeur sentinelle que le vrai subprocess
+    fake.kwargs = []
+
     def Popen(*args, **kwargs):
         calls.append(label)
+        fake.kwargs.append(kwargs)
         return _FakeProc()
 
     fake.TimeoutExpired = TimeoutExpired
@@ -1123,13 +1131,16 @@ def _test_start_checkpoint_order():
         def _sync_user_settings_from_volume(self): calls.append("user_settings")
 
     real_subprocess, real_wait = bw.subprocess, bw.wait_for_port
+    real_log = bw.COMFY_LOG_PATH
     bw.subprocess = _fake_subprocess(calls, "popen")
     bw.wait_for_port = lambda port, timeout=60: calls.append(f"wait:{timeout}")
+    bw.COMFY_LOG_PATH = Path(tempfile.mkdtemp()) / "comfyui.log"
     try:
         worker = W()
         worker.start_checkpoint()
     finally:
         bw.subprocess, bw.wait_for_port = real_subprocess, real_wait
+        bw.COMFY_LOG_PATH = real_log
 
     helpers = ["link_models", "custom_nodes", "uploads", "user_settings"]
     check("start_checkpoint : les 4 helpers tournent avant Popen",
@@ -1214,12 +1225,15 @@ def _test_start_restore_restart():
                 raise TimeoutError("snapshot KO")
 
         real_subprocess, real_wait = bw.subprocess, bw.wait_for_port
+        real_log = bw.COMFY_LOG_PATH
         bw.subprocess = _fake_subprocess(calls, "popen")
         bw.wait_for_port = fake_wait
+        bw.COMFY_LOG_PATH = Path(tempfile.mkdtemp()) / "comfyui.log"
         try:
             W().start_restore()
         finally:
             bw.subprocess, bw.wait_for_port = real_subprocess, real_wait
+            bw.COMFY_LOG_PATH = real_log
         return calls
 
     calls = _run(new_nodes=2)
@@ -1271,6 +1285,246 @@ def _test_shutdown_comfy():
           proc.terminated and worker.proc is None)
 
 
+# ─────────── Tests capture des logs ComfyUI (diagnostic custom nodes) ──────
+
+def _test_launch_comfy_redirect():
+    """ComfyUI est lancé avec stdout/stderr redirigés vers COMFY_LOG_PATH."""
+    bw = _load_base_worker()
+    tmp = Path(tempfile.mkdtemp())
+    log_path = tmp / "nested" / "comfyui.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text("ancienne sortie\n")  # doit être conservée (append)
+
+    fake = _fake_subprocess([], "popen")
+    real_subprocess, real_log = bw.subprocess, bw.COMFY_LOG_PATH
+    bw.subprocess, bw.COMFY_LOG_PATH = fake, log_path
+    try:
+        proc1 = bw.ComfyWorker()._launch_comfy()
+        proc2 = bw.ComfyWorker()._launch_comfy()
+    finally:
+        bw.subprocess, bw.COMFY_LOG_PATH = real_subprocess, real_log
+
+    check("_launch_comfy : process retourné (à mémoriser sur self.proc)",
+          isinstance(proc1, _FakeProc) and isinstance(proc2, _FakeProc))
+    check("_launch_comfy : stdout redirigé vers COMFY_LOG_PATH",
+          len(fake.kwargs) == 2
+          and all(Path(kw["stdout"].name) == log_path for kw in fake.kwargs))
+    check("_launch_comfy : log ouvert en append",
+          all(kw["stdout"].mode == "a" for kw in fake.kwargs))
+    check("_launch_comfy : stderr fusionné dans stdout",
+          all(kw.get("stderr") == fake.STDOUT for kw in fake.kwargs))
+    check("_launch_comfy : process détaché du groupe parent",
+          all(kw.get("start_new_session") is True for kw in fake.kwargs))
+
+    content = log_path.read_text()
+    check("_launch_comfy : en-tête horodaté écrit à chaque lancement",
+          content.count("===== ComfyUI start ") == 2)
+    check("_launch_comfy : ancienne sortie conservée (append)",
+          content.startswith("ancienne sortie\n"))
+
+
+def _test_logs_tail():
+    """logs_tail : fichier absent → error, N dernières lignes, bornes."""
+    bw = _load_base_worker()
+    worker = bw.ComfyWorker()
+    tmp = Path(tempfile.mkdtemp())
+    real_log = bw.COMFY_LOG_PATH
+
+    try:
+        bw.COMFY_LOG_PATH = tmp / "absent.log"
+        res = asyncio.run(worker.logs_tail(10))
+        check("logs_tail : log absent → error explicite",
+              res.get("error") == "log file not found" and res.get("lines") == [])
+        check("logs_tail : log absent → chemin retourné",
+              res.get("path") == str(bw.COMFY_LOG_PATH))
+
+        log = tmp / "comfyui.log"
+        log.write_text("\n".join(f"ligne {i}" for i in range(1, 11)) + "\n")
+        bw.COMFY_LOG_PATH = log
+        res = asyncio.run(worker.logs_tail(3))
+        check("logs_tail : 3 dernières lignes du log",
+              res.get("lines") == ["ligne 8", "ligne 9", "ligne 10"])
+        check("logs_tail : taille du log exposée",
+              res.get("size") == log.stat().st_size)
+        check("logs_tail : pas d'error quand le log existe", "error" not in res)
+
+        big = tmp / "big.log"
+        big.write_text("\n".join(f"l{i}" for i in range(1, 2501)) + "\n")
+        bw.COMFY_LOG_PATH = big
+        res = asyncio.run(worker.logs_tail(10 ** 6))
+        check("logs_tail : borne haute à 2000 lignes",
+              len(res.get("lines", [])) == 2000
+              and res["lines"][-1] == "l2500")
+        res = asyncio.run(worker.logs_tail(-5))
+        check("logs_tail : borne basse à 1 ligne", len(res.get("lines", [])) == 1)
+
+        # Fichier plus gros que la fenêtre de lecture : seules les dernières
+        # lignes sont chargées, la ligne coupée par le seek doit être jetée.
+        real_window = bw.COMFY_LOG_MAX_BYTES
+        bw.COMFY_LOG_MAX_BYTES = 64
+        try:
+            res = asyncio.run(worker.logs_tail(2000))
+        finally:
+            bw.COMFY_LOG_MAX_BYTES = real_window
+        lines = res.get("lines", [])
+        check("logs_tail : fenêtre de lecture bornée (fin du log seul)",
+              lines[-1] == "l2500" and len(lines) < 2000)
+        check("logs_tail : taille exposée = fichier entier malgré la fenêtre",
+              res.get("size") == big.stat().st_size)
+        check("logs_tail : aucune ligne tronquée par le seek",
+              all(line.startswith("l") and line[1:].isdigit() for line in lines))
+    finally:
+        bw.COMFY_LOG_PATH = real_log
+
+
+def _test_worker_logs_route():
+    """La route GET /logs relaie logs_tail du worker (et gère les erreurs)."""
+    class LogsWorker:
+        asked = []
+
+        def __init__(self):
+            self.logs_tail = _Chain(self._logs_tail)
+
+        async def _logs_tail(self, lines):
+            LogsWorker.asked.append(lines)
+            return {"lines": ["derniere ligne"], "path": "/tmp/comfyui.log", "size": 9}
+
+    class BoomWorker(LogsWorker):
+        async def _logs_tail(self, lines):
+            raise RuntimeError("container injoignable")
+
+    router = gateway_router.build_router(
+        {"L4": LogsWorker}, cors_origins=["*"], title="logs"
+    )
+    check("router : route GET /logs exposée", ("GET", "/logs") in router.handlers)
+
+    logs = router.handlers[("GET", "/logs")]
+    result = asyncio.run(logs(lines=50))
+    check("router : /logs retourne les lignes du worker",
+          result.get("lines") == ["derniere ligne"])
+    check("router : /logs transmet le nombre de lignes au worker",
+          LogsWorker.asked == [50])
+
+    bad = asyncio.run(logs(gpu="A100"))
+    check("router : /logs GPU inconnu → 400",
+          isinstance(bad, JSONResponse) and bad.status_code == 400)
+
+    boom = gateway_router.build_router(
+        {"L4": BoomWorker}, cors_origins=["*"], title="logs"
+    )
+    failed = asyncio.run(boom.handlers[("GET", "/logs")](lines=10))
+    check("router : /logs worker en erreur → 500 avec message",
+          isinstance(failed, JSONResponse) and failed.status_code == 500
+          and "container injoignable" in failed.content.get("error", ""))
+
+
+def _test_extension_worker_logs_route():
+    """La route locale GET /api/modal/worker-logs relaie {api_url}/logs.
+
+    ``server`` et ``aiohttp`` sont stubbés le temps de l'import : sans eux,
+    ``__init__.py`` n'enregistre aucune route (cas des autres tests).
+    """
+    registered = {}
+
+    class _Router:
+        def add_route(self, method, path, handler):
+            registered[(method, path)] = handler
+
+    class _App:
+        def __init__(self): self.router = _Router()
+
+    class PromptServer:
+        def __init__(self): self.app = _App()
+        def add_routes(self): return None  # remplacée par _add_routes_with_modal
+
+    class _Web:
+        @staticmethod
+        def json_response(payload, status=200):
+            return SimpleNamespace(payload=payload, status=status, content=payload)
+
+    server_mod = types.ModuleType("server")
+    server_mod.PromptServer = PromptServer
+    aiohttp_mod = types.ModuleType("aiohttp")
+    aiohttp_mod.web = _Web
+
+    sys.modules["server"] = server_mod
+    sys.modules["aiohttp"] = aiohttp_mod
+    try:
+        comfych = _load_comfych_module()
+        prompt_server = PromptServer()
+        comfych.PromptServer.add_routes(prompt_server)
+    finally:
+        sys.modules.pop("server", None)
+        sys.modules.pop("aiohttp", None)
+
+    handler = registered.get(("GET", "/api/modal/worker-logs"))
+    check("route locale : /api/modal/worker-logs enregistrée (gardée)",
+          handler is not None)
+    if handler is None:
+        return
+
+    tmp = Path(tempfile.mkdtemp())
+    real_config, real_urllib = comfych.load_config, comfych.urllib
+    urls = []
+
+    class _FakeResp:
+        def __init__(self, body, status=200):
+            self._body = body; self.status = status
+        def read(self): return self._body
+        def __enter__(self): return self
+        def __exit__(self, *exc): return False
+
+    class _FakeUrlopen:
+        body = b'{"lines": ["tb import"], "path": "/tmp/comfyui.log", "size": 9}'
+        status = 200
+        @classmethod
+        def __call__(cls, req, timeout=None):
+            urls.append((req.full_url, req.headers.get("X-API-Key")))
+            return _FakeResp(cls.body, cls.status)
+
+    class _FakeRequest:
+        @staticmethod
+        def __call__(url, headers=None):
+            return SimpleNamespace(full_url=url, headers=headers or {})
+
+    fake_urllib = types.SimpleNamespace(
+        request=types.SimpleNamespace(Request=_FakeRequest(), urlopen=_FakeUrlopen()),
+        error=types.SimpleNamespace(HTTPError=RuntimeError, URLError=OSError),
+    )
+
+    def _fake_config(cfg):
+        return lambda: dict(cfg)
+
+    async def _call(query):
+        return await handler(SimpleNamespace(
+            rel_url=SimpleNamespace(query=query), headers={}
+        ))
+
+    try:
+        comfych.urllib = fake_urllib
+        comfych.load_config = _fake_config({"api_url": "", "api_key": "k"})
+        resp = asyncio.run(_call({}))
+        check("route locale : api_url absente → 400",
+              resp.status == 400 and resp.payload["ok"] is False)
+
+        comfych.load_config = _fake_config(
+            {"api_url": "https://x.modal.run/", "api_key": "k"}
+        )
+        resp = asyncio.run(_call({"lines": "300", "gpu": "L40S"}))
+        check("route locale : lignes du worker relayées",
+              resp.payload.get("lines") == ["tb import"])
+        check("route locale : URL /logs + gpu transmis au gateway",
+              urls and urls[0][0] == "https://x.modal.run/logs?lines=300&gpu=L40S")
+        check("route locale : clé API envoyée dans X-API-Key",
+              bool(urls) and urls[0][1] == "k")
+
+        resp = asyncio.run(_call({"lines": "pas-un-nombre"}))
+        check("route locale : lines invalide → 200 lignes par défaut",
+              urls[-1][0] == "https://x.modal.run/logs?lines=200")
+    finally:
+        comfych.urllib, comfych.load_config = real_urllib, real_config
+
+
 # ─────────────────────────── Main ──────────────────────────────────────────
 
 def main():
@@ -1306,6 +1560,10 @@ def main():
     _test_custom_nodes_sync()
     _test_start_restore_restart()
     _test_shutdown_comfy()
+    _test_launch_comfy_redirect()
+    _test_logs_tail()
+    _test_worker_logs_route()
+    _test_extension_worker_logs_route()
 
     print(f"\n{'='*50}")
     print(f"Résultat : {PASS}/{TOTAL} tests OK")
