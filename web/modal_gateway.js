@@ -1316,7 +1316,7 @@
      * @param {'sync'|'deploy'} operation
      */
     async function runOperation(operation) {
-        var btn = document.getElementById('cfg-run-' + operation);
+        var btn = document.getElementById('cfg-run-' + operation) || document.getElementById('cfg-sync-' + operation);
         var logSection = document.getElementById('modal-log-section');
         var logOutput = document.getElementById('modal-log-output');
 

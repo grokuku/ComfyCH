@@ -875,7 +875,7 @@ if PromptServer is not None:
                     {"ok": False, "error": "Une opération Modal est déjà en cours"},
                     status=409,
                 )
-            asyncio.create_task(_run_async("sync_custom_nodes", ["modal", "run", "sync.py", "--custom-nodes"]))
+            asyncio.create_task(_run_async("sync_custom_nodes", ["modal", "run", "sync.py", "--sync-custom-nodes"]))
             return web.json_response({"ok": True, "message": "Sync custom nodes lancée"})
 
         # Ensuite nos routes Modal Gateway
