@@ -1099,10 +1099,13 @@
             '  to { opacity: 1; }',
             '}',
             '/* Panneau de la modale */',
+            '/* Colonne flex : le scroll est interne (étapes scrollables + logs épinglés). */',
             '.modal-settings-panel {',
             '  background: #2a2a2e; color: #e0e0e0;',
-            '  border-radius: 12px; width: 560px; max-width: 90vw;',
-            '  max-height: 85vh; overflow-y: auto;',
+            '  border-radius: 12px;',
+            '  width: min(1240px, 96vw);',
+            '  height: min(780px, 94vh);',
+            '  display: flex; flex-direction: column;',
             '  box-shadow: 0 8px 32px rgba(0,0,0,0.5);',
             '  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;',
             '  font-size: 14px; line-height: 1.5;',
@@ -1114,15 +1117,17 @@
             '}',
             '/* En-tête */',
             '.modal-settings-header {',
-            '  display: flex; justify-content: space-between; align-items: center;',
-            '  padding: 16px 20px; border-bottom: 1px solid #3a3a3e;',
+            '  flex-shrink: 0;',
+            '  display: flex; align-items: center; gap: 14px;',
+            '  padding: 12px 18px; border-bottom: 1px solid #3a3a3e;',
             '}',
             '.modal-settings-header h2 {',
-            '  margin: 0; font-size: 16px; font-weight: 600;',
+            '  margin: 0; font-size: 15px; font-weight: 600; white-space: nowrap;',
             '}',
             '.modal-settings-close {',
+            '  margin-left: auto;',
             '  background: none; border: none; color: #888;',
-            '  cursor: pointer; font-size: 20px; padding: 0 4px;',
+            '  cursor: pointer; font-size: 18px; padding: 0 4px;',
             '  line-height: 1;',
             '}',
             '.modal-settings-close:hover { color: #fff; }',
@@ -1309,6 +1314,224 @@
             '  font-size: 11px; color: #777; margin-top: 2px;',
             '}',
             '',
+            '',
+            // ─── Layout 3 étapes (refonte de la modale) ───
+            '/* Pastilles de statut du header */',
+            '.modal-pills {',
+            '  display: flex; align-items: center; gap: 8px; margin-left: 4px;',
+            '  min-width: 0; overflow: hidden;',
+            '}',
+            '.modal-pill {',
+            '  display: inline-flex; align-items: center; gap: 6px;',
+            '  font-size: 11px; color: #aaa; white-space: nowrap;',
+            '  background: #1a1a1e; border: 1px solid #38383d;',
+            '  border-radius: 999px; padding: 3px 9px;',
+            '}',
+            '.modal-pill::before {',
+            '  content: ""; width: 7px; height: 7px; border-radius: 50%;',
+            '  background: #777; flex-shrink: 0;',
+            '}',
+            '.modal-pill.ok { color: #6fcf7f; border-color: #2f4a34; }',
+            '.modal-pill.ok::before { background: #6fcf7f; }',
+            '.modal-pill.warn { color: #e0a94a; border-color: #4a3f2a; }',
+            '.modal-pill.warn::before { background: #e0a94a; }',
+            '',
+            '/* Barre « Connexion » repliable */',
+            '.modal-prereq { flex-shrink: 0; border-bottom: 1px solid #3a3a3e; background: #232327; }',
+            '.modal-prereq-head {',
+            '  display: flex; align-items: center; gap: 10px;',
+            '  height: 40px; padding: 0 18px;',
+            '  cursor: pointer; user-select: none;',
+            '}',
+            '.modal-prereq-head:hover { background: #26262b; }',
+            '.modal-chevron {',
+            '  display: inline-block; font-size: 9px; color: #777;',
+            '  transition: transform 0.15s ease;',
+            '}',
+            '.modal-prereq.open .modal-chevron { transform: rotate(90deg); }',
+            '.modal-prereq-title {',
+            '  font-size: 12px; font-weight: 600; color: #aaa;',
+            '  text-transform: uppercase; letter-spacing: 0.5px;',
+            '}',
+            '.modal-prereq-api {',
+            '  font-size: 12px; color: #e0e0e0; max-width: 42%;',
+            '  font-family: "Courier New", monospace;',
+            '  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;',
+            '}',
+            '.modal-prereq-state {',
+            '  font-size: 11px; color: #777; margin-left: auto; white-space: nowrap;',
+            '}',
+            '.modal-prereq-body { display: none; padding: 0 18px 16px; }',
+            '.modal-prereq.open .modal-prereq-body {',
+            '  display: grid; grid-template-columns: 1.4fr 1fr; gap: 18px;',
+            '}',
+            '.modal-col { min-width: 0; }',
+            '.modal-prereq-body label {',
+            '  display: block; margin: 8px 0 4px; font-size: 11px; color: #999;',
+            '}',
+            '.modal-prereq-body input[type="text"],',
+            '.modal-prereq-body input[type="password"] {',
+            '  width: 100%; padding: 7px 10px; box-sizing: border-box;',
+            '  border: 1px solid #3a3a3e; border-radius: 6px;',
+            '  background: #1a1a1e; color: #e0e0e0; font-size: 12px; outline: none;',
+            '}',
+            '.modal-prereq-body input:focus { border-color: #4a4aff; }',
+            '',
+            '/* Grille des 3 étapes */',
+            '.modal-steps {',
+            '  flex: 1; min-height: 0;',
+            '  display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px;',
+            '  padding: 14px 18px;',
+            '}',
+            '.modal-step {',
+            '  display: flex; flex-direction: column;',
+            '  min-height: 0; min-width: 0;',
+            '  background: #232327; border: 1px solid #38383d; border-radius: 10px;',
+            '}',
+            '.modal-step-head {',
+            '  flex-shrink: 0; display: flex; align-items: center; gap: 8px;',
+            '  padding: 10px 12px; border-bottom: 1px solid #38383d;',
+            '}',
+            '.modal-step-num {',
+            '  display: inline-flex; align-items: center; justify-content: center;',
+            '  width: 20px; height: 20px; border-radius: 50%; flex-shrink: 0;',
+            '  font-size: 11px; font-weight: 700;',
+            '  background: #38383d; color: #aaa;',
+            '}',
+            '.modal-step-num.active { background: #4a4aff; color: #fff; }',
+            '.modal-step-num.done { background: #2f4a34; color: #6fcf7f; }',
+            '.modal-step-title { font-size: 13px; font-weight: 600; color: #e0e0e0; }',
+            '.modal-step-badge {',
+            '  margin-left: auto; padding: 2px 7px; border-radius: 999px;',
+            '  font-size: 10px; white-space: nowrap;',
+            '  background: #1a1a1e; border: 1px solid #38383d; color: #777;',
+            '}',
+            '.modal-step-badge.ok { color: #6fcf7f; border-color: #2f4a34; }',
+            '.modal-step-badge.warn { color: #e0a94a; border-color: #4a3f2a; }',
+            '.modal-step-body {',
+            '  flex: 1; min-height: 0; overflow-y: auto;',
+            '  display: flex; flex-direction: column; gap: 8px;',
+            '  padding: 10px 12px;',
+            '}',
+            '.modal-step-foot {',
+            '  flex-shrink: 0; display: flex; flex-direction: column; gap: 7px;',
+            '  padding: 10px 12px; border-top: 1px solid #38383d;',
+            '}',
+            '',
+            '/* Lignes d\'information dans une étape */',
+            '.modal-hint { font-size: 11px; color: #777; line-height: 1.45; }',
+            '.modal-row {',
+            '  display: flex; align-items: center; justify-content: space-between; gap: 8px;',
+            '  padding: 6px 8px; border-radius: 6px; background: #1a1a1e;',
+            '  font-size: 12px; color: #aaa;',
+            '}',
+            '.modal-row .val, .status-item .val {',
+            '  flex-shrink: 0; font-weight: 600; color: #e0e0e0; text-align: right;',
+            '}',
+            '.modal-row .val.ok, .status-item .val.ok { color: #6fcf7f; }',
+            '.modal-row .val.warn, .status-item .val.warn { color: #e06a6a; }',
+            '.modal-row .val.muted, .status-item .val.muted { color: #777; }',
+            '.status-item {',
+            '  display: flex; align-items: center; justify-content: space-between; gap: 8px;',
+            '}',
+            '.modal-divider { flex-shrink: 0; height: 1px; background: #38383d; margin: 2px 0; }',
+            '',
+            '/* Listes (nodes / modèles) */',
+            '.modal-list {',
+            '  flex: 1 1 auto; min-height: 100px; max-height: none; overflow-y: auto;',
+            '  border: 1px solid #38383d; border-radius: 8px;',
+            '  padding: 6px; background: #1a1a1e;',
+            '}',
+            '.modal-item {',
+            '  display: flex; align-items: flex-start; gap: 8px;',
+            '  padding: 6px 4px; border-bottom: 1px solid #2a2a2e; cursor: pointer;',
+            '}',
+            '.modal-item:last-child { border-bottom: none; }',
+            '.modal-item:hover { background: #202027; }',
+            '.modal-item input[type="checkbox"] {',
+            '  margin-top: 2px; flex-shrink: 0; cursor: pointer;',
+            '  width: 15px; height: 15px; accent-color: #4a4aff;',
+            '}',
+            '.modal-item-main { flex: 1; min-width: 0; }',
+            '.modal-item-name {',
+            '  font-size: 12px; font-weight: 600; color: #e0e0e0; word-break: break-all;',
+            '}',
+            '.modal-item-sub { font-size: 10px; color: #777; margin-top: 2px; }',
+            '.modal-item-sub.installed { color: #6fcf7f; }',
+            '.modal-item-sub.new { color: #e0a94a; }',
+            '.modal-item-sub.removed { color: #e06a6a; }',
+            '.modal-item-sub.none { color: #777; }',
+            '',
+            '/* Déclinaisons de boutons du nouveau layout */',
+            '.modal-btn {',
+            '  background: #2f2f36; color: #e0e0e0;',
+            '  border: 1px solid #3f3f46;',
+            '}',
+            '.modal-btn:hover:not(:disabled) { background: #38383f; }',
+            '.modal-btn--primary { background: #4a4aff; color: #fff; border-color: #4a4aff; }',
+            '.modal-btn--primary:hover:not(:disabled) { background: #5a5aff; }',
+            '.modal-btn--wide { width: 100%; margin-top: 0; }',
+            '.modal-btn--sm { padding: 6px 10px; margin-top: 0; font-size: 12px; }',
+            '.modal-btnrow { display: flex; gap: 7px; flex-wrap: wrap; margin-top: 8px; }',
+            '.modal-check {',
+            '  display: flex; align-items: center; gap: 6px;',
+            '  font-size: 11px; color: #999; cursor: pointer;',
+            '}',
+            '.modal-check input { margin: 0; accent-color: #4a4aff; cursor: pointer; }',
+            '',
+            '/* Logs épinglés en bas */',
+            '.modal-logs {',
+            '  flex-shrink: 0; height: 138px;',
+            '  display: flex; flex-direction: column;',
+            '  border-top: 1px solid #3a3a3e; background: #1a1a1e;',
+            '  border-radius: 0 0 12px 12px;',
+            '}',
+            '.modal-logs-head {',
+            '  flex-shrink: 0; display: flex; align-items: center; gap: 10px;',
+            '  padding: 6px 18px; border-bottom: 1px solid #38383d;',
+            '}',
+            '.modal-logs-title {',
+            '  font-size: 11px; font-weight: 600; color: #aaa;',
+            '  text-transform: uppercase; letter-spacing: 0.5px;',
+            '}',
+            '.modal-logs-live {',
+            '  display: inline-flex; align-items: center; gap: 5px;',
+            '  font-size: 10px; color: #6fcf7f;',
+            '}',
+            '.modal-logs-live::before {',
+            '  content: ""; width: 6px; height: 6px; border-radius: 50%;',
+            '  background: #6fcf7f; animation: modal-blink 1.4s ease-in-out infinite;',
+            '}',
+            '@keyframes modal-blink { 50% { opacity: 0.25; } }',
+            '.modal-logs-count { margin-left: auto; font-size: 10px; color: #777; }',
+            '.modal-logs-body {',
+            '  flex: 1; min-height: 0; margin: 0; overflow-y: auto;',
+            '  padding: 8px 18px; color: #9f9;',
+            '  font-family: "Courier New", monospace; font-size: 11px; line-height: 1.45;',
+            '  white-space: pre-wrap; word-break: break-all;',
+            '}',
+            '',
+            '/* Écrans étroits : les étapes s\'empilent verticalement */',
+            '@media (max-width: 900px) {',
+            '  .modal-prereq.open .modal-prereq-body { grid-template-columns: 1fr; }',
+            '  .modal-steps { grid-template-columns: 1fr; overflow-y: auto; }',
+            '  .modal-step { min-height: 260px; }',
+            '  .modal-logs { height: 110px; }',
+            '}',
+            '',
+            '/* Scrollbars fines des zones scrollables du nouveau layout */',
+            '.modal-step-body::-webkit-scrollbar,',
+            '.modal-list::-webkit-scrollbar,',
+            '.modal-logs-body::-webkit-scrollbar { width: 8px; }',
+            '.modal-step-body::-webkit-scrollbar-track,',
+            '.modal-list::-webkit-scrollbar-track,',
+            '.modal-logs-body::-webkit-scrollbar-track { background: transparent; }',
+            '.modal-step-body::-webkit-scrollbar-thumb,',
+            '.modal-list::-webkit-scrollbar-thumb,',
+            '.modal-logs-body::-webkit-scrollbar-thumb {',
+            '  background: #3a3a3e; border-radius: 4px;',
+            '}',
+            '',
             '#modal-queue-badge {',
             '  transition: border-color 0.3s, background 0.3s;',
             '}',
@@ -1334,20 +1557,82 @@
     }
 
     /**
+     * Renseigne la pastille d'état du header (`#pill-*`).
+     * Le libellé est remplacé, la classe porte la couleur du point.
+     * @param {string} id
+     * @param {boolean} ok
+     * @param {string} okText
+     * @param {string} warnText
+     */
+    function setStatusPill(id, ok, okText, warnText) {
+        var el = document.getElementById(id);
+        if (!el) return;
+        el.textContent = ok ? okText : warnText;
+        el.className = 'modal-pill ' + (ok ? 'ok' : 'warn');
+    }
+
+    /**
+     * Renseigne le badge d'une étape (`#stepN-badge`).
+     * @param {string} id
+     * @param {boolean} ok
+     * @param {string} okText
+     * @param {string} warnText
+     */
+    function setStepBadge(id, ok, okText, warnText) {
+        var el = document.getElementById(id);
+        if (!el) return;
+        el.textContent = ok ? okText : warnText;
+        el.className = 'modal-step-badge ' + (ok ? 'ok' : 'warn');
+    }
+
+    /**
+     * Renseigne une ligne de statut (`div.status-item`).
+     * Si la ligne contient un `<span class="val">` (nouveau layout), seule la
+     * valeur est mise à jour afin de conserver le libellé ; sinon on écrit la
+     * ligne complète (fallback).
+     * @param {Element} el
+     * @param {string} label
+     * @param {boolean} ok
+     */
+    function setStatusValue(el, label, ok) {
+        if (!el) return;
+        var valEl = el.querySelector('.val');
+        if (valEl) {
+            valEl.textContent = ok ? '✅' : '❌';
+            valEl.className = 'val ' + (ok ? 'ok' : 'warn');
+        } else {
+            el.textContent = label + ' : ' + (ok ? '✅' : '❌');
+        }
+    }
+
+    /**
      * Rafraîchit les indicateurs de statut dans la modale.
      */
     function refreshStatus() {
         fetch('/api/modal/status')
             .then(function (r) { return r.json(); })
             .then(function (status) {
+                // Ordre imposé par le nouveau layout de l'étape 1 :
+                // CLI, Authentifié, Volume, API configurée, Secret.
                 var items = document.querySelectorAll('.status-item');
                 if (items.length >= 5) {
-                    items[0].textContent = '🔧 Modal CLI : ' + (status.modal_installed ? '✅' : '❌');
-                    items[1].textContent = '🔐 Authentifié : ' + (status.modal_authenticated ? '✅' : '❌');
-                    items[2].textContent = '💾 Volume comfy-models : ' + (status.volume_exists ? '✅' : '❌');
-                    items[3].textContent = '🌐 API configurée : ' + (status.api_configured ? '✅' : '❌');
-                    items[4].textContent = '🔑 Secret Modal : ' + (status.secret_exists ? '✅' : '❌');
+                    setStatusValue(items[0], '🔧 Modal CLI', !!status.modal_installed);
+                    setStatusValue(items[1], '🔐 Authentifié', !!status.modal_authenticated);
+                    setStatusValue(items[2], '💾 Volume comfy-models', !!status.volume_exists);
+                    setStatusValue(items[3], '🌐 API configurée', !!status.api_configured);
+                    setStatusValue(items[4], '🔑 Secret Modal', !!status.secret_exists);
                 }
+                // Pastilles compactes du header
+                setStatusPill('pill-connect', !!status.api_configured, 'Connecté', 'Non connecté');
+                setStatusPill('pill-secret', !!status.secret_exists, 'Secret', 'Sans secret');
+                setStatusPill('pill-volume', !!status.volume_exists, 'Volume', 'Sans volume');
+                // Badges des étapes Build / Modèles
+                setStepBadge('step1-badge', !!status.last_deploy,
+                    '✅ déployé',
+                    '⏳ jamais déployé');
+                setStepBadge('step3-badge', !!status.last_sync,
+                    '✅ synchronisé',
+                    '⏳ jamais synchronisé');
                 // Bandeau d'avertissement — masqué dès que l'auth Modal est présente
                 var authWarning = document.getElementById('modal-auth-warning');
                 if (authWarning) {
@@ -1361,17 +1646,44 @@
      * Lance une opération (sync/deploy) et affiche les logs en direct via SSE.
      * @param {'sync'|'deploy'} operation
      */
+    /**
+     * Bouton déclencheur de chaque opération (les ids ne suivent pas le même
+     * schéma pour sync/deploy et pour les opérations « user settings » /
+     * « custom nodes »).
+     */
+    var OP_BUTTON_IDS = {
+        sync: 'cfg-run-sync',
+        deploy: 'cfg-run-deploy',
+        'sync-user': 'cfg-sync-user',
+        'sync-custom-nodes': 'cfg-sync-custom-nodes',
+    };
+
+    /** Libellé d'opération utilisé dans les notifications. */
+    var OP_LABELS = {
+        sync: 'Sync modèles',
+        deploy: 'Déploiement',
+        'sync-user': 'Sync user settings',
+        'sync-custom-nodes': 'Sync custom nodes',
+    };
+
     async function runOperation(operation) {
-        var btn = document.getElementById('cfg-run-' + operation) || document.getElementById('cfg-sync-' + operation);
+        var btnId = OP_BUTTON_IDS[operation] || ('cfg-run-' + operation);
+        var btn = document.getElementById(btnId);
         var logSection = document.getElementById('modal-log-section');
         var logOutput = document.getElementById('modal-log-output');
+        var logCountEl = document.getElementById('modal-log-count');
+        var logLines = 0;
+        var opLabel = OP_LABELS[operation] || operation;
 
         if (!btn || !logSection || !logOutput) return;
 
+        var originalLabel = btn.textContent;
         btn.disabled = true;
         btn.textContent = '⏳ En cours...';
-        logSection.style.display = 'block';
+        // `.modal-logs` est un conteneur flex (head fixe + corps scrollable).
+        logSection.style.display = 'flex';
         logOutput.textContent = '';
+        if (logCountEl) logCountEl.textContent = '0 ligne';
 
         try {
             // Lancer l'opération
@@ -1396,6 +1708,10 @@
                     if (data.line) {
                         logOutput.textContent += data.line + '\n';
                         logOutput.scrollTop = logOutput.scrollHeight;
+                        logLines++;
+                        if (logCountEl) {
+                            logCountEl.textContent = logLines + ' ligne' + (logLines > 1 ? 's' : '');
+                        }
                     }
                 } catch (e) {}
             };
@@ -1410,16 +1726,17 @@
                 }
                 btn.disabled = false;
                 btn.textContent = data.code === '0' ? '✅ Terminé' : '❌ Échec';
+                setTimeout(function () { btn.textContent = originalLabel; }, 2500);
                 if (data.code === '0') {
                     showNotification(
-                        '✅ ' + (operation === 'sync' ? 'Sync' : 'Déploiement') + ' réussi !',
+                        '✅ ' + opLabel + ' réussi !',
                         'success'
                     );
                     // Rafraîchir le statut
                     setTimeout(refreshStatus, 1000);
                 } else {
                     showNotification(
-                        '❌ ' + (operation === 'sync' ? 'Sync' : 'Déploiement') + ' échoué — voir logs',
+                        '❌ ' + opLabel + ' échoué — voir logs',
                         'error'
                     );
                 }
@@ -1429,12 +1746,14 @@
                 eventSource.close();
                 btn.disabled = false;
                 btn.textContent = '❌ Erreur connexion';
+                setTimeout(function () { btn.textContent = originalLabel; }, 2500);
                 logOutput.textContent += '\n⚠️ Connexion SSE perdue.\n';
             };
 
         } catch (e) {
             btn.disabled = false;
             btn.textContent = '❌ Erreur';
+            setTimeout(function () { btn.textContent = originalLabel; }, 2500);
             logOutput.textContent = e.message || 'Erreur inconnue';
         }
     }
@@ -1525,107 +1844,130 @@
         overlay.innerHTML = [
             '<div class="modal-settings-panel">',
             '  <div class="modal-settings-header">',
-            '    <h2>⚙️ Modal Gateway — Configuration</h2>',
-            '    <button class="modal-settings-close">✕</button>',
+            '    <h2>⚙️ Modal Gateway</h2>',
+            '    <div class="modal-pills">',
+            '      <span class="modal-pill" id="pill-connect">…</span>',
+            '      <span class="modal-pill" id="pill-secret">…</span>',
+            '      <span class="modal-pill" id="pill-volume">…</span>',
+            '    </div>',
+            '    <button class="modal-settings-close" title="Fermer">✕</button>',
             '  </div>',
-            '  <div class="modal-settings-body">',
-            '    <section>',
-            '      <h3>🔌 Connexion API Modal</h3>',
-            '      <label>URL de l\'API</label>',
-            '      <input type="text" id="cfg-api-url" value="" placeholder="https://xxx.modal.run" />',
-            '      <label>Clé API (X-API-Key)</label>',
-            '      <input type="password" id="cfg-api-key" value="" placeholder="Collez votre clé API" autocomplete="off" />',
-            '      <label>Hôtes autorisés (reverse proxy)</label>',
-            '      <input type="text" id="cfg-allowed-hosts" value="" placeholder="comfy.example.com, autre.domaine" autocomplete="off" />',
-            '      <div class="modal-plugin-actions">',
-            '        <button id="cfg-generate-key" class="modal-btn">🔑 Générer une clé</button>',
-            '        <button id="cfg-create-secret" class="modal-btn modal-btn-action">☁️ Créer/Mettre à jour le Secret sur Modal</button>',
-            '        <button id="cfg-save-connection" class="modal-btn modal-btn-primary">💾 Sauvegarder</button>',
+            '',
+            '  <div class="modal-prereq" id="modal-prereq">',
+            '    <div class="modal-prereq-head" id="modal-prereq-head">',
+            '      <span class="modal-chevron">▶</span>',
+            '      <span class="modal-prereq-title">Connexion</span>',
+            '      <span class="modal-prereq-api" id="prereq-summary-api">…</span>',
+            '      <span class="modal-prereq-state" id="prereq-summary-state">cliquer pour modifier</span>',
+            '    </div>',
+            '    <div class="modal-prereq-body">',
+            '      <div class="modal-col">',
+            '        <label for="cfg-api-url">URL de l\'API</label>',
+            '        <input type="text" id="cfg-api-url" value="" placeholder="https://xxx.modal.run" />',
+            '        <label for="cfg-api-key">Clé API (X-API-Key)</label>',
+            '        <input type="password" id="cfg-api-key" value="" placeholder="Collez votre clé API" autocomplete="off" />',
+            '        <div class="modal-btnrow">',
+            '          <button id="cfg-generate-key" class="modal-btn modal-btn--sm">🔑 Générer</button>',
+            '          <button id="cfg-create-secret" class="modal-btn modal-btn--sm">☁️ Créer le Secret</button>',
+            '        </div>',
+            '        <div id="cfg-secret-hint" class="modal-plugin-note">🔑 Cette clé protège votre endpoint /generate — n\'importe quelle chaîne aléatoire convient. Elle doit être identique dans le Secret Modal et ici.</div>',
             '      </div>',
-            '      <div class="modal-plugin-note" id="cfg-secret-hint">🔑 Cette clé protège votre endpoint /generate — n\'importe quelle chaîne aléatoire convient (générez-en une ou collez un mot de passe). Elle doit être identique dans le Secret Modal et ici.</div>',
-            '    </section>',
-            '    <section>',
-            '      <h3>🔑 Token Modal (compte)</h3>',
-            '      <p style="font-size:12px;color:#999;margin:0 0 8px 0;">Token API créé sur le site Modal (Settings → API Tokens). À saisir ici une seule fois — remplace la commande <code>modal token set</code>. Le token est stocké dans les credentials Modal (~/.modal), pas dans la config.</p>',
-            '      <label>Token ID</label>',
-            '      <input type="text" id="cfg-token-id" placeholder="ak-..." autocomplete="off" />',
-            '      <label>Token Secret</label>',
-            '      <input type="password" id="cfg-token-secret" placeholder="as-..." autocomplete="off" />',
-            '      <button id="cfg-save-token" class="modal-btn modal-btn-action">✅ Enregistrer le token</button>',
-            '    </section>',
-            '    <section>',
-            '      <h3>📦 Modèles</h3>',
-            '      <p style="font-size:12px;color:#999;margin:0 0 8px 0;">Détectez vos modèles locaux et synchronisez-les vers Modal.</p>',
-            '      <div class="modal-plugin-actions">',
-            '        <button id="cfg-detect-models" class="modal-btn modal-btn-action">🔄 Détecter mes modèles</button>',
-            '        <button id="cfg-save-models" class="modal-btn modal-btn-primary" disabled>💾 Save Selection</button>',
-            '        <a id="cfg-toggle-models" style="font-size:12px;color:#6a6aff;cursor:pointer;margin-left:8px;display:none;">Tout sélectionner</a>',
-            '        <label style="font-size:12px;color:#999;display:block;margin-top:8px;"><input type="checkbox" id="cfg-models-workflow-only" style="vertical-align:middle;"> 📋 Workflow seulement</label>',
+            '      <div class="modal-col">',
+            '        <label for="cfg-allowed-hosts">Hôtes autorisés (reverse proxy)</label>',
+            '        <input type="text" id="cfg-allowed-hosts" value="" placeholder="comfy.example.com, autre.domaine" autocomplete="off" />',
+            '        <label for="cfg-token-id">Token Modal — ID</label>',
+            '        <input type="text" id="cfg-token-id" placeholder="ak-..." autocomplete="off" />',
+            '        <label for="cfg-token-secret">Token Modal — Secret</label>',
+            '        <input type="password" id="cfg-token-secret" placeholder="as-..." autocomplete="off" />',
+            '        <div class="modal-btnrow">',
+            '          <button id="cfg-save-token" class="modal-btn modal-btn--sm">✅ Enregistrer le token</button>',
+            '          <button id="cfg-save-connection" class="modal-btn modal-btn--primary modal-btn--sm">💾 Sauvegarder</button>',
+            '        </div>',
             '      </div>',
-            '      <div id="modal-models-list" class="modal-models-list" style="display:none;">',
+            '    </div>',
+            '  </div>',
+            '',
+            '  <div class="modal-steps">',
+            '    <div class="modal-step">',
+            '      <div class="modal-step-head">',
+            '        <span class="modal-step-num active">1</span>',
+            '        <span class="modal-step-title">Build</span>',
+            '        <span class="modal-step-badge" id="step1-badge">⏳</span>',
             '      </div>',
-            '      <div id="modal-models-loading" class="modal-plugin-loading" style="display:none;">⏳ Scan en cours...</div>',
-            '      <div id="modal-models-empty" class="modal-plugin-empty" style="display:none;">Aucun modèle détecté.</div>',
-            '      <div class="modal-status-row" style="margin-top:12px;">',
-            '        <span>🔄 Synchronisation des modèles</span>',
-            '        <span class="status-badge" id="status-sync">⏳ Jamais</span>',
+            '      <div class="modal-step-body">',
+            '        <div id="modal-auth-warning" class="modal-auth-warning" style="display:none;">⚠️ <strong>Aucun token Modal actif</strong> — le déploiement échouera. Renseignez votre token dans « Connexion » puis cliquez sur « ✅ Enregistrer le token ».</div>',
+            '        <div class="modal-hint">Construit l\'image Modal (nodes + modèles), y copie les user settings puis déploie le gateway API.</div>',
+            '        <div class="modal-row"><span>🌐 Dernier déploiement</span><span class="val muted" id="status-deploy">⏳ Jamais</span></div>',
+            '        <div class="modal-divider"></div>',
+            '        <div class="modal-row status-item"><span>🔧 Modal CLI</span><span class="val muted">…</span></div>',
+            '        <div class="modal-row status-item"><span>🔐 Authentifié</span><span class="val muted">…</span></div>',
+            '        <div class="modal-row status-item"><span>💾 Volume comfy-models</span><span class="val muted">…</span></div>',
+            '        <div class="modal-row status-item"><span>🌐 API configurée</span><span class="val muted">…</span></div>',
+            '        <div class="modal-row status-item"><span>🔑 Secret Modal</span><span class="val muted">…</span></div>',
+            '        <div class="modal-divider"></div>',
+            '        <div class="modal-row"><span>📁 User settings locaux</span><span class="val muted" id="status-user-settings">⏳ Vérification...</span></div>',
+            '        <div class="modal-row"><span>🔄 Dernière sync user</span><span class="val muted" id="status-user-sync">⏳ Jamais</span></div>',
+            '        <div class="modal-hint">Les workflows, clés API et préférences UI sont copiés vers le volume. Un redémarrage du worker est nécessaire pour appliquer les changements.</div>',
             '      </div>',
-            '      <button id="cfg-run-sync" class="modal-btn modal-btn-action">📥 Sync Models</button>',
-            '      <div class="modal-plugin-note">ℹ️ Sauvegardez votre sélection puis cliquez sur <strong>Sync Models</strong> pour uploader vers Modal.</div>',
-            '    </section>',
-            '    <section>',
-            '      <h3>👤 User Settings</h3>',
-            '      <p style="font-size:12px;color:#999;margin:0 0 8px 0;">Synchronisez vos paramètres ComfyUI (workflows, clés API, config) vers le volume cloud.</p>',
-            '      <div class="modal-status-row">',
-            '        <span>📁 Dossier user/ local</span>',
-            '        <span class="status-badge" id="status-user-settings">⏳ Vérification...</span>',
+            '      <div class="modal-step-foot">',
+            '        <button id="cfg-run-deploy" class="modal-btn modal-btn--primary modal-btn--wide">🚀 Déployer</button>',
+            '        <button id="cfg-sync-user" class="modal-btn modal-btn--wide">👤 Sync user settings</button>',
             '      </div>',
-            '      <div class="modal-status-row">',
-            '        <span>🔄 Dernière sync</span>',
-            '        <span class="status-badge" id="status-user-sync">⏳ Jamais</span>',
+            '    </div>',
+            '    <div class="modal-step">',
+            '      <div class="modal-step-head">',
+            '        <span class="modal-step-num active">2</span>',
+            '        <span class="modal-step-title">Nodes</span>',
+            '        <span class="modal-step-badge" id="step2-badge">⏳</span>',
             '      </div>',
-            '      <button id="cfg-sync-user" class="modal-btn modal-btn-action">👤 Sync User Settings</button>',
-            '      <div class="modal-plugin-note">ℹ️ Les workflows, clés API et préférences UI seront copiés vers le volume. Un redémarrage du worker est nécessaire pour appliquer les changements.</div>',
-            '    </section>',
-            '    <section>',
-            '      <h3>🚀 Déploiement</h3>',
-            '      <div id="modal-auth-warning" class="modal-auth-warning" style="display:none;">⚠️ <strong>Aucun token Modal actif</strong> — le déploiement échouera. Renseignez votre token dans la section “Token Modal (compte)” ci-dessus puis appuyez sur “✅ Enregistrer le token”.</div>',
-            '      <div class="modal-status-row">',
-            '        <span>🌐 API Gateway déployée</span>',
-            '        <span class="status-badge" id="status-deploy">⏳ Jamais</span>',
+            '      <div class="modal-step-body">',
+            '        <div class="modal-hint">Détectez vos custom nodes locaux et synchronisez-les vers Modal. Un redeploy est nécessaire pour qu\'ils prennent effet.</div>',
+            '        <div class="modal-btnrow">',
+            '          <button id="cfg-detect-plugins" class="modal-btn modal-btn--sm">🔄 Détecter</button>',
+            '          <a id="cfg-toggle-plugins" class="modal-btn modal-btn--sm" style="display:none;">☑ Tout</a>',
+            '        </div>',
+            '        <label class="modal-check"><input type="checkbox" id="cfg-plugins-workflow-only" /> Filtrer sur le workflow courant</label>',
+            '        <div id="modal-plugins-loading" class="modal-plugin-loading" style="display:none;">⏳ Scan en cours...</div>',
+            '        <div id="modal-plugins-empty" class="modal-plugin-empty" style="display:none;">Aucun node détecté.</div>',
+            '        <div id="modal-plugins-list" class="modal-plugins-list modal-list" style="display:none;"></div>',
             '      </div>',
-            '      <button id="cfg-run-deploy" class="modal-btn modal-btn-action">🚀 Deploy API</button>',
-            '    </section>',
-            '    <section>',
-            '      <h3>📊 Statut Modal</h3>',
-            '      <div class="modal-status-grid">',
-            '        <div class="status-item">🔧 Modal CLI : ...</div>',
-            '        <div class="status-item">🔐 Authentifié : ...</div>',
-            '        <div class="status-item">💾 Volume comfy-models : ...</div>',
-            '        <div class="status-item">🌐 API configurée : ...</div>',
-            '        <div class="status-item">🔑 Secret Modal : ...</div>',
+            '      <div class="modal-step-foot">',
+            '        <button id="cfg-save-plugins" class="modal-btn modal-btn--wide" disabled>💾 Enregistrer la sélection</button>',
+            '        <button id="cfg-sync-custom-nodes" class="modal-btn modal-btn--primary modal-btn--wide">📦 Sync vers Modal</button>',
             '      </div>',
-            '    </section>',
-            '    <section>',
-            '      <h3>🧩 Custom Nodes</h3>',
-            '      <p style="font-size:12px;color:#999;margin:0 0 8px 0;">Détectez vos custom nodes locaux et synchronisez-les vers Modal.</p>',
-            '      <div class="modal-plugin-actions">',
-            '        <button id="cfg-detect-plugins" class="modal-btn modal-btn-action">🔄 Détecter mes nodes</button>',
-            '        <button id="cfg-save-plugins" class="modal-btn modal-btn-primary" disabled>💾 Save Plugins</button>',
-            '        <a id="cfg-toggle-plugins" style="font-size:12px;color:#6a6aff;cursor:pointer;margin-left:8px;display:none;">Tout sélectionner</a>',
-            '        <label style="font-size:12px;color:#999;display:block;margin-top:8px;"><input type="checkbox" id="cfg-plugins-workflow-only" style="vertical-align:middle;"> 📋 Workflow seulement</label>',
-            '        <button id="cfg-sync-custom-nodes" class="modal-btn modal-btn-action" style="margin-top:8px;">📦 Sync Custom Nodes</button>',
+            '    </div>',
+            '    <div class="modal-step">',
+            '      <div class="modal-step-head">',
+            '        <span class="modal-step-num active">3</span>',
+            '        <span class="modal-step-title">Modèles</span>',
+            '        <span class="modal-step-badge" id="step3-badge">⏳</span>',
             '      </div>',
-            '      <div id="modal-plugins-list" class="modal-plugins-list" style="display:none;">',
+            '      <div class="modal-step-body">',
+            '        <div class="modal-hint">Détectez vos modèles locaux et synchronisez-les vers le volume comfy-models de Modal.</div>',
+            '        <div class="modal-btnrow">',
+            '          <button id="cfg-detect-models" class="modal-btn modal-btn--sm">🔄 Détecter</button>',
+            '          <a id="cfg-toggle-models" class="modal-btn modal-btn--sm" style="display:none;">☑ Tout</a>',
+            '        </div>',
+            '        <label class="modal-check"><input type="checkbox" id="cfg-models-workflow-only" /> Filtrer sur le workflow courant</label>',
+            '        <div id="modal-models-loading" class="modal-plugin-loading" style="display:none;">⏳ Scan en cours...</div>',
+            '        <div id="modal-models-empty" class="modal-plugin-empty" style="display:none;">Aucun modèle détecté.</div>',
+            '        <div id="modal-models-list" class="modal-models-list modal-list" style="display:none;"></div>',
+            '        <div class="modal-row"><span>🔄 Dernière sync modèles</span><span class="val muted" id="status-sync">⏳ Jamais</span></div>',
             '      </div>',
-            '      <div id="modal-plugins-loading" class="modal-plugin-loading" style="display:none;">⏳ Scan en cours...</div>',
-            '      <div id="modal-plugins-empty" class="modal-plugin-empty" style="display:none;">Aucun node détecté.</div>',
-            '      <div class="modal-plugin-note">ℹ️ Les changements nécessitent un <strong>redeploy</strong> (bouton 🚀 Deploy API) pour prendre effet sur Modal.</div>',
-            '    </section>',
-            '    <section id="modal-log-section" style="display:none;">',
-            '      <h3>📋 Logs</h3>',
-            '      <pre id="modal-log-output" class="modal-log-output"></pre>',
-            '    </section>',
+            '      <div class="modal-step-foot">',
+            '        <button id="cfg-save-models" class="modal-btn modal-btn--wide" disabled>💾 Enregistrer la sélection</button>',
+            '        <button id="cfg-run-sync" class="modal-btn modal-btn--primary modal-btn--wide">📥 Sync vers Modal</button>',
+            '      </div>',
+            '    </div>',
+            '  </div>',
+            '',
+            '  <div class="modal-logs" id="modal-log-section" style="display:none;">',
+            '    <div class="modal-logs-head">',
+            '      <span class="modal-logs-title">📋 Logs</span>',
+            '      <span class="modal-logs-live">en direct</span>',
+            '      <span class="modal-logs-count" id="modal-log-count">0 ligne</span>',
+            '    </div>',
+            '    <pre id="modal-log-output" class="modal-logs-body"></pre>',
             '  </div>',
             '</div>',
         ].join('\n');
@@ -1692,6 +2034,44 @@
             document.addEventListener('mouseup', onModalDragUp);
         }
 
+        // ── Barre « Connexion » repliable ────────────────────────────────
+        var prereqBar = document.getElementById('modal-prereq');
+        var prereqHead = document.getElementById('modal-prereq-head');
+        if (prereqBar && prereqHead) {
+            prereqHead.onclick = function (e) {
+                // Ne pas replier si l'utilisateur interagit avec un contrôle
+                var target = e && e.target;
+                if (target && target.closest && target.closest('input, button, a, select, textarea, label')) return;
+                prereqBar.classList.toggle('open');
+            };
+        }
+
+        /**
+         * Met à jour le résumé de la barre « Connexion » (URL + état).
+         * Appelé après le chargement de la config et après chaque sauvegarde.
+         */
+        function updatePrereqSummary() {
+            var apiUrlInput = document.getElementById('cfg-api-url');
+            var hostsInput = document.getElementById('cfg-allowed-hosts');
+            var apiSummary = document.getElementById('prereq-summary-api');
+            var stateSummary = document.getElementById('prereq-summary-state');
+
+            var url = apiUrlInput ? (apiUrlInput.value || '').trim() : '';
+            if (apiSummary) apiSummary.textContent = url || 'URL non configurée';
+
+            var hosts = (hostsInput && hostsInput.value ? hostsInput.value : '')
+                .split(',')
+                .map(function (h) { return h.trim(); })
+                .filter(function (h) { return h.length > 0; });
+
+            if (stateSummary) {
+                var parts = [];
+                parts.push(window._apiKeySet ? 'clé enregistrée' : 'sans clé');
+                parts.push(hosts.length + ' hôte' + (hosts.length > 1 ? 's' : '') + ' proxy');
+                stateSummary.textContent = parts.join(' · ') + ' — cliquer pour modifier';
+            }
+        }
+
         document.getElementById('cfg-save-connection').onclick = async function () {
             var apiUrl = document.getElementById('cfg-api-url').value.trim();
             var apiKey = document.getElementById('cfg-api-key').value.trim();
@@ -1731,6 +2111,9 @@
                     localStorage.removeItem('modal-api-key');
                 }
                 // La clé déjà enregistrée reste utilisée (localStorage).
+                updatePrereqSummary();
+                updateSecretHint();
+                refreshStatus();
                 showNotification('✅ Configuration sauvegardée', 'success');
             } catch (e) {
                 showNotification('❌ Erreur lors de la sauvegarde : ' + e.message, 'error');
@@ -1990,7 +2373,7 @@
                 }
 
                 var toggleBtn = document.getElementById('cfg-toggle-plugins');
-                toggleBtn.style.display = 'inline';
+                toggleBtn.style.display = 'inline-block';
                 toggleBtn.textContent = 'Tout sélectionner';
                 var allChecked = false;
                 toggleBtn.onclick = function () {
@@ -2119,12 +2502,12 @@
                 );
                 setTimeout(function () {
                     saveBtn.disabled = false;
-                    saveBtn.textContent = '💾 Save Plugins';
+                    saveBtn.textContent = '💾 Enregistrer la sélection';
                 }, 2000);
 
             } catch (e) {
                 saveBtn.disabled = false;
-                saveBtn.textContent = '💾 Save Plugins';
+                saveBtn.textContent = '💾 Enregistrer la sélection';
                 showNotification('❌ Erreur sauvegarde : ' + e.message, 'error');
             }
         };
@@ -2221,7 +2604,7 @@
                 }
 
                 var toggleBtn = document.getElementById('cfg-toggle-models');
-                toggleBtn.style.display = 'inline';
+                toggleBtn.style.display = 'inline-block';
                 toggleBtn.textContent = 'Tout sélectionner';
                 var allChecked = false;
                 toggleBtn.onclick = function () {
@@ -2318,17 +2701,17 @@
 
                 saveBtn.textContent = '✅ Sauvegardé';
                 showNotification(
-                    '✅ ' + modelsToSync.length + ' modèle(s) sélectionné(s) — ' + Math.round(totalMB) + ' MB. Cliquez sur Sync Models.',
+                    '✅ ' + modelsToSync.length + ' modèle(s) sélectionné(s) — ' + Math.round(totalMB) + ' MB. Cliquez sur « 📥 Sync vers Modal ».',
                     'success'
                 );
                 setTimeout(function () {
                     saveBtn.disabled = false;
-                    saveBtn.textContent = '💾 Save Selection';
+                    saveBtn.textContent = '💾 Enregistrer la sélection';
                 }, 2000);
 
             } catch (e) {
                 saveBtn.disabled = false;
-                saveBtn.textContent = '💾 Save Selection';
+                saveBtn.textContent = '💾 Enregistrer la sélection';
                 showNotification('❌ Erreur sauvegarde : ' + e.message, 'error');
             }
         };
@@ -2362,19 +2745,33 @@
             allowedHostsEl.value = config.allowed_hosts.join(', ');
         }
 
+        // Résumé de la barre « Connexion » (replié par défaut)
+        updatePrereqSummary();
+
         // Badges de date (sync / deploy / user sync)
         var syncBadge = document.getElementById('status-sync');
         if (syncBadge) {
             syncBadge.textContent = config.last_sync ? '✅ ' + config.last_sync : '⏳ Jamais';
+            syncBadge.className = 'val ' + (config.last_sync ? 'ok' : 'muted');
         }
         var deployBadge = document.getElementById('status-deploy');
         if (deployBadge) {
             deployBadge.textContent = config.last_deploy ? '✅ ' + config.last_deploy : '⏳ Jamais';
+            deployBadge.className = 'val ' + (config.last_deploy ? 'ok' : 'muted');
         }
         var userSyncBadge = document.getElementById('status-user-sync');
         if (userSyncBadge) {
             userSyncBadge.textContent = config.last_user_sync ? '✅ ' + config.last_user_sync : '⏳ Jamais';
+            userSyncBadge.className = 'val ' + (config.last_user_sync ? 'ok' : 'muted');
         }
+
+        // Badge de l'étape 2 — custom nodes déjà déployés sur Modal
+        var deployedNodes = Array.isArray(config.last_deployed_custom_nodes)
+            ? config.last_deployed_custom_nodes
+            : [];
+        setStepBadge('step2-badge', deployedNodes.length > 0,
+            deployedNodes.length + ' node' + (deployedNodes.length > 1 ? 's' : '') + ' déployé' + (deployedNodes.length > 1 ? 's' : ''),
+            'non déployé');
 
         // ─── User Settings : statut du dossier user/ local ───
         var userStatusEl = document.getElementById('status-user-settings');
@@ -2384,16 +2781,19 @@
                 .then(function (status) {
                     if (status.exists) {
                         userStatusEl.textContent = '✅ ' + status.file_count + ' fichiers (' + status.size_mb + ' MB)';
+                        userStatusEl.className = 'val ok';
                     } else {
                         userStatusEl.textContent = '❌ Non trouvé';
+                        userStatusEl.className = 'val warn';
                     }
                 })
                 .catch(function () {
                     userStatusEl.textContent = '❌ Erreur';
+                    userStatusEl.className = 'val warn';
                 });
         }
 
-        // ─── Grille de statut Modal + bandeau auth (fetch /api/modal/status) ──
+        // ─── Statuts Modal + pastilles header + bandeau auth ──────────
         refreshStatus();
 
         document.getElementById('cfg-sync-user').onclick = function() {
