@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -61,6 +62,7 @@ PROJECT_ROOT_NAME = os.path.basename(os.path.dirname(os.path.abspath(__file__)))
 EXCLUDED_NODE_NAMES = {"user", PROJECT_ROOT_NAME}
 
 # Dossiers techniques ignorés où qu'ils soient dans l'arbre d'un node.
+# Les noms sont comparés en minuscules (cf. :func:`_dir_exclusion_reason`).
 EXCLUDE_DIRS = {
     ".git",
     "__pycache__",
@@ -76,6 +78,102 @@ EXCLUDE_DIRS = {
     ".mypy_cache",
     ".pytest_cache",
     ".ruff_cache",
+    # Déjà couverts par la règle « dossier caché », listés pour l'intention.
+    ".github",
+    ".idea",
+    ".vscode",
+}
+
+# Contenu de démonstration embarqué par certains repos de nodes (captures
+# d'écran, workflows d'exemple, jeux de test, documentation) : jamais chargé au
+# runtime, mais facilement des centaines de Mo (images et vidéos de preview).
+#
+# Mesuré sur des repos réels : ComfyUI-vrgamedevgirl = 375 MB de `Workflows/`,
+# 102 MB de `LUTS/` (.cube), 17 MB d'`images/` pour ~1 MB de code réel.
+# ATTENTION : ces noms sont du contenu d'exemple dans ces repos ; l'UI d'un node
+# vit dans `web/` (ou `js/`), qui n'est jamais exclu.
+EXCLUDE_CONTENT_DIRS = {
+    "previews",
+    "preview",
+    "samples",
+    "sample",
+    "examples",
+    "example",
+    "docs",
+    "doc",
+    "test",
+    "tests",
+    "__tests__",
+    "benchmarks",
+    # Workflows d'exemple livrés avec le node (le plus gros contributeur).
+    "workflows",
+    "workflow",
+    # Tables de color grading `.cube` livrées avec les nodes vidéo/LUT.
+    "luts",
+    "lut",
+    # Images d'exemple. Compromis assumé : quelques nodes rangent leurs icônes
+    # dans `images/`. Les icônes UI sont en général dans `web/` ou à la racine
+    # (chemins non filtrés), et le garde-fou MAX_IMAGE_MB protège les cas
+    # isolés ; les dossiers restants d'images d'exemple, eux, pèsent des
+    # dizaines de Mo.
+    "images",
+    "image",
+    # Même compromis pour `assets/` : un front bundlé (Vite) peut y déposer son
+    # JS/CSS. Sans ce filtre, les assets d'exemple coûtent des centaines de Mo ;
+    # `web/` et `js/`, où vit l'UI de la grande majorité des nodes, ne sont
+    # jamais exclus.
+    "assets",
+    "screenshots",
+    "screenshot",
+    "media",
+    "videos",
+    "video",
+    "audio",
+    "sounds",
+    "fonts",
+}
+
+# Radicaux d'un nom de dossier qui trahissent du contenu même combinés à
+# d'autres mots. Les repos réels nomment rarement ces dossiers exactement comme
+# ci-dessus : ``example_workflows/`` (ComfyUI-RES4LYF, plusieurs centaines de
+# Mo), ``previews_old/``, ``workflows_v2/``… Découpage sur ``-_.`` et espace
+# (cf. :func:`_dir_name_tokens`) : on n'exclut que des mots entiers, jamais un
+# préfixe arbitraire (``image_utils`` reste du code).
+CONTENT_DIR_STEMS = {
+    "workflow",
+    "workflows",
+    "preview",
+    "previews",
+    "screenshot",
+    "screenshots",
+    "example",
+    "examples",
+    "benchmark",
+    "benchmarks",
+}
+
+# Extensions média/démo (vidéos, audio, assets 3D/Photoshop) : inutiles côté
+# Modal et souvent stockées en dizaines d'exemples de plusieurs Mo.
+# Les images restent autorisées (icônes et UI des nodes), sauf dans les
+# dossiers de :data:`EXCLUDE_CONTENT_DIRS`, élagués avant d'y arriver.
+EXCLUDE_MEDIA_EXTS = {
+    ".mp4",
+    ".webm",
+    ".mov",
+    ".avi",
+    ".mkv",
+    ".flv",
+    ".wmv",
+    ".psd",
+    ".blend",
+    ".fbx",
+    ".obj",
+    ".glb",
+    ".gltf",
+    ".wav",
+    ".mp3",
+    ".flac",
+    ".ogg",
 }
 
 # Extensions de fichiers lourds (modèles, archives, bytecode) : inutiles côté
@@ -97,12 +195,39 @@ EXCLUDE_FILE_EXTS = {
     ".7z",
     ".pyc",
     ".pyo",
+    # Contenu lourd, jamais du code : LUTs, images HDR/EXR, raws d'images.
+    ".cube",
+    ".exr",
+    ".hdr",
+    ".tiff",
+    ".tif",
+    ".bmp",
+    # Fichiers techniques résiduels (logs, sauvegardes d'éditeur/merge).
+    ".log",
+    ".tmp",
+    ".bak",
+    ".orig",
+    ".rej",
+    # Notebooks de démo et documentation bureautique.
+    ".ipynb",
+    ".pdf",
+    ".docx",
+    ".xlsx",
+    ".pptx",
+    # NOTE : `.ico` et `.json` restent autorisés — une favicon d'UI et un preset
+    # de node sont fréquemment nécessaires au runtime.
 }
 
 # Garde-fous de taille : un fichier trop gros est ignoré, une archive trop
 # grosse est refusée avant l'upload (message explicite, pas de crash).
 MAX_FILE_MB = 50
 MAX_ARCHIVE_MB = 500
+
+# Garde-fou ciblé sur les images : une icône/asset d'UI pèse < 200 Ko ; une
+# image de plus de MAX_IMAGE_MB est une capture ou un exemple, jamais un asset
+# de node. Seule la règle par taille les distingue, d'où cette liste.
+MAX_IMAGE_MB = 2
+LARGE_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 
 
 # ── Path / archive validation helpers ────────────────────────────────────
@@ -166,23 +291,28 @@ def _validate_tar_members(members, staging_dir: str) -> None:
 
 # ── Sélection des nodes / filtrage des fichiers ──────────────────────────
 
+# Raisons d'exclusion, réutilisées par les messages de progression du sync.
+_SKIP_HIDDEN = "dossier caché"
+_SKIP_TECHNICAL = "dossier technique"
+_SKIP_DEMO_DIR = "contenu de démonstration"
+_SKIP_HEAVY_FILE = "extension lourde"
+_SKIP_MEDIA_FILE = "média de démonstration"
+_SKIP_LARGE_IMAGE = "image volumineuse"
+
 
 def _node_skip_reason(name: str) -> str | None:
     """Raison d'exclure le dossier *name* de custom_nodes/, ou ``None``.
 
     Le gateway lui-même (``PROJECT_ROOT_NAME``) et ``user`` ne sont pas des
     nodes ; les dossiers cachés et techniques (``__pycache__``, ``.git``…) non
-    plus.
+    plus. Les radicaux de contenu (:data:`CONTENT_DIR_STEMS`) ne s'appliquent
+    PAS ici : un node peut légitimement s'appeler ``ComfyUI-Workflows``.
     """
     if name == PROJECT_ROOT_NAME:
         return "gateway ComfyCH (code déjà présent dans l'image)"
     if name in EXCLUDED_NODE_NAMES:
         return "données ComfyUI, pas un custom node"
-    if name.startswith("."):
-        return "dossier caché"
-    if name in EXCLUDE_DIRS:
-        return "dossier technique"
-    return None
+    return _dir_exclusion_reason(name, node_root=True)
 
 
 def _select_node_dirs(custom_nodes_dir) -> tuple[list, list]:
@@ -204,37 +334,138 @@ def _select_node_dirs(custom_nodes_dir) -> tuple[list, list]:
     return kept, skipped
 
 
+def _dir_name_tokens(lowered_name: str) -> set[str]:
+    """Mots d'un nom de dossier (découpage sur ``-``, ``_``, ``.``, espace)."""
+    return {token for token in re.split(r"[-_.\s]+", lowered_name) if token}
+
+
+def _dir_exclusion_reason(name: str, *, node_root: bool = False) -> str | None:
+    """Raison d'ignorer le dossier *name* rencontré dans l'arbre d'un node.
+
+    Retourne ``None`` si le dossier doit être archivé. La comparaison est
+    insensible à la casse : les repos écrits sous Windows/macOS utilisent
+    fréquemment ``Docs``, ``Previews`` ou ``Tests``.
+
+    *node_root* signale un dossier de premier niveau de ``custom_nodes/`` (donc
+    un nom de node) : les radicaux de :data:`CONTENT_DIR_STEMS` n'y sont pas
+    appliqués, un node pouvant s'appeler ``ComfyUI-Workflows``.
+    """
+    if name.startswith("."):
+        return _SKIP_HIDDEN
+    lowered = name.lower()
+    if lowered in EXCLUDE_DIRS:
+        return _SKIP_TECHNICAL
+    if lowered in EXCLUDE_CONTENT_DIRS:
+        return _SKIP_DEMO_DIR
+    if not node_root and _dir_name_tokens(lowered) & CONTENT_DIR_STEMS:
+        return _SKIP_DEMO_DIR
+    return None
+
+
+def _file_exclusion_reason(
+    name: str, size_bytes: int | None = None
+) -> str | None:
+    """Raison d'ignorer le fichier *name* (``None`` s'il doit être archivé).
+
+    *size_bytes* (facultatif) active le garde-fou par taille
+    (cf. :data:`MAX_IMAGE_MB`) : une image de plus de ``MAX_IMAGE_MB`` est une
+    capture ou un exemple, pas un asset d'UI. Sans taille connue, la décision
+    par nom seul fait foi (le fichier est conservé).
+    """
+    if name.startswith("."):
+        return _SKIP_HIDDEN
+    suffix = Path(name).suffix.lower()
+    if suffix in EXCLUDE_FILE_EXTS:
+        return _SKIP_HEAVY_FILE
+    if suffix in EXCLUDE_MEDIA_EXTS:
+        return _SKIP_MEDIA_FILE
+    if (
+        size_bytes is not None
+        and suffix in LARGE_IMAGE_EXTS
+        and size_bytes > MAX_IMAGE_MB * _MB
+    ):
+        return _SKIP_LARGE_IMAGE
+    return None
+
+
 def _is_excluded_dir(name: str) -> bool:
-    """True si le dossier *name* doit être ignoré (technique ou caché)."""
-    return name in EXCLUDE_DIRS or name.startswith(".")
+    """True si le dossier *name* doit être ignoré (technique, démo ou caché)."""
+    return _dir_exclusion_reason(name) is not None
 
 
 def _is_excluded_file(name: str) -> bool:
-    """True si le fichier *name* doit être ignoré (caché ou extension lourde)."""
-    if name.startswith("."):
-        return True
-    return Path(name).suffix.lower() in EXCLUDE_FILE_EXTS
+    """True si le fichier *name* doit être ignoré (caché, lourd ou média).
+
+    Vérification par nom seul : le garde-fou par taille (``MAX_IMAGE_MB``) ne
+    s'applique qu'à l'énumération, où la taille est connue.
+    """
+    return _file_exclusion_reason(name) is not None
 
 
-def _iter_node_files(node_dir):
+def _file_size(file_path) -> int | None:
+    """Taille de *file_path* en octets, ou ``None`` si elle est inaccessible."""
+    try:
+        return Path(file_path).stat().st_size
+    except OSError:
+        return None
+
+
+def _new_archive_counters() -> dict:
+    """Compteurs d'exclusion remplis pendant l'énumération d'un node."""
+    return {
+        "demo_dirs": set(),
+        "skipped_demo_dirs": 0,
+        "media_exts": set(),
+        "skipped_media": 0,
+        "image_exts": set(),
+        "skipped_large_images": 0,
+    }
+
+
+def _iter_node_files(node_dir, counters: dict | None = None):
     """Énumère ``(dossier, [fichiers retenus])`` pour *node_dir*.
 
     Les dossiers exclus sont élagués (``os.walk`` ne descend pas dedans) et les
     liens symboliques ignorés : ils seraient de toute façon rejetés à
-    l'extraction par :func:`_validate_tar_members`.
+    l'extraction par :func:`_validate_tar_members`. Les images dépassant
+    ``MAX_IMAGE_MB`` sont écartées ici, avant tout ajout au tar.
+
+    *counters* (facultatif, cf. :func:`_new_archive_counters`) est incrémenté
+    au passage pour que l'appelant puisse rapporter ce qui a été écarté.
     """
     node_dir = Path(node_dir)
     for root, dirs, filenames in os.walk(node_dir):
-        dirs[:] = sorted(
-            d for d in dirs
-            if not _is_excluded_dir(d) and not os.path.islink(os.path.join(root, d))
-        )
+        kept_dirs = []
+        for dir_name in sorted(dirs):
+            reason = _dir_exclusion_reason(dir_name)
+            if reason is not None:
+                if counters is not None and reason == _SKIP_DEMO_DIR:
+                    counters["demo_dirs"].add(dir_name)
+                    counters["skipped_demo_dirs"] += 1
+                continue
+            if os.path.islink(os.path.join(root, dir_name)):
+                continue
+            kept_dirs.append(dir_name)
+        dirs[:] = kept_dirs
+
         kept = []
         for name in sorted(filenames):
-            if _is_excluded_file(name):
-                continue
             file_path = Path(root) / name
             if file_path.is_symlink():
+                continue
+            # La taille n'est statée que pour les extensions concernées par le
+            # garde-fou MAX_IMAGE_MB : pas de stat inutile sur tout l'arbre.
+            suffix = Path(name).suffix.lower()
+            size = _file_size(file_path) if suffix in LARGE_IMAGE_EXTS else None
+            reason = _file_exclusion_reason(name, size)
+            if reason is not None:
+                if counters is not None:
+                    if reason == _SKIP_MEDIA_FILE:
+                        counters["media_exts"].add(suffix)
+                        counters["skipped_media"] += 1
+                    elif reason == _SKIP_LARGE_IMAGE:
+                        counters["image_exts"].add(suffix)
+                        counters["skipped_large_images"] += 1
                 continue
             kept.append(file_path)
         yield Path(root), kept
@@ -266,20 +497,25 @@ def _build_custom_nodes_archive(
     Les mêmes exclusions que :func:`_node_dir_size` s'appliquent, plus le
     garde-fou par fichier (``max_file_mb``) dont les rejets sont comptés.
 
-    Retourne ``{"files": n, "skipped_large": n, "size": octets}``.
+    Retourne ``{"files": n, "skipped_large": n, "size": octets}`` complété par
+    le détail des exclusions : ``skipped_demo_dirs``/``demo_dir_names``
+    (dossiers de démonstration élagués), ``skipped_media``/``media_exts``
+    (fichiers média ignorés) et ``skipped_large_images``/``image_exts``
+    (images au-delà de ``MAX_IMAGE_MB``).
     """
     import tarfile
 
     limit = max_file_mb * _MB
     files_count = 0
     skipped_large = 0
+    counters = _new_archive_counters()
 
     with tarfile.open(archive_path, mode="w:gz") as tar:
         for node_dir in node_dirs:
             node_dir = Path(node_dir)
             # Entrée racine du node, même si le dossier est vide.
             tar.add(str(node_dir), arcname=node_dir.name, recursive=False)
-            for root, files in _iter_node_files(node_dir):
+            for root, files in _iter_node_files(node_dir, counters):
                 rel_root = root.relative_to(node_dir)
                 if rel_root != Path("."):
                     tar.add(
@@ -302,6 +538,12 @@ def _build_custom_nodes_archive(
     return {
         "files": files_count,
         "skipped_large": skipped_large,
+        "skipped_demo_dirs": counters["skipped_demo_dirs"],
+        "demo_dir_names": sorted(counters["demo_dirs"]),
+        "skipped_media": counters["skipped_media"],
+        "media_exts": sorted(counters["media_exts"]),
+        "skipped_large_images": counters["skipped_large_images"],
+        "image_exts": sorted(counters["image_exts"]),
         "size": os.path.getsize(archive_path),
     }
 
@@ -325,7 +567,9 @@ def _archive_too_big_message(
     lines = [
         f"❌ Archive trop volumineuse : {_format_mb(size_bytes)} "
         f"(maximum {max_archive_mb} MB)",
-        "   Vérifiez que vos custom nodes ne contiennent pas de modèles ou de caches.",
+        "   Vérifiez que vos custom nodes ne contiennent pas de modèles ou de caches",
+        "   (ni de contenus de démonstration : previews, samples, examples, docs,",
+        "   tests, Workflows, LUTS, images, ni de vidéos ou captures d'écran).",
     ]
     ranked = list(node_sizes)[:5]
     if ranked:
@@ -347,6 +591,39 @@ def _format_node_list(names, limit: int = 10) -> str:
     if remaining > 0:
         text += f" … et {remaining} autre(s)"
     return text
+
+
+def _archive_exclusion_summary_lines(stats: dict) -> list[str]:
+    """Lignes de résumé des exclusions d'un packaging de custom nodes.
+
+    Une ligne par catégorie non vide, dans l'ordre d'affichage de ``main`` :
+    dossiers de démonstration, fichiers média, images au-delà de
+    ``MAX_IMAGE_MB``, puis fichiers au-delà de ``MAX_FILE_MB``. *stats* est le
+    dict retourné par :func:`_build_custom_nodes_archive`.
+    """
+    lines: list[str] = []
+    if stats.get("skipped_demo_dirs"):
+        demo_names = [f"{name}/" for name in stats.get("demo_dir_names", ())]
+        lines.append(
+            f"  ⊘ {_format_node_list(demo_names)} exclu(s) "
+            f"({stats['skipped_demo_dirs']} dossier(s), contenu de démonstration)"
+        )
+    if stats.get("skipped_media"):
+        exts = " ".join(stats.get("media_exts", ()))
+        lines.append(
+            f"  ⊘ {stats['skipped_media']} fichier(s) média/démo ignoré(s) ({exts})"
+        )
+    if stats.get("skipped_large_images"):
+        exts = " ".join(stats.get("image_exts", ()))
+        lines.append(
+            f"  ⊘ {stats['skipped_large_images']} image(s) > {MAX_IMAGE_MB} MB "
+            f"ignorée(s) ({exts})"
+        )
+    if stats.get("skipped_large"):
+        lines.append(
+            f"⚠️ {stats['skipped_large']} fichier(s) > {MAX_FILE_MB} MB ignoré(s)"
+        )
+    return lines
 
 # ── Read config.json for local models to sync ────────────────────────────
 
@@ -775,7 +1052,9 @@ def main(sync_custom_nodes: bool = False, sync_user_only: bool = False) -> None:
         # en cas d'archive trop volumineuse.
         node_sizes = _node_size_report(node_dirs)
         total = _format_mb(sum(size for _, size in node_sizes))
-        print(f"  → {total} de fichiers retenus (modèles, caches et binaires exclus)", flush=True)
+        print(f"  → {total} de fichiers retenus "
+              f"(modèles, caches, binaires et contenus de démonstration exclus)",
+              flush=True)
 
         # Archive écrite sur disque (jamais en RAM : plusieurs centaines de Mo).
         tmp_archive = tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False)
@@ -787,11 +1066,8 @@ def main(sync_custom_nodes: bool = False, sync_user_only: bool = False) -> None:
             stats = _build_custom_nodes_archive(node_dirs, tmp_path)
             size_bytes = stats["size"]
 
-            if stats["skipped_large"]:
-                print(
-                    f"⚠️ {stats['skipped_large']} fichier(s) > {MAX_FILE_MB} MB ignoré(s)",
-                    flush=True,
-                )
+            for line in _archive_exclusion_summary_lines(stats):
+                print(line, flush=True)
             print(f"✅ Archive créée : {_format_mb(size_bytes)}", flush=True)
 
             too_big = _archive_too_big_message(size_bytes, node_sizes)

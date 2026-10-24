@@ -8,6 +8,7 @@ Couvre :
 - le slot d'opération Modal (timeout, état exposé, libération sur slot fuité)
 - l'encadrement des logs + heartbeat (le flux SSE ne reste jamais muet)
 - le manifeste des custom nodes sur le volume (source de vérité des badges)
+- le filtrage des custom nodes (workflows/LUTS/images de démo, garde-fou images)
 
 Usage ::
 
@@ -822,6 +823,36 @@ def _test_node_exclusions():
                "dist", "build", "models", "output", "input", ".mypy_cache",
                ".pytest_cache", ".ruff_cache"]))
 
+    # Contenu lourd livré avec les nodes (mesuré : Workflows 375 MB, LUTS
+    # 102 MB, images 17 MB chez vrgamedevgirl) : jamais du code.
+    check("exclusions : dossiers de contenu exclus (workflows, luts, images…)",
+          all(sync_mod._is_excluded_dir(d) for d in
+              ["Workflows", "workflows", "workflow", "LUTS", "luts", "lut",
+               "images", "image", "assets", "screenshots", "screenshot",
+               "media", "videos", "video", "audio", "sounds", "fonts"]))
+    check("exclusions : le dossier UI `web` et le code restent inclus",
+          not any(sync_mod._is_excluded_dir(d) for d in
+                  ["web", "js", "nodes", "src", "lib", "utils",
+                   "image_utils", "assets_loader", "luts_reader", "nodes_api"]))
+    check("exclusions : dossiers de contenu composés exclus (example_workflows…)",
+          all(sync_mod._is_excluded_dir(d) for d in
+              ["example_workflows", "example_workflows2", "workflows_v2",
+               "previews_old", "my_screenshots"]))
+    check("exclusions : un node nommé « …Workflows » n'est pas éliminé",
+          sync_mod._node_skip_reason("ComfyUI-Workflows") is None
+          and sync_mod._node_skip_reason("ComfyUI-example-nodes") is None
+          and sync_mod._node_skip_reason("workflows") is not None)
+
+    content_exts = ["lut.cube", "img.exr", "img.hdr", "x.tiff", "x.tif",
+                    "x.bmp", "run.log", "x.tmp", "x.bak", "x.orig", "x.rej",
+                    "demo.ipynb", "doc.pdf", "doc.docx", "sheet.xlsx",
+                    "slides.pptx"]
+    check("exclusions : extensions de contenu lourd rejetées",
+          all(sync_mod._is_excluded_file(n) for n in content_exts))
+    check("exclusions : `.ico` et `.json` conservés (favicon d'UI, presets)",
+          not sync_mod._is_excluded_file("favicon.ico")
+          and not sync_mod._is_excluded_file("presets.json"))
+
 
 def _test_node_size_report():
     """Taille par node (fichiers retenus seulement) + top 5 décroissant."""
@@ -908,6 +939,83 @@ def _test_archive_guards():
           and sync_mod._format_node_list(["a", "b"]) == "a, b")
 
 
+# ───────────── Tests garde-fou images volumineuses / résumé des exclusions ─
+
+def _test_image_size_guard():
+    """Une image > ``MAX_IMAGE_MB`` est écartée ; une icône d'UI est gardée."""
+    import tarfile
+
+    sync_mod = _load_sync_module()
+    root = Path(tempfile.mkdtemp())
+    node = _make_node(root, "node_imgs", files=("__init__.py",))
+
+    check("images : MAX_IMAGE_MB module-level exposé",
+          sync_mod.MAX_IMAGE_MB == 2)
+    check("images : décision par nom seul → conservée (taille inconnue)",
+          sync_mod._file_exclusion_reason("shot.png") is None)
+
+    limit = sync_mod.MAX_IMAGE_MB * 1024 * 1024
+    check("images : 3 MB exclue",
+          sync_mod._file_exclusion_reason("sample.png", 3 * 1024 * 1024)
+          == sync_mod._SKIP_LARGE_IMAGE)
+    check("images : 100 Ko conservée",
+          sync_mod._file_exclusion_reason("icon.png", 100 * 1024) is None)
+    check("images : exactement MAX_IMAGE_MB conservée",
+          sync_mod._file_exclusion_reason("edge.jpg", limit) is None)
+    check("images : garde-fou limité aux images",
+          sync_mod._file_exclusion_reason("node.py", 3 * 1024 * 1024) is None)
+
+    # Bout en bout : le tar contient l'icône, pas la capture.
+    (node / "icon.png").write_bytes(b"i" * (100 * 1024))
+    (node / "shot.png").write_bytes(b"s" * (3 * 1024 * 1024))
+    archive = Path(tempfile.mkdtemp()) / "nodes.tar.gz"
+    stats = sync_mod._build_custom_nodes_archive([node], archive)
+
+    check("images : grande image comptée dans les stats",
+          stats["skipped_large_images"] == 1 and stats["image_exts"] == [".png"])
+    with tarfile.open(archive, mode="r:gz") as tar:
+        names = set(tar.getnames())
+    check("images : icône conservée, capture exclue",
+          "node_imgs/icon.png" in names and "node_imgs/shot.png" not in names)
+
+    check("résumé : nouveaux compteurs affichés",
+          sync_mod._archive_exclusion_summary_lines(stats)[-1]
+          == "  ⊘ 1 image(s) > 2 MB ignorée(s) (.png)")
+
+
+def _test_archive_summary_lines():
+    """Le résumé de packaging mentionne chaque catégorie d'exclusion."""
+    sync_mod = _load_sync_module()
+
+    check("résumé : rien à signaler → aucune ligne",
+          sync_mod._archive_exclusion_summary_lines({}) == [])
+    check("résumé : catégories vides → aucune ligne",
+          sync_mod._archive_exclusion_summary_lines(
+              {"skipped_demo_dirs": 0, "skipped_media": 0,
+               "skipped_large_images": 0, "skipped_large": 0}) == [])
+
+    lines = sync_mod._archive_exclusion_summary_lines({
+        "skipped_demo_dirs": 3,
+        "demo_dir_names": ["LUTS", "Workflows", "images"],
+        "skipped_media": 3,
+        "media_exts": [".mp4", ".psd", ".wav"],
+        "skipped_large_images": 12,
+        "image_exts": [".jpg", ".png"],
+        "skipped_large": 1,
+    })
+    check("résumé : quatre lignes (dossiers, médias, images, gros fichiers)",
+          len(lines) == 4)
+    check("résumé : dossiers de démonstration nommés",
+          lines[0] == "  ⊘ LUTS/, Workflows/, images/ exclu(s) "
+                      "(3 dossier(s), contenu de démonstration)")
+    check("résumé : médias listés avec leurs extensions",
+          lines[1] == "  ⊘ 3 fichier(s) média/démo ignoré(s) (.mp4 .psd .wav)")
+    check("résumé : images volumineuses comptées",
+          lines[2] == "  ⊘ 12 image(s) > 2 MB ignorée(s) (.jpg .png)")
+    check("résumé : fichiers > MAX_FILE_MB signalés",
+          lines[3] == f"⚠️ 1 fichier(s) > {sync_mod.MAX_FILE_MB} MB ignoré(s)")
+
+
 # ─────────────────────────── Tests extraction AST ──────────────────────────
 
 def _test_extract_class_mappings():
@@ -958,6 +1066,8 @@ def main():
     _test_safe_model_filename()
     _test_tar_member_validation()
     _test_node_exclusions()
+    _test_image_size_guard()
+    _test_archive_summary_lines()
     _test_node_size_report()
     _test_archive_guards()
     _test_extract_class_mappings()
