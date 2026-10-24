@@ -48,7 +48,8 @@ DEFAULT_CONFIG = {
     # Conservé pour compatibilité des config.json existants.
     "last_deployed_custom_nodes": [],
     # Nodes réellement présents sur le volume comfy-custom-nodes, écrits par
-    # sync.py (main → sync_custom_nodes_to_volume) après un sync réussi.
+    # sync.py (main → upload streaming → extract_custom_nodes_from_volume)
+    # après un sync réussi.
     "synced_custom_nodes": [],
     "last_sync_custom_nodes": None,
 }

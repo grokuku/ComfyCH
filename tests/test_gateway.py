@@ -506,6 +506,14 @@ def _nodes_archive(names):
     return buf.getvalue()
 
 
+def _stage_upload(root, names, archive_name="nodes.tar.gz"):
+    """Dépose une archive dans ``<root>/_upload/`` (comme le batch_upload local)."""
+    upload = Path(root) / "_upload"
+    upload.mkdir(parents=True, exist_ok=True)
+    (upload / archive_name).write_bytes(_nodes_archive(names))
+    return archive_name
+
+
 def _test_custom_nodes_manifest():
     import json as json_mod
 
@@ -516,11 +524,16 @@ def _test_custom_nodes_manifest():
     (root / "stale_file.txt").write_text("x")
     sync_mod._CUSTOM_NODES_ROOT = str(root)
 
-    result = sync_mod.sync_custom_nodes_to_volume(_nodes_archive(["node_b", "node_a"]))
+    archive_name = _stage_upload(root, ["node_b", "node_a"])
+    result = sync_mod.extract_custom_nodes_from_volume(archive_name)
     check("manifeste : sync retourne les nodes triés",
           result.get("status") == "ok" and result.get("nodes") == ["node_a", "node_b"])
     check("manifeste : ancien contenu du volume remplacé",
           not (root / "old_node").exists())
+    check("manifeste : archive temporaire + dossier _upload supprimés",
+          not (root / "_upload").exists())
+    check("manifeste : dossier _upload jamais listé comme un node",
+          "_upload" not in result.get("nodes", []))
 
     manifest = root / sync_mod.NODES_MANIFEST_NAME
     check("manifeste : fichier écrit sur le volume", manifest.is_file())
@@ -542,6 +555,25 @@ def _test_custom_nodes_manifest():
     (empty_root / sync_mod.NODES_MANIFEST_NAME).write_text("pas du json {{{ ")
     check("manifeste : corrompu → fallback vide",
           sync_mod.get_custom_nodes_manifest() == {"nodes": [], "synced_at": None})
+
+
+def _test_extract_volume_security():
+    """Nom d'archive invalide / archive absente → refus explicite."""
+    sync_mod = _load_sync_module()
+    root = Path(tempfile.mkdtemp())
+    sync_mod._CUSTOM_NODES_ROOT = str(root)
+
+    check("extraction : nom d'archive avec traversal rejeté",
+          all(_raises(sync_mod.extract_custom_nodes_from_volume, n)
+              for n in ("../evil.tar.gz", "sub/nodes.tar.gz", "a\\b.tar.gz", "", ".", "..")))
+
+    try:
+        sync_mod.extract_custom_nodes_from_volume("absent.tar.gz")
+        check("extraction : archive absente → pas d'exception", False)
+    except FileNotFoundError:
+        check("extraction : archive absente → pas d'exception", True)
+    except Exception:  # noqa: BLE001
+        check("extraction : archive absente → pas d'exception", False)
 
 
 def _test_update_local_config():
@@ -732,6 +764,150 @@ def _test_tar_member_validation():
           validate(_tar_members([directory, regular]), staging) is None)
 
 
+# ─────────────── Tests sélection des nodes / garde-fous de taille ─────────
+
+def _make_node(custom_nodes_dir, name, files=("__init__.py",)):
+    """Crée ``<custom_nodes_dir>/<name>/`` avec les fichiers relatifs *files*."""
+    node = Path(custom_nodes_dir) / name
+    node.mkdir(parents=True, exist_ok=True)
+    for rel in files:
+        target = node / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("x")
+    return node
+
+
+def _test_node_exclusions():
+    """Le gateway lui-même, ``user`` et les dossiers techniques sont exclus."""
+    sync_mod = _load_sync_module()
+    root = Path(tempfile.mkdtemp())
+
+    _make_node(root, "ComfyUI-Manager")
+    _make_node(root, "user")
+    _make_node(root, sync_mod.PROJECT_ROOT_NAME)
+    _make_node(root, ".hidden_node")
+    _make_node(root, "__pycache__")
+    _make_node(root, "node_modules")
+    (root / "config.json").write_text("{}")  # fichier, pas un node
+
+    check("exclusions : PROJECT_ROOT_NAME déduit du dossier de sync.py",
+          sync_mod.PROJECT_ROOT_NAME == PROJECT_ROOT.name)
+
+    kept, skipped = sync_mod._select_node_dirs(root)
+    kept_names = [Path(d).name for d in kept]
+    skipped_names = {name for name, _ in skipped}
+    check("exclusions : node normal conservé", kept_names == ["ComfyUI-Manager"])
+    check("exclusions : gateway ComfyCH exclu",
+          sync_mod.PROJECT_ROOT_NAME not in kept_names)
+    check("exclusions : dossier 'user' exclu", "user" not in kept_names)
+    check("exclusions : dossiers cachés et techniques exclus",
+          {".hidden_node", "__pycache__", "node_modules"}.isdisjoint(kept_names))
+    check("exclusions : chaque exclusion est motivée",
+          skipped_names == {"user", sync_mod.PROJECT_ROOT_NAME, ".hidden_node",
+                            "__pycache__", "node_modules"}
+          and all(bool(reason) for _, reason in skipped))
+
+    heavy_exts = ["model.safetensors", "w.ckpt", "x.pt", "x.pth", "x.bin",
+                  "x.gguf", "x.onnx", "x.pkl", "x.h5", "x.msgpack", "x.zip",
+                  "x.tar", "x.gz", "x.7z", "mod.pyc", "mod.pyo"]
+    check("exclusions : extensions lourdes rejetées",
+          all(sync_mod._is_excluded_file(n) for n in heavy_exts))
+    check("exclusions : fichiers de code conservés",
+          not sync_mod._is_excluded_file("__init__.py")
+          and not sync_mod._is_excluded_file("requirements.txt")
+          and not sync_mod._is_excluded_file("nodes.py"))
+    check("exclusions : dossiers techniques ignorés où qu'ils soient",
+          all(sync_mod._is_excluded_dir(d) for d in
+              ["__pycache__", ".git", "node_modules", ".venv", "venv", ".cache",
+               "dist", "build", "models", "output", "input", ".mypy_cache",
+               ".pytest_cache", ".ruff_cache"]))
+
+
+def _test_node_size_report():
+    """Taille par node (fichiers retenus seulement) + top 5 décroissant."""
+    sync_mod = _load_sync_module()
+    root = Path(tempfile.mkdtemp())
+
+    small = _make_node(root, "node_small", files=())
+    (small / "payload.dat").write_bytes(b"x" * 10)
+    mid = _make_node(root, "node_mid", files=())
+    (mid / "payload.dat").write_bytes(b"x" * 500)
+    big = _make_node(root, "node_big", files=())
+    (big / "payload.dat").write_bytes(b"x" * 3000)
+    # Ces fichiers ne doivent PAS être comptés (extension lourde / dossier exclu)
+    (big / "model.safetensors").write_bytes(b"y" * 10000)
+    (big / "models").mkdir()
+    (big / "models" / "weights.dat").write_bytes(b"z" * 20000)
+    (big / "__pycache__").mkdir()
+    (big / "__pycache__" / "junk.dat").write_bytes(b"w" * 30000)
+
+    kept, _ = sync_mod._select_node_dirs(root)
+    report = sync_mod._node_size_report(kept)
+    sizes = dict(report)
+
+    check("tailles : rapport trié décroissant",
+          [name for name, _ in report] == ["node_big", "node_mid", "node_small"])
+    check("tailles : seuls les fichiers archivés sont comptés",
+          sizes["node_big"] == 3000 and sizes["node_mid"] == 500
+          and sizes["node_small"] == 10)
+    check("tailles : _node_dir_size cohérent avec le rapport",
+          sync_mod._node_dir_size(big) == sizes["node_big"])
+
+    many = [(f"node_{i:02d}", i) for i in range(7)]
+    msg = sync_mod._archive_too_big_message(999 * 1024 * 1024, many)
+    check("tailles : top 5 seulement dans le message",
+          msg is not None and msg.count("     - ") == 5)
+
+
+def _test_archive_guards():
+    """Garde-fou par fichier et abandon propre si l'archive est trop grosse."""
+    import tarfile
+
+    sync_mod = _load_sync_module()
+    root = Path(tempfile.mkdtemp())
+    node = _make_node(root, "node_ok", files=("__init__.py", "sub/mod.py"))
+    (node / "big.bin").write_bytes(b"h" * 10)  # extension lourde → exclue
+    oversized = node / "payload.dat"
+    with open(oversized, "wb") as f:  # fichier sparse, instantané
+        f.truncate(sync_mod.MAX_FILE_MB * 1024 * 1024 + 1)
+
+    archive = Path(tempfile.mkdtemp()) / "nodes.tar.gz"
+    stats = sync_mod._build_custom_nodes_archive([node], archive)
+    check("archive : fichier > MAX_FILE_MB ignoré et compté",
+          stats["skipped_large"] == 1)
+    check("archive : taille retournée = taille du fichier",
+          stats["size"] == archive.stat().st_size and stats["size"] > 0)
+
+    with tarfile.open(archive, mode="r:gz") as tar:
+        names = set(tar.getnames())
+        members = tar.getmembers()
+    check("archive : contenu filtré (lourds exclus)",
+          {"node_ok/__init__.py", "node_ok/sub/mod.py"} <= names
+          and "node_ok/big.bin" not in names
+          and "node_ok/payload.dat" not in names)
+    check("archive : la validation de membres accepte l'archive produite",
+          sync_mod._validate_tar_members(
+              members, str(Path(tempfile.mkdtemp()) / ".staging")) is None)
+
+    heavy = sync_mod.MAX_ARCHIVE_MB * 1024 * 1024
+    msg = sync_mod._archive_too_big_message(heavy + 1, [("a", 100 * 1024 * 1024)])
+    check("garde-fou : archive au-dessus du seuil → message, pas d'exception",
+          isinstance(msg, str) and "trop volumineuse" in msg)
+    check("garde-fou : message explicite (taille + maximum)",
+          "(maximum 500 MB)" in msg)
+    check("garde-fou : conseil + nodes les plus lourds listés",
+          "modèles ou de caches" in msg and "- a : 100 MB" in msg)
+    check("garde-fou : taille à la limite → aucun message",
+          sync_mod._archive_too_big_message(heavy) is None)
+    check("garde-fou : jamais d'exception quel que soit le volume",
+          sync_mod._archive_too_big_message(10 ** 15, []) is not None)
+
+    check("résumé : liste tronquée à 10 + « et N autres »",
+          sync_mod._format_node_list([f"n{i}" for i in range(12)])
+          .endswith("… et 2 autre(s)")
+          and sync_mod._format_node_list(["a", "b"]) == "a, b")
+
+
 # ─────────────────────────── Tests extraction AST ──────────────────────────
 
 def _test_extract_class_mappings():
@@ -776,10 +952,14 @@ def main():
     asyncio.run(_test_op_log_framing())
     asyncio.run(_test_stream_heartbeat())
     _test_custom_nodes_manifest()
+    _test_extract_volume_security()
     _test_update_local_config()
     _test_sanitize_save_path()
     _test_safe_model_filename()
     _test_tar_member_validation()
+    _test_node_exclusions()
+    _test_node_size_report()
+    _test_archive_guards()
     _test_extract_class_mappings()
 
     print(f"\n{'='*50}")

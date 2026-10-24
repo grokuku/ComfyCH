@@ -42,7 +42,67 @@ NODES_MANIFEST_NAME = ".nodes_manifest.json"
 # Point de montage du volume des custom nodes (surchargeable en test).
 _CUSTOM_NODES_ROOT = "/custom_nodes"
 
+# Dossiers internes du volume (jamais considérés comme des nodes).
+_STAGING_DIR_NAME = ".staging"
+_UPLOAD_DIR_NAME = "_upload"
+
 _CACHE_ROOT = Path("/cache")
+
+_MB = 1024 * 1024
+
+# ── Filtrage / garde-fous de l'archive des custom nodes ──────────────────
+
+# Ce script EST dans le dossier du projet ComfyCH (custom_nodes/ComfyCH) : le
+# nom est donc déduit du chemin, sans constante « ComfyCH » à maintenir.
+PROJECT_ROOT_NAME = os.path.basename(os.path.dirname(os.path.abspath(__file__)))
+
+# Dossiers de custom_nodes/ qui ne sont PAS des nodes : le gateway lui-même et
+# le dossier de données ComfyUI.
+EXCLUDED_NODE_NAMES = {"user", PROJECT_ROOT_NAME}
+
+# Dossiers techniques ignorés où qu'ils soient dans l'arbre d'un node.
+EXCLUDE_DIRS = {
+    ".git",
+    "__pycache__",
+    "node_modules",
+    ".venv",
+    "venv",
+    ".cache",
+    "dist",
+    "build",
+    "models",
+    "output",
+    "input",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+}
+
+# Extensions de fichiers lourds (modèles, archives, bytecode) : inutiles côté
+# Modal et responsables d'archives de plusieurs Go.
+EXCLUDE_FILE_EXTS = {
+    ".safetensors",
+    ".ckpt",
+    ".pt",
+    ".pth",
+    ".bin",
+    ".gguf",
+    ".onnx",
+    ".pkl",
+    ".h5",
+    ".msgpack",
+    ".zip",
+    ".tar",
+    ".gz",
+    ".7z",
+    ".pyc",
+    ".pyo",
+}
+
+# Garde-fous de taille : un fichier trop gros est ignoré, une archive trop
+# grosse est refusée avant l'upload (message explicite, pas de crash).
+MAX_FILE_MB = 50
+MAX_ARCHIVE_MB = 500
 
 
 # ── Path / archive validation helpers ────────────────────────────────────
@@ -103,6 +163,190 @@ def _validate_tar_members(members, staging_dir: str) -> None:
                 f"Tar member '{member.name}' would extract outside target directory"
             )
 
+
+# ── Sélection des nodes / filtrage des fichiers ──────────────────────────
+
+
+def _node_skip_reason(name: str) -> str | None:
+    """Raison d'exclure le dossier *name* de custom_nodes/, ou ``None``.
+
+    Le gateway lui-même (``PROJECT_ROOT_NAME``) et ``user`` ne sont pas des
+    nodes ; les dossiers cachés et techniques (``__pycache__``, ``.git``…) non
+    plus.
+    """
+    if name == PROJECT_ROOT_NAME:
+        return "gateway ComfyCH (code déjà présent dans l'image)"
+    if name in EXCLUDED_NODE_NAMES:
+        return "données ComfyUI, pas un custom node"
+    if name.startswith("."):
+        return "dossier caché"
+    if name in EXCLUDE_DIRS:
+        return "dossier technique"
+    return None
+
+
+def _select_node_dirs(custom_nodes_dir) -> tuple[list, list]:
+    """Sépare les nodes retenus des dossiers exclus.
+
+    Retourne ``(node_dirs, skipped)`` où *skipped* est une liste de couples
+    ``(nom, raison)``.
+    """
+    kept: list[Path] = []
+    skipped: list[tuple[str, str]] = []
+    for entry in sorted(Path(custom_nodes_dir).iterdir()):
+        if not entry.is_dir():
+            continue
+        reason = _node_skip_reason(entry.name)
+        if reason:
+            skipped.append((entry.name, reason))
+        else:
+            kept.append(entry)
+    return kept, skipped
+
+
+def _is_excluded_dir(name: str) -> bool:
+    """True si le dossier *name* doit être ignoré (technique ou caché)."""
+    return name in EXCLUDE_DIRS or name.startswith(".")
+
+
+def _is_excluded_file(name: str) -> bool:
+    """True si le fichier *name* doit être ignoré (caché ou extension lourde)."""
+    if name.startswith("."):
+        return True
+    return Path(name).suffix.lower() in EXCLUDE_FILE_EXTS
+
+
+def _iter_node_files(node_dir):
+    """Énumère ``(dossier, [fichiers retenus])`` pour *node_dir*.
+
+    Les dossiers exclus sont élagués (``os.walk`` ne descend pas dedans) et les
+    liens symboliques ignorés : ils seraient de toute façon rejetés à
+    l'extraction par :func:`_validate_tar_members`.
+    """
+    node_dir = Path(node_dir)
+    for root, dirs, filenames in os.walk(node_dir):
+        dirs[:] = sorted(
+            d for d in dirs
+            if not _is_excluded_dir(d) and not os.path.islink(os.path.join(root, d))
+        )
+        kept = []
+        for name in sorted(filenames):
+            if _is_excluded_file(name):
+                continue
+            file_path = Path(root) / name
+            if file_path.is_symlink():
+                continue
+            kept.append(file_path)
+        yield Path(root), kept
+
+
+def _node_dir_size(node_dir) -> int:
+    """Taille (octets) des fichiers de *node_dir* réellement archivés."""
+    total = 0
+    for _root, files in _iter_node_files(node_dir):
+        for file_path in files:
+            try:
+                total += file_path.stat().st_size
+            except OSError:
+                continue
+    return total
+
+
+def _node_size_report(node_dirs) -> list[tuple[str, int]]:
+    """Tailles des nodes retenus, triées du plus lourd au plus léger."""
+    sizes = [(Path(d).name, _node_dir_size(d)) for d in node_dirs]
+    return sorted(sizes, key=lambda item: item[1], reverse=True)
+
+
+def _build_custom_nodes_archive(
+    node_dirs, archive_path, *, max_file_mb: int = MAX_FILE_MB
+) -> dict:
+    """Écrit un tar.gz des *node_dirs* dans *archive_path* (sur disque).
+
+    Les mêmes exclusions que :func:`_node_dir_size` s'appliquent, plus le
+    garde-fou par fichier (``max_file_mb``) dont les rejets sont comptés.
+
+    Retourne ``{"files": n, "skipped_large": n, "size": octets}``.
+    """
+    import tarfile
+
+    limit = max_file_mb * _MB
+    files_count = 0
+    skipped_large = 0
+
+    with tarfile.open(archive_path, mode="w:gz") as tar:
+        for node_dir in node_dirs:
+            node_dir = Path(node_dir)
+            # Entrée racine du node, même si le dossier est vide.
+            tar.add(str(node_dir), arcname=node_dir.name, recursive=False)
+            for root, files in _iter_node_files(node_dir):
+                rel_root = root.relative_to(node_dir)
+                if rel_root != Path("."):
+                    tar.add(
+                        str(root),
+                        arcname=str(Path(node_dir.name) / rel_root),
+                        recursive=False,
+                    )
+                for file_path in files:
+                    try:
+                        size = file_path.stat().st_size
+                    except OSError:
+                        continue
+                    if size > limit:
+                        skipped_large += 1
+                        continue
+                    arcname = str(Path(node_dir.name) / rel_root / file_path.name)
+                    tar.add(str(file_path), arcname=arcname)
+                    files_count += 1
+
+    return {
+        "files": files_count,
+        "skipped_large": skipped_large,
+        "size": os.path.getsize(archive_path),
+    }
+
+
+def _format_mb(size_bytes: float) -> str:
+    """Formate une taille en MB (une décimale sous 10 MB, entier au-dessus)."""
+    mb = size_bytes / _MB
+    return f"{mb:.0f} MB" if mb >= 10 else f"{mb:.1f} MB"
+
+
+def _archive_too_big_message(
+    size_bytes: int, node_sizes=(), *, max_archive_mb: int = MAX_ARCHIVE_MB
+) -> str | None:
+    """Message d'abandon si *size_bytes* dépasse la limite, sinon ``None``.
+
+    Ne lève jamais : l'appelant imprime le message et s'arrête proprement.
+    """
+    if size_bytes <= max_archive_mb * _MB:
+        return None
+
+    lines = [
+        f"❌ Archive trop volumineuse : {_format_mb(size_bytes)} "
+        f"(maximum {max_archive_mb} MB)",
+        "   Vérifiez que vos custom nodes ne contiennent pas de modèles ou de caches.",
+    ]
+    ranked = list(node_sizes)[:5]
+    if ranked:
+        lines.append("   Nodes les plus lourds :")
+        for name, node_bytes in ranked:
+            lines.append(f"     - {name} : {_format_mb(node_bytes)}")
+        lines.append(
+            f"   Total des nodes : {_format_mb(sum(b for _, b in node_sizes))}"
+        )
+    return "\n".join(lines)
+
+
+def _format_node_list(names, limit: int = 10) -> str:
+    """Résumé lisible des nodes (« a, b, … et N autre(s) »)."""
+    names = list(names)
+    shown = names[:limit]
+    text = ", ".join(shown)
+    remaining = len(names) - len(shown)
+    if remaining > 0:
+        text += f" … et {remaining} autre(s)"
+    return text
 
 # ── Read config.json for local models to sync ────────────────────────────
 
@@ -264,7 +508,69 @@ def link_model(filename: str, model_dir: str) -> dict:
     return {"ok": True, "filename": filename, "linked": True}
 
 
-# ── Remote function: sync custom nodes archive to dedicated volume ──────
+# ── Volume custom nodes : extraction / swap / manifeste ─────────────────
+
+
+def _extract_archive_to_staging(archive_path: str, staging_dir: str) -> None:
+    """Valide puis extrait l'archive tar.gz *archive_path* dans *staging_dir*.
+
+    Les liens, chemins absolus, ``..`` et échappements sont rejetés par
+    :func:`_validate_tar_members` AVANT toute écriture.
+    """
+    import shutil as _shutil
+    import tarfile
+
+    if os.path.exists(staging_dir):
+        _shutil.rmtree(staging_dir)
+    os.makedirs(staging_dir)
+
+    with tarfile.open(archive_path, mode="r:gz") as tar:
+        _validate_tar_members(tar.getmembers(), staging_dir)
+        tar.extractall(path=staging_dir)
+
+
+def _swap_volume_content(base_path: str, staging_dir: str) -> list[str]:
+    """Remplace le contenu de *base_path* par celui de *staging_dir*.
+
+    Les dossiers internes (``.staging``, ``_upload``) sont préservés. Retourne
+    la liste triée des nodes (dossiers) présents après le swap.
+    """
+    import shutil as _shutil
+
+    internal = {_STAGING_DIR_NAME, _UPLOAD_DIR_NAME}
+
+    # Suppression de l'ancien contenu (sauf dossiers internes)
+    for item in os.listdir(base_path):
+        if item in internal:
+            continue
+        item_path = os.path.join(base_path, item)
+        if os.path.isdir(item_path) and not os.path.islink(item_path):
+            _shutil.rmtree(item_path)
+        else:
+            os.remove(item_path)
+
+    for item in os.listdir(staging_dir):
+        _shutil.move(os.path.join(staging_dir, item), os.path.join(base_path, item))
+
+    _shutil.rmtree(staging_dir)
+
+    return sorted(
+        d for d in os.listdir(base_path)
+        if d not in internal
+        and not d.startswith(".")
+        and os.path.isdir(os.path.join(base_path, d))
+    )
+
+
+def _write_nodes_manifest(base_path: str, nodes: list[str]) -> None:
+    """Écrit ``.nodes_manifest.json`` : nodes RÉELLEMENT présents sur le volume.
+
+    Source de vérité des badges « déjà installé » dans l'UI (le volume, pas la
+    sélection). À écrire AVANT le ``commit()`` pour être persisté avec le swap.
+    """
+    manifest_path = os.path.join(base_path, NODES_MANIFEST_NAME)
+    with open(manifest_path, "w") as f:
+        json.dump({"nodes": nodes, "synced_at": datetime.now().isoformat()}, f, indent=2)
 
 
 @app.function(
@@ -273,62 +579,44 @@ def link_model(filename: str, model_dir: str) -> dict:
     volumes={"/custom_nodes": custom_nodes_vol},
     timeout=1800,
 )
-def sync_custom_nodes_to_volume(archive_data: bytes) -> dict:
-    """Receive a tar.gz archive of custom nodes and extract to the volume.
+def extract_custom_nodes_from_volume(archive_name: str) -> dict:
+    """Extrait sur le volume une archive tar.gz déjà uploadée (streaming).
 
-    Extraction happens in a ``.staging`` directory with path traversal
-    protection, then an atomic swap replaces the volume content.
+    L'archive est lue depuis ``/custom_nodes/_upload/<archive_name>`` : plus
+    aucun contenu binaire ne transite par un argument RPC (l'ancien transport
+    ``bytes`` faisait sérialiser plusieurs Go côté client → OOM/SIGKILL).
+
+    Même pipeline qu'avant : validation des membres, extraction en
+    ``.staging``, swap atomique, manifeste, ``commit()``. L'archive temporaire
+    et le dossier ``_upload`` sont supprimés AVANT le commit (sinon la
+    suppression ne serait pas persistée).
     """
-    import io
     import shutil as _shutil
-    import tarfile
+
+    name = str(archive_name or "")
+    if not name or name in (".", "..") or "/" in name or "\\" in name:
+        raise ValueError(f"Nom d'archive invalide : {archive_name!r}")
 
     base_path = _CUSTOM_NODES_ROOT
-    staging_dir = os.path.join(base_path, ".staging")
+    upload_dir = os.path.join(base_path, _UPLOAD_DIR_NAME)
+    archive_path = os.path.join(upload_dir, name)
+    staging_dir = os.path.join(base_path, _STAGING_DIR_NAME)
 
-    # Clean any leftover staging dir
-    if os.path.exists(staging_dir):
-        _shutil.rmtree(staging_dir)
-    os.makedirs(staging_dir)
+    if not os.path.isfile(archive_path):
+        raise FileNotFoundError(f"Archive introuvable sur le volume : {archive_path}")
 
-    # Extract to staging with path traversal protection
-    buf = io.BytesIO(archive_data)
-    with tarfile.open(fileobj=buf, mode="r:gz") as tar:
-        # Reject links, absolute paths, parent references and escapes
-        _validate_tar_members(tar.getmembers(), staging_dir)
-        # Reset buffer and extract after validation
-        buf.seek(0)
-        with tarfile.open(fileobj=buf, mode="r:gz") as tar2:
-            tar2.extractall(path=staging_dir)
+    _extract_archive_to_staging(archive_path, staging_dir)
+    nodes = _swap_volume_content(base_path, staging_dir)
 
-    # Swap: remove old content (except staging), move staging content into place
-    for item in os.listdir(base_path):
-        if item == ".staging":
-            continue
-        item_path = os.path.join(base_path, item)
-        if os.path.isdir(item_path):
-            _shutil.rmtree(item_path)
-        else:
-            os.remove(item_path)
+    # Le swap préserve ``_upload`` : on le supprime explicitement (archive
+    # consommée et éventuels restes d'un run précédent).
+    try:
+        if os.path.isdir(upload_dir):
+            _shutil.rmtree(upload_dir)
+    except OSError as e:  # noqa: BLE001 — le sync lui-même a réussi
+        print(f"⚠️ Nettoyage de {upload_dir} impossible : {e}")
 
-    for item in os.listdir(staging_dir):
-        _shutil.move(os.path.join(staging_dir, item), os.path.join(base_path, item))
-
-    # Clean up staging
-    _shutil.rmtree(staging_dir)
-
-    nodes = sorted(
-        d for d in os.listdir(base_path)
-        if os.path.isdir(os.path.join(base_path, d))
-    )
-
-    # Manifest des nodes RÉELLEMENT présents sur le volume : source de vérité
-    # des badges « déjà installé » dans l'UI (le volume, pas la sélection).
-    # Écrit AVANT le commit pour être persisté avec le reste du swap.
-    manifest_path = os.path.join(base_path, NODES_MANIFEST_NAME)
-    with open(manifest_path, "w") as f:
-        json.dump({"nodes": nodes, "synced_at": datetime.now().isoformat()}, f, indent=2)
-
+    _write_nodes_manifest(base_path, nodes)
     custom_nodes_vol.commit()
 
     return {"status": "ok", "nodes": nodes}
@@ -456,8 +744,7 @@ def main(sync_custom_nodes: bool = False, sync_user_only: bool = False) -> None:
 
     # ── Custom nodes only mode ─────────────────────────────────────────
     if sync_custom_nodes:
-        import io
-        import tarfile
+        import tempfile
 
         # NOTE : tous les ``print`` de cette branche utilisent ``flush=True``.
         # Sans flush, la sortie est bufferisée quand stdout n'est pas un TTY
@@ -472,39 +759,69 @@ def main(sync_custom_nodes: bool = False, sync_user_only: bool = False) -> None:
             print(f"❌ Custom nodes directory not found: {custom_nodes_dir}", flush=True)
             return
 
-        EXCLUDE_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv"}
-
         print(f"📦 Packaging des custom nodes depuis {custom_nodes_dir}…", flush=True)
 
-        # Dossiers retenus (mêmes règles de filtrage que la boucle ci-dessous).
-        node_dirs = [
-            d for d in sorted(custom_nodes_dir.iterdir())
-            if d.is_dir()
-            and not d.name.startswith(".")
-            and not d.name.startswith("__pycache__")
-        ]
+        # Sélection : le gateway lui-même et le dossier de données ``user`` ne
+        # sont pas des nodes ; les dossiers techniques/cachés non plus.
+        node_dirs, skipped = _select_node_dirs(custom_nodes_dir)
+        for name, reason in skipped:
+            print(f"  ⊘ {name} exclu ({reason})", flush=True)
         print(f"  → {len(node_dirs)} node(s) inclus", flush=True)
+        if not node_dirs:
+            print("❌ Aucun custom node à synchroniser", flush=True)
+            return
 
-        buf = io.BytesIO()
-        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-            for node_dir in node_dirs:
-                print(f"  + {node_dir}", flush=True)
-                for item in node_dir.rglob("*"):
-                    rel_parts = item.relative_to(node_dir).parts
-                    # Skip excluded dirs anywhere in the path and hidden dirs
-                    if any(p in EXCLUDE_DIRS or p.startswith(".") for p in rel_parts[:-1]):
-                        continue
-                    if item.is_dir() and item.name in EXCLUDE_DIRS:
-                        continue
-                    if item.is_file() and item.suffix in (".pyc", ".pyo"):
-                        continue
-                    tar.add(str(item), arcname=str(Path(node_dir.name) / item.relative_to(node_dir)))
+        # Tailles calculées AVANT le packaging : sert au résumé et au diagnostic
+        # en cas d'archive trop volumineuse.
+        node_sizes = _node_size_report(node_dirs)
+        total = _format_mb(sum(size for _, size in node_sizes))
+        print(f"  → {total} de fichiers retenus (modèles, caches et binaires exclus)", flush=True)
 
-        size_mb = buf.tell() / (1024 * 1024)
-        print(f"✅ Archive créée : {size_mb:.1f} MB", flush=True)
+        # Archive écrite sur disque (jamais en RAM : plusieurs centaines de Mo).
+        tmp_archive = tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False)
+        tmp_path = tmp_archive.name
+        tmp_archive.close()
+        archive_name = f"custom_nodes_{datetime.now().strftime('%Y%m%d_%H%M%S')}.tar.gz"
 
-        print("☁️  Envoi vers Modal (extraction + swap atomique)…", flush=True)
-        result = sync_custom_nodes_to_volume.remote(buf.getvalue())
+        try:
+            stats = _build_custom_nodes_archive(node_dirs, tmp_path)
+            size_bytes = stats["size"]
+
+            if stats["skipped_large"]:
+                print(
+                    f"⚠️ {stats['skipped_large']} fichier(s) > {MAX_FILE_MB} MB ignoré(s)",
+                    flush=True,
+                )
+            print(f"✅ Archive créée : {_format_mb(size_bytes)}", flush=True)
+
+            too_big = _archive_too_big_message(size_bytes, node_sizes)
+            if too_big:
+                print(too_big, flush=True)
+                return
+
+            names = [Path(d).name for d in node_dirs]
+            print(
+                f"📦 Archive : {_format_mb(size_bytes)} — {len(names)} node(s)\n"
+                f"   {_format_node_list(names)}",
+                flush=True,
+            )
+
+            # Upload streaming : ``batch_upload`` envoie le fichier octet par
+            # octet vers le volume. L'ancien transport passait l'archive
+            # entière en argument RPC (sérialisation de plusieurs Go → OOM /
+            # SIGKILL côté client).
+            print("☁️  Upload de l'archive vers le volume…", flush=True)
+            with custom_nodes_vol.batch_upload() as batch:
+                batch.put_file(tmp_path, f"/{_UPLOAD_DIR_NAME}/{archive_name}")
+
+            print("🔧 Extraction sur Modal…", flush=True)
+            result = extract_custom_nodes_from_volume.remote(archive_name)
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
         nodes = result.get("nodes", [])
         print(f"✅ Sync terminé : {len(nodes)} node(s) sur le volume", flush=True)
         for n in nodes:
