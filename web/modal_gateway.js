@@ -1215,6 +1215,23 @@
             '.modal-auth-warning strong {',
             '  color: #ffb3a7;',
             '}',
+            '/* Bandeau « log périmé » : reprend la palette d\'alerte ci-dessus,',
+            '   en ambre (ce n\'est pas une erreur mais un risque de confusion). */',
+            '.modal-log-stale {',
+            '  flex-shrink: 0; margin: 8px 18px 0;',
+            '  background: #4a3a1d;',
+            '  border: 1px solid #c08a2b;',
+            '  border-left: 4px solid #f0a83c;',
+            '  border-radius: 6px;',
+            '  color: #f5dfb8;',
+            '  padding: 8px 12px;',
+            '  margin-bottom: 0;',
+            '  font-size: 12px;',
+            '  line-height: 1.45;',
+            '}',
+            '.modal-log-stale strong {',
+            '  color: #ffcf8b;',
+            '}',
             '/* Logs */',
             '.modal-log-output {',
             '  background: #111; color: #0f0;',
@@ -1808,6 +1825,52 @@
     }
 
     /**
+     * Formate l'âge d'un log en texte lisible.
+     *
+     * ``< 60 s`` → « à l'instant », ``< 60 min`` → « N min »,
+     * ``< 24 h`` → « N h », au-delà → « N j ». Avec ``prefix``, on obtient la
+     * forme relative « il y a N h » (ligne d'en-tête du log).
+     * @param {*} seconds - ``age_seconds`` renvoyé par l'API (absent = '').
+     * @param {boolean} [prefix=false] - Préfixer par « il y a ».
+     * @returns {string} Texte de l'âge, ou '' si l'information manque
+     *   (ancien backend sans ``age_seconds``).
+     */
+    function formatLogAge(seconds, prefix) {
+        if (typeof seconds !== 'number' || !isFinite(seconds) || seconds < 0) return '';
+        var text;
+        if (seconds < 60) {
+            text = 'à l\'instant';
+        } else if (seconds < 3600) {
+            text = Math.floor(seconds / 60) + ' min';
+        } else if (seconds < 86400) {
+            text = Math.floor(seconds / 3600) + ' h';
+        } else {
+            text = Math.floor(seconds / 86400) + ' j';
+        }
+        if (!prefix || seconds < 60) return text;
+        return 'il y a ' + text;
+    }
+
+    /**
+     * Affiche (ou masque) le bandeau « log périmé » au-dessus du log.
+     *
+     * Un ``modal deploy`` ne démarre aucun container : sans cet avertissement,
+     * un log de 400 octets vieux de 7 h se lit comme « le nouveau code tourne ».
+     * @param {string} message - Texte du bandeau ; chaîne vide = masqué.
+     */
+    function setLogStaleWarning(message) {
+        var el = document.getElementById('modal-log-stale');
+        if (!el) return;
+        if (message) {
+            el.textContent = message;
+            el.style.display = 'block';
+        } else {
+            el.textContent = '';
+            el.style.display = 'none';
+        }
+    }
+
+    /**
      * Affiche les dernières lignes du log ComfyUI du worker Modal
      * (``GET /api/modal/worker-logs`` → ``{api_url}/logs``).
      *
@@ -1852,18 +1915,35 @@
             }
 
             var tail = Array.isArray(data.lines) ? data.lines : [];
+            var ageText = formatLogAge(data.age_seconds, true);
             var meta = '';
             if (data.path) {
                 meta = '  ' + data.path +
-                    (typeof data.size === 'number' ? ' — ' + data.size + ' octets' : '');
+                    (typeof data.size === 'number' ? ' — ' + data.size + ' octets' : '') +
+                    (ageText ? ' · dernière écriture : ' + ageText : '');
+            } else if (ageText) {
+                meta = '  dernière écriture : ' + ageText;
             }
+
+            // Péremption : plus d'une heure sans écriture = aucun container
+            // n'a démarré depuis le dernier déploiement.
+            if (typeof data.age_seconds === 'number' && data.age_seconds > 3600) {
+                setLogStaleWarning(
+                    '⚠️ Ce log date de ' + formatLogAge(data.age_seconds) +
+                    ' : aucun container n\'a redémarré depuis. Lancez une ' +
+                    'génération pour démarrer un worker avec le code actuel.'
+                );
+            } else {
+                setLogStaleWarning('');
+            }
+
             var body = tail.length ? tail.join('\n') : '(log vide)';
-            var text = warning +
+            var errorLine = data.error ? '❌ ' + data.error + '\n\n' : '';
+            var text = warning + errorLine +
                 '───── Logs worker (comfyui.log) ─────\n' +
                 (meta ? meta + '\n' : '') +
                 '────────────────────────────────────\n' +
                 body;
-            if (data.error) text += '\n⚠️ ' + data.error;
 
             logOutput.textContent = text;
             logOutput.scrollTop = logOutput.scrollHeight;
@@ -1874,6 +1954,7 @@
                 showNotification('⚠️ Logs worker : ' + data.error, 'error');
             }
         } catch (e) {
+            setLogStaleWarning('');
             logOutput.textContent = warning +
                 '❌ Logs worker indisponibles : ' + (e.message || 'erreur inconnue');
             if (logCountEl) logCountEl.textContent = '0 ligne';
@@ -2023,6 +2104,9 @@
         // `.modal-logs` est un conteneur flex (head fixe + corps scrollable).
         logSection.style.display = 'flex';
         logOutput.textContent = '';
+        // La sortie d'une opération remplace le log worker : l'avertissement
+        // de péremption ne concerne plus ce qui s'affiche.
+        setLogStaleWarning('');
         if (logCountEl) logCountEl.textContent = '0 ligne';
 
         try {
@@ -2350,6 +2434,7 @@
             '      <button id="modal-log-force-release" class="modal-btn modal-btn--sm" style="display:none;margin:0 0 0 10px;" title="Libère le verrou d\'opération sans tuer le processus Modal en cours">🔓 Forcer la libération</button>',
             '      <button id="modal-log-worker-logs" class="modal-btn modal-btn--sm" style="margin:0 0 0 10px;" title="Affiche les dernières lignes du log ComfyUI du worker Modal (tracebacks des custom nodes)">🖥️ Logs worker</button>',
             '    </div>',
+            '    <div id="modal-log-stale" class="modal-auth-warning modal-log-stale" style="display:none;" role="alert"></div>',
             '    <pre id="modal-log-output" class="modal-logs-body">─── Logs ───\nLancez une opération ou cliquez sur « 🖥️ Logs worker » pour voir les logs du worker.</pre>',
             '  </div>',
             '  <div class="modal-resize-handle" id="modal-resize-handle" title="Glisser pour agrandir la zone de logs"></div>',

@@ -18,6 +18,7 @@ import asyncio
 import contextlib
 import importlib.util
 import io
+import os
 import sys
 import tempfile
 import time
@@ -1096,13 +1097,15 @@ def _load_base_worker():
 class _FakeProc:
     """Process ComfyUI factice — aucun lancement réel."""
 
-    def __init__(self):
+    def __init__(self, exit_code=None):
         self.terminated = False
         self.killed = False
+        self.exit_code = exit_code
 
     def terminate(self): self.terminated = True
     def wait(self, timeout=None): return 0
     def kill(self): self.killed = True
+    def poll(self): return self.exit_code
 
 
 def _fake_subprocess(calls, label):
@@ -1145,16 +1148,18 @@ def _test_start_checkpoint_order():
         def _sync_user_settings_from_volume(self): calls.append("user_settings")
 
     real_subprocess, real_wait = bw.subprocess, bw.wait_for_port
-    real_log = bw.COMFY_LOG_PATH
+    real_log, real_build = bw.COMFY_LOG_PATH, bw.WORKER_BUILD_ID_PATH
     bw.subprocess = _fake_subprocess(calls, "popen")
     bw.wait_for_port = lambda port, timeout=60: calls.append(f"wait:{timeout}")
     bw.COMFY_LOG_PATH = Path(tempfile.mkdtemp()) / "comfyui.log"
+    bw.WORKER_BUILD_ID_PATH = Path(tempfile.mkdtemp()) / "worker_build_id"
     try:
         worker = W()
         worker.start_checkpoint()
     finally:
         bw.subprocess, bw.wait_for_port = real_subprocess, real_wait
         bw.COMFY_LOG_PATH = real_log
+        bw.WORKER_BUILD_ID_PATH = real_build
 
     helpers = ["link_models", "custom_nodes", "uploads", "user_settings"]
     check("start_checkpoint : les 4 helpers tournent avant Popen",
@@ -1163,6 +1168,126 @@ def _test_start_checkpoint_order():
           calls.index("popen") < calls.index("wait:300"))
     check("start_checkpoint : le process est mémorisé sur self.proc",
           isinstance(getattr(worker, "proc", None), _FakeProc))
+
+
+def _test_worker_build_id():
+    """Empreinte du code = détecteur de redéploiement (anti-snapshot périmé)."""
+    bw = _load_base_worker()
+
+    build_id = bw.WORKER_BUILD_ID
+    check("WORKER_BUILD_ID : non vide", isinstance(build_id, str) and build_id != "")
+    check("WORKER_BUILD_ID : 16 caractères hexadécimaux",
+          len(build_id) == 16 and all(c in "0123456789abcdef" for c in build_id.lower()))
+    check("WORKER_BUILD_ID : stable pour un même code",
+          bw._compute_worker_build_id() == build_id or bool(
+              os.environ.get("COMFYCH_BUILD_ID")))
+
+    # ── start_checkpoint : l'empreinte est gravée avant tout le reste ──
+    calls = []
+
+    class W(bw.ComfyWorker):
+        def _link_models_from_manifest(self):
+            calls.append("link_models")
+            written_at_first_helper.append(build_path.exists())
+        def _sync_custom_nodes_from_volume(self): return 0
+        def _restore_uploads_from_volume(self): calls.append("uploads")
+        def _sync_user_settings_from_volume(self): calls.append("user_settings")
+
+    tmp = Path(tempfile.mkdtemp())
+    build_path = tmp / "nested" / "worker_build_id"
+    written_at_first_helper: list[bool] = []
+    real = (bw.subprocess, bw.wait_for_port, bw.COMFY_LOG_PATH, bw.WORKER_BUILD_ID_PATH)
+    bw.subprocess = _fake_subprocess(calls, "popen")
+    bw.wait_for_port = lambda port, timeout=60: calls.append(f"wait:{timeout}")
+    bw.COMFY_LOG_PATH = tmp / "comfyui.log"
+    bw.WORKER_BUILD_ID_PATH = build_path
+    try:
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            W().start_checkpoint()
+        check("start_checkpoint : empreinte écrite sur le volume",
+              build_path.is_file() and build_path.read_text() == build_id)
+        check("start_checkpoint : empreinte loguée", f"build id: {build_id}" in out.getvalue())
+        check("start_checkpoint : empreinte écrite avant les helpers ("
+              "sinon un snapshot interrompu resterait non identifié)",
+              written_at_first_helper == [True])
+    finally:
+        bw.subprocess, bw.wait_for_port = real[0], real[1]
+        bw.COMFY_LOG_PATH, bw.WORKER_BUILD_ID_PATH = real[2], real[3]
+
+    # ── _launch_comfy : l'en-tête porte l'empreinte ──
+    log_path = tmp / "launch.log"
+    bw.COMFY_LOG_PATH = log_path
+    bw.subprocess = _fake_subprocess([], "popen")
+    try:
+        bw.ComfyWorker()._launch_comfy()
+    finally:
+        bw.subprocess, bw.COMFY_LOG_PATH = real[0], real[2]
+    check("_launch_comfy : build_id dans l'en-tête du log",
+          f"build_id: {build_id}" in log_path.read_text())
+
+    # ── start_restore : snapshot identique → pas de redémarrage ──
+    def _restore(snapshot_id, new_nodes=0, proc_exit_code=None):
+        calls = []
+
+        class R(bw.ComfyWorker):
+            def _link_models_from_manifest(self): calls.append("link_models")
+            def _restore_uploads_from_volume(self): calls.append("uploads")
+            def _sync_user_settings_from_volume(self): calls.append("user_settings")
+            def _sync_custom_nodes_from_volume(self):
+                calls.append("custom_nodes")
+                return new_nodes
+            def _shutdown_comfy(self, timeout=10): calls.append("shutdown")
+            def _launch_comfy(self):
+                calls.append("popen")
+                return _FakeProc(exit_code=proc_exit_code)
+
+        path = Path(tempfile.mkdtemp()) / "worker_build_id"
+        if snapshot_id is not None:
+            path.write_text(snapshot_id)
+        saved = (bw.subprocess, bw.wait_for_port, bw.COMFY_LOG_PATH, bw.WORKER_BUILD_ID_PATH)
+        bw.subprocess = _fake_subprocess(calls, "popen")
+        bw.wait_for_port = lambda port, timeout=60: calls.append(f"wait:{timeout}")
+        bw.COMFY_LOG_PATH = Path(tempfile.mkdtemp()) / "comfyui.log"
+        bw.WORKER_BUILD_ID_PATH = path
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                R().start_restore()
+        finally:
+            bw.subprocess, bw.wait_for_port = saved[0], saved[1]
+            bw.COMFY_LOG_PATH, bw.WORKER_BUILD_ID_PATH = saved[2], saved[3]
+        return calls, path, out.getvalue()
+
+    calls, path, _ = _restore(snapshot_id=build_id)
+    check("start_restore : snapshot à jour → aucun redémarrage",
+          "shutdown" not in calls and "popen" not in calls and "wait:30" in calls)
+
+    calls, path, out = _restore(snapshot_id="deadbeefdeadbeef")
+    check("start_restore : empreinte différente → process du snapshot tué",
+          "shutdown" in calls)
+    check("start_restore : empreinte différente → ComfyUI relancé par le nouveau code",
+          "popen" in calls and calls[-1] == "wait:300")
+    check("start_restore : empreinte différente → le port n'est pas testé ("
+          "il répondrait avec l'ancien ComfyUI)",
+          "wait:30" not in calls)
+    check("start_restore : empreinte réécrite après relance",
+          path.read_text() == build_id)
+    check("start_restore : redéploiement signalé dans les logs",
+          "Code du worker modifié depuis le snapshot" in out)
+
+    calls, path, out = _restore(snapshot_id=None)  # snapshot d'une version antérieure
+    check("start_restore : snapshot sans empreinte → considéré comme périmé",
+          "shutdown" in calls and "popen" in calls)
+    check("start_restore : snapshot sans empreinte → avertissement logué",
+          "snapshot=inconnu" in out)
+
+    # Process relancé mort-né (port 8000 déjà tenu par l'ancien ComfyUI du
+    # snapshot) : on ne doit surtout pas graver l'empreinte — le code qui
+    # tourne reste l'ancien.
+    calls, path, out = _restore(snapshot_id="deadbeefdeadbeef", proc_exit_code=1)
+    check("start_restore : relance morte-née → avertissement port squatté",
+          "port 8000 est probablement tenu" in out)
+    check("start_restore : relance morte-née → empreinte NON gravée",
+          not path.exists() or path.read_text() != build_id)
 
 
 def _test_custom_nodes_sync():
@@ -1221,7 +1346,7 @@ def _test_start_restore_restart():
     """Redémarrage de ComfyUI uniquement si de nouveaux nodes ont été liés."""
     bw = _load_base_worker()
 
-    def _run(new_nodes, port_ok=True):
+    def _run(new_nodes, port_ok=True, snapshot_build_id=bw.WORKER_BUILD_ID):
         calls = []
 
         class W(bw.ComfyWorker):
@@ -1239,31 +1364,36 @@ def _test_start_restore_restart():
                 raise TimeoutError("snapshot KO")
 
         real_subprocess, real_wait = bw.subprocess, bw.wait_for_port
-        real_log = bw.COMFY_LOG_PATH
+        real_log, real_build = bw.COMFY_LOG_PATH, bw.WORKER_BUILD_ID_PATH
         bw.subprocess = _fake_subprocess(calls, "popen")
         bw.wait_for_port = fake_wait
         bw.COMFY_LOG_PATH = Path(tempfile.mkdtemp()) / "comfyui.log"
+        build_path = Path(tempfile.mkdtemp()) / "worker_build_id"
+        if snapshot_build_id is not None:
+            build_path.write_text(snapshot_build_id)
+        bw.WORKER_BUILD_ID_PATH = build_path
         try:
             W().start_restore()
         finally:
             bw.subprocess, bw.wait_for_port = real_subprocess, real_wait
             bw.COMFY_LOG_PATH = real_log
-        return calls
+            bw.WORKER_BUILD_ID_PATH = real_build
+        return calls, build_path
 
-    calls = _run(new_nodes=2)
+    calls, _ = _run(new_nodes=2)
     check("start_restore : symlinks faits avant le test du port",
           calls.index("custom_nodes") < calls.index("wait:30"))
     check("start_restore : nouveaux nodes → ComfyUI arrêté", "shutdown" in calls)
     check("start_restore : nouveaux nodes → relance + attente du port",
           "popen" in calls and calls[-1] == "wait:300")
 
-    calls = _run(new_nodes=0)
+    calls, _ = _run(new_nodes=0)
     check("start_restore : aucun nouveau node → pas de redémarrage",
           "shutdown" not in calls and "popen" not in calls)
     check("start_restore : snapshot sain → pas d'attente de relance",
           "wait:300" not in calls)
 
-    calls = _run(new_nodes=0, port_ok=False)
+    calls, _ = _run(new_nodes=0, port_ok=False)
     check("start_restore : ComfyUI muet → cold restart",
           "popen" in calls and "wait:300" in calls and "shutdown" not in calls)
 
@@ -1297,6 +1427,454 @@ def _test_shutdown_comfy():
     worker.cleanup()
     check("cleanup : passe par _shutdown_comfy",
           proc.terminated and worker.proc is None)
+
+
+# ───────── Tests du chronométrage du démarrage (wait_for_port, timing) ─────
+
+class _FakeSocket:
+    """``socket.create_connection`` factice piloté par un scénario de ports."""
+    def __init__(self, fail_times):
+        self.calls = 0
+        self.fail_times = fail_times
+
+    def create_connection(self, address, timeout=None):
+        self.calls += 1
+        if self.calls <= self.fail_times:
+            raise ConnectionRefusedError("port fermé")
+        return self  # objet-contexte minimal : c'est le "succès"
+
+    def __enter__(self): return self
+    def __exit__(self, *exc): return False
+
+
+def _catch_timeout(fn):
+    """Renvoie l'exception levée par ``fn()`` (``None`` si aucune) — stdout muet."""
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            fn()
+    except BaseException as e:  # noqa: BLE001 — l'assertion vérifie le type
+        return e
+    return None
+
+
+def _test_wait_for_port():
+    """wait_for_port : durée retournée, progression loguée, TimeoutError à l'échéance."""
+    bw = _load_base_worker()
+    port = 59999  # aucun serveur réel : seuls les OSError comptent
+
+    # ── Port qui répond (monkeypatch de socket.create_connection) ──
+    real_socket, real_sleep = bw.socket, time.sleep
+    fake = _FakeSocket(fail_times=0)
+    bw.socket = types.SimpleNamespace(create_connection=fake.create_connection)
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            elapsed = bw.wait_for_port(port, timeout=5)
+    finally:
+        bw.socket = real_socket
+    check("wait_for_port : retourne un float >= 0 quand le port répond",
+          isinstance(elapsed, float) and elapsed >= 0)
+    check("wait_for_port : port joignable → un seul essai", fake.calls == 1)
+    check("wait_for_port : disponibilité loguée",
+          f"port {port} prêt" in buf.getvalue())
+
+    # ── Port muet : timeout court → TimeoutError, jamais d'attente infinie ──
+    # (timeout=1.2 s plutôt que 0.3 : la progression est logguée toutes les
+    # secondes — en dessous, aucune ligne ne peut apparaître.)
+    real_socket = bw.socket
+    bw.socket = types.SimpleNamespace(
+        create_connection=lambda address, timeout=None: (_ for _ in ()).throw(
+            ConnectionRefusedError("port fermé")
+        )
+    )
+    started = time.time()
+    try:
+        with contextlib.redirect_stdout(io.StringIO()) as buf:
+            bw.wait_for_port(port, timeout=1.2)
+        raised = None
+    except BaseException as e:  # noqa: BLE001 — on vérifie le type ensuite
+        raised = e
+    finally:
+        bw.socket = real_socket
+    check("wait_for_port : TimeoutError quand le port ne répond pas",
+          isinstance(raised, TimeoutError))
+    check("wait_for_port : timeout respecté (~1.2 s, pas 60 s)",
+          time.time() - started < 5)
+    check("wait_for_port : progression loguée pendant l'attente",
+          f"en attente du port {port}…" in buf.getvalue())
+
+    # ── Progression périodique : une ligne toutes ~0.3 s ici ──
+    real_socket = bw.socket
+    bw.socket = types.SimpleNamespace(
+        create_connection=lambda address, timeout=None: (_ for _ in ()).throw(
+            OSError("port fermé")
+        )
+    )
+    try:
+        with contextlib.redirect_stdout(io.StringIO()) as buf:
+            try:
+                bw.wait_for_port(port, timeout=1.5, progress_every=0.3)
+            except TimeoutError:
+                pass
+    finally:
+        bw.socket = real_socket
+    check("wait_for_port : progress_every borne la fréquence des lignes",
+          buf.getvalue().count("en attente du port") >= 2)
+
+    # ── timeout/progress_every dégénérés : jamais d'attente infinie ──
+    real_socket = bw.socket
+    bw.socket = types.SimpleNamespace(
+        create_connection=lambda address, timeout=None: (_ for _ in ()).throw(
+            OSError("port fermé")
+        )
+    )
+    started = time.time()
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            try:
+                bw.wait_for_port(port, timeout=0.4, progress_every=0)
+            except TimeoutError:
+                pass
+    finally:
+        bw.socket = real_socket
+    check("wait_for_port : progress_every=0 ne bloque pas ni ne divise par zéro",
+          time.time() - started < 5)
+
+    # ── wait_for_port réel (aucun fake) : socket local, échéance respectée ──
+    check("wait_for_port : TimeoutError sur un port réellement fermé",
+          isinstance(_catch_timeout(lambda: bw.wait_for_port(port, timeout=1.0)),
+                     TimeoutError))
+
+
+def _test_startup_timing_blocks():
+    """Blocs de timing : phases mesurées, mode explicite, TOTAL, log + stdout."""
+    bw = _load_base_worker()
+
+    # ── Bloc de timing isolé (append + stdout + total retourné) ──
+    tmp = Path(tempfile.mkdtemp())
+    log_path = tmp / "nested" / "comfyui.log"
+    phases = [
+        ("préparation (volumes, symlinks, deps)", 12.4),
+        ("lancement du process ComfyUI", 0.0),
+        ("attente du port 8000 (ready)", 47.3),
+    ]
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        total = bw.write_timing_block(
+            "démarrage (checkpoint)", phases,
+            mode=bw.STARTUP_MODE_CHECKPOINT, path=log_path,
+        )
+    check("write_timing_block : retourne le TOTAL", abs(total - 59.7) < 0.05)
+    written = log_path.read_text() if log_path.is_file() else ""
+    check("write_timing_block : bloc écrit dans le log (dossier créé)",
+          "timing démarrage (checkpoint)" in written)
+    check("write_timing_block : bloc dupliqué sur stdout du worker",
+          "TOTAL" in buf.getvalue() and "préparation" in buf.getvalue())
+    check("write_timing_block : phases attendues dans le bloc",
+          "préparation" in written and "attente du port 8000" in written
+          and "TOTAL" in written)
+    check("write_timing_block : mode affiché sur sa propre ligne",
+          f"mode{'':<34} : " in written and bw.STARTUP_MODE_CHECKPOINT in written)
+    check("write_timing_block : format aligné « label : 12.4s »",
+          f"  {'préparation (volumes, symlinks, deps)':<38} :  12.4s" in written)
+    check("write_timing_block : TOTAL aligné",
+          f"  {'TOTAL':<38} :  59.7s" in written)
+    check("write_timing_block : séparateur de 44 ─",
+          ("  " + "─" * 44) in written)
+
+    # Un log non inscriptible ne doit jamais faire échouer un démarrage.
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        total = bw.write_timing_block(
+            "démarrage (checkpoint)", phases, path=tmp / "comfyui.log" / "x"
+        )
+    check("write_timing_block : OSError toléré (total renvoyé, avertissement)",
+          abs(total - 59.7) < 0.05 and "timing non écrit" in buf.getvalue())
+    check("write_timing_block : phases non numériques → 0.0 (jamais d'exception)",
+          bw.write_timing_block("t", [("x", None), ("y", "boom")], path=tmp) == 0.0)
+
+    # ── start_checkpoint : 3 phases + TOTAL dans le log et sur stdout ──
+    class C(bw.ComfyWorker):
+        def _link_models_from_manifest(self): pass
+        def _sync_custom_nodes_from_volume(self): return 0
+        def _restore_uploads_from_volume(self): pass
+        def _sync_user_settings_from_volume(self): pass
+
+    checkpoint_log = Path(tempfile.mkdtemp()) / "comfyui.log"
+    real = (bw.subprocess, bw.wait_for_port, bw.COMFY_LOG_PATH, bw.WORKER_BUILD_ID_PATH)
+    bw.subprocess = _fake_subprocess([], "popen")
+    bw.wait_for_port = lambda port, timeout=60, progress_every=5.0: 1.0
+    bw.COMFY_LOG_PATH = checkpoint_log
+    bw.WORKER_BUILD_ID_PATH = Path(tempfile.mkdtemp()) / "worker_build_id"
+    try:
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            C().start_checkpoint()
+    finally:
+        bw.subprocess, bw.wait_for_port = real[0], real[1]
+        bw.COMFY_LOG_PATH, bw.WORKER_BUILD_ID_PATH = real[2], real[3]
+    block = checkpoint_log.read_text() if checkpoint_log.is_file() else ""
+    check("start_checkpoint : bloc de timing écrit dans le log",
+          "timing démarrage (checkpoint)" in block)
+    check("start_checkpoint : bloc de timing sur stdout",
+          "timing démarrage (checkpoint)" in out.getvalue())
+    check("start_checkpoint : 3 phases + TOTAL",
+          all(k in block for k in (
+              "préparation (volumes, symlinks, deps)",
+              "lancement du process ComfyUI",
+              "attente du port 8000 (ready)",
+              "TOTAL",
+          )))
+    check("start_checkpoint : attente du port mesurée via wait_for_port",
+          f"  {'attente du port 8000 (ready)':<38} :   1.0s" in block)
+    check("start_checkpoint : durée totale résumée sur stdout",
+          "Démarrage ComfyUI terminé en" in out.getvalue())
+
+    # ── start_restore : le mode retenu est explicite dans le bloc ──
+    def _restore_block(snapshot_id, port_ok=True, new_nodes=0):
+        log = Path(tempfile.mkdtemp()) / "comfyui.log"
+        build = Path(tempfile.mkdtemp()) / "worker_build_id"
+        if snapshot_id is not None:
+            build.write_text(snapshot_id)
+
+        class R(bw.ComfyWorker):
+            def _link_models_from_manifest(self): pass
+            def _restore_uploads_from_volume(self): pass
+            def _sync_user_settings_from_volume(self): pass
+            def _sync_custom_nodes_from_volume(self): return new_nodes
+            def _launch_comfy(self): return _FakeProc()
+
+        def fake_wait(port, timeout=60, progress_every=5.0):
+            if timeout == 30 and not port_ok:
+                raise TimeoutError("snapshot muet")
+            return 0.5
+
+        saved = (bw.subprocess, bw.wait_for_port, bw.COMFY_LOG_PATH, bw.WORKER_BUILD_ID_PATH)
+        bw.subprocess = _fake_subprocess([], "popen")
+        bw.wait_for_port = fake_wait
+        bw.COMFY_LOG_PATH = log
+        bw.WORKER_BUILD_ID_PATH = build
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                R().start_restore()
+        finally:
+            bw.subprocess, bw.wait_for_port = saved[0], saved[1]
+            bw.COMFY_LOG_PATH, bw.WORKER_BUILD_ID_PATH = saved[2], saved[3]
+        return (log.read_text() if log.is_file() else ""), out.getvalue()
+
+    block, out = _restore_block(bw.WORKER_BUILD_ID)
+    check("start_restore : bloc « timing restauration (snapshot) »",
+          "timing restauration (snapshot)" in block)
+    check("start_restore : snapshot réutilisé → « restauré depuis snapshot »",
+          "restauré depuis snapshot" in block)
+    check("start_restore : 4 phases mesurées + TOTAL",
+          all(k in block for k in (
+              "vérification build id",
+              "préparation (volumes, symlinks, deps)",
+              "arrêt éventuel de ComfyUI",
+              "attente/relance ComfyUI",
+              "TOTAL",
+          )))
+
+    block, _ = _restore_block("deadbeefdeadbeef")
+    check("start_restore : code modifié → « redémarrage forcé (code modifié) »",
+          "redémarrage forcé (code modifié)" in block)
+
+    block, _ = _restore_block(bw.WORKER_BUILD_ID, new_nodes=1)
+    check("start_restore : nouveaux nodes → « nouveaux custom nodes » dans le bloc",
+          "nouveaux custom nodes" in block)
+
+    block, _ = _restore_block(bw.WORKER_BUILD_ID, port_ok=False)
+    check("start_restore : port muet → « cold start » dans le bloc",
+          "cold start" in block)
+
+    # ── _timed_shutdown : le coût de l'arrêt est réellement mesuré ──
+    worker = bw.ComfyWorker()
+    worker.proc = _FakeProc()
+    check("_timed_shutdown : renvoie une durée >= 0",
+          isinstance(worker._timed_shutdown(), float) and worker.proc is None)
+    check("_timed_shutdown : sans process → 0.0",
+          bw.ComfyWorker()._timed_shutdown() == 0.0)
+
+
+# ─────────── Tests chronométrage du démarrage de ComfyUI ────────────────
+
+def _test_wait_for_port_timing():
+    """``wait_for_port`` mesure l'attente, la renvoie et logue la progression."""
+    bw = _load_base_worker()
+
+    class _Conn:
+        def __enter__(self): return self
+        def __exit__(self, *exc): return False
+
+    def _open(address, timeout=1):
+        return _Conn()
+
+    def _never(address, timeout=1):
+        raise OSError("connexion refusée")
+
+    real_socket = bw.socket
+    try:
+        # ── Port déjà ouvert : mesure ~0 s, mais bien un float >= 0 ──
+        bw.socket = SimpleNamespace(create_connection=_open)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            elapsed = bw.wait_for_port(8000, timeout=5)
+        check("wait_for_port : port ouvert → float >= 0",
+              isinstance(elapsed, float) and elapsed >= 0)
+        check("wait_for_port : port ouvert → pas d'attente artificielle",
+              elapsed < 1.0)
+        check("wait_for_port : durée loguée sur la stdout du worker",
+              "port 8000 prêt après" in out.getvalue())
+
+        # ── Port muet : TimeoutError, durée mesurée dans le message ──
+        bw.socket = SimpleNamespace(create_connection=_never)
+        started = time.time()
+        try:
+            bw.wait_for_port(8000, timeout=0.3)
+            error = None
+        except TimeoutError as e:
+            error = e
+        took = time.time() - started
+        check("wait_for_port : port muet → TimeoutError", isinstance(error, TimeoutError))
+        check("wait_for_port : port muet → message avec la durée mesurée",
+              "after " in str(error) and str(error).endswith("s"))
+        check("wait_for_port : port muet → le timeout court est respecté",
+              took < 3)
+
+        # ── Logs de progression : un démarrage long n'est pas un silence ──
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            try:
+                bw.wait_for_port(8000, timeout=0.3, progress_every=0.0)
+            except TimeoutError:
+                pass
+        check("wait_for_port : progression loguée pendant l'attente",
+              "en attente du port 8000" in out.getvalue())
+    finally:
+        bw.socket = real_socket
+
+
+def _test_startup_timing_block():
+    """Le bloc « timing » du démarrage est écrit dans le log, phases nommées."""
+    bw = _load_base_worker()
+    tmp = Path(tempfile.mkdtemp())
+    log = tmp / "comfyui.log"
+
+    class W(bw.ComfyWorker):
+        def _link_models_from_manifest(self): pass
+        def _sync_custom_nodes_from_volume(self): return 0
+        def _restore_uploads_from_volume(self): pass
+        def _sync_user_settings_from_volume(self): pass
+
+    commits = []
+    real = (bw.subprocess, bw.wait_for_port, bw.COMFY_LOG_PATH,
+            bw.WORKER_BUILD_ID_PATH, bw.commit_log_volume)
+    bw.subprocess = _fake_subprocess([], "popen")
+    bw.wait_for_port = lambda port, timeout=60: 12.5
+    bw.COMFY_LOG_PATH = log
+    bw.WORKER_BUILD_ID_PATH = tmp / "worker_build_id"
+    bw.commit_log_volume = lambda: commits.append(True)
+    try:
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            W().start_checkpoint()
+    finally:
+        (bw.subprocess, bw.wait_for_port, bw.COMFY_LOG_PATH,
+         bw.WORKER_BUILD_ID_PATH, bw.commit_log_volume) = real
+
+    body = log.read_text()
+    check("timing : bloc écrit dans le log ComfyUI",
+          "timing démarrage (checkpoint)" in body)
+    check("timing : phases nommées (préparation, lancement, attente du port)",
+          all(label in body for label in (
+              "préparation (volumes, symlinks, deps)",
+              "lancement du process ComfyUI",
+              "attente du port 8000 (ready)",
+              "TOTAL")))
+    check("timing : la phase d'attente reprend la mesure de wait_for_port",
+          bw.format_timing_line("attente du port 8000 (ready)", 12.5) in body)
+    check("timing : mode affiché (snapshot en préparation)",
+          f"mode" in body and bw.STARTUP_MODE_CHECKPOINT in body)
+    check("timing : bloc commité sur le volume dans la foulée", len(commits) >= 1)
+    check("timing : durée totale annoncée sur la stdout du worker",
+          "Démarrage ComfyUI terminé en 12.5s" in out.getvalue())
+
+    # ── Les phases sont bien ordonnées et le TOTAL est leur somme ──
+    block = [ln for ln in body.splitlines() if ln.strip()]
+    total_line = next((ln for ln in block if "TOTAL" in ln), "")
+    check("timing : TOTAL présent sous forme de durée",
+          total_line.strip().endswith("s"))
+
+
+def _test_restore_timing_mode():
+    """Le timing de restauration dit si le snapshot a servi ou non."""
+    bw = _load_base_worker()
+
+    def _run(snapshot_id, new_nodes=0, port_ok=True):
+        calls = []
+
+        class R(bw.ComfyWorker):
+            def _link_models_from_manifest(self): pass
+            def _restore_uploads_from_volume(self): pass
+            def _sync_user_settings_from_volume(self): pass
+            def _sync_custom_nodes_from_volume(self): return new_nodes
+            def _shutdown_comfy(self, timeout=10): calls.append("shutdown")
+
+        def fake_wait(port, timeout=60):
+            calls.append(f"wait:{timeout}")
+            if not port_ok and timeout == 30:
+                raise TimeoutError("port muet")
+            return 4.0 if timeout == 30 else 41.2
+
+        tmp = Path(tempfile.mkdtemp())
+        log = tmp / "comfyui.log"
+        build_path = tmp / "worker_build_id"
+        if snapshot_id is not None:
+            build_path.write_text(snapshot_id)
+        real = (bw.subprocess, bw.wait_for_port, bw.COMFY_LOG_PATH,
+                bw.WORKER_BUILD_ID_PATH)
+        bw.subprocess = _fake_subprocess(calls, "popen")
+        bw.wait_for_port = fake_wait
+        bw.COMFY_LOG_PATH = log
+        bw.WORKER_BUILD_ID_PATH = build_path
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                R().start_restore()
+        finally:
+            (bw.subprocess, bw.wait_for_port, bw.COMFY_LOG_PATH,
+             bw.WORKER_BUILD_ID_PATH) = real
+        return log.read_text(), out.getvalue()
+
+    body, out = _run(bw.WORKER_BUILD_ID)
+    check("timing restauration : toutes les phases présentes",
+          all(label in body for label in (
+              "timing restauration (snapshot)",
+              "vérification build id",
+              "arrêt éventuel de ComfyUI",
+              "préparation (volumes, symlinks, deps)",
+              "attente/relance ComfyUI",
+              "TOTAL")))
+    check("timing restauration : snapshot réutilisé → mode explicite",
+          bw.STARTUP_MODE_SNAPSHOT in body and "restauré depuis snapshot" in body)
+    check("timing restauration : snapshot → attente du port 30 s mesurée",
+          bw.format_timing_line("attente/relance ComfyUI", 4.0) in body)
+    check("timing restauration : mode aussi sur la stdout du worker",
+          f"({bw.STARTUP_MODE_SNAPSHOT})" in out)
+
+    body, out = _run("deadbeefdeadbeef")
+    check("timing restauration : code modifié → mode redémarrage",
+          bw.STARTUP_MODE_CODE_CHANGED in body)
+    check("timing restauration : redémarrage → attente de relance mesurée",
+          bw.format_timing_line("attente/relance ComfyUI", 41.2) in body)
+
+    body, _ = _run(bw.WORKER_BUILD_ID, new_nodes=2)
+    check("timing restauration : nouveaux nodes → mode redémarrage",
+          bw.STARTUP_MODE_NEW_NODES in body)
+
+    body, out = _run(bw.WORKER_BUILD_ID, port_ok=False)
+    check("timing restauration : cold start → mode explicite",
+          bw.STARTUP_MODE_COLD in body)
+    # Le cold start cumule les deux attentes : port muet (≈30 s) + relance.
+    check("timing restauration : cold start → les deux attentes comptées",
+          "attente/relance ComfyUI" in body
+          and bw.STARTUP_MODE_COLD in out)
 
 
 # ─────────── Tests capture des logs ComfyUI (diagnostic custom nodes) ──────
@@ -1462,6 +2040,12 @@ def _test_logs_tail_cli_fallback():
         check("logs_tail : log principal conservé avant le complément",
               res.get("lines", [""])[0].startswith("===== ComfyUI start")
               and res.get("size") == log.stat().st_size)
+        # Le complément comfy-cli ne doit pas écraser l'âge : seul le log
+        # principal dit quand un container a réellement démarré.
+        check("logs_tail : mtime/age_seconds du log principal conservés",
+              isinstance(res.get("mtime"), float)
+              and isinstance(res.get("age_seconds"), int)
+              and abs(res["mtime"] - log.stat().st_mtime) < 2)
 
         # Log principal exploitable → aucun complément (le log fait foi).
         big = tmp / "gros.log"
@@ -1665,6 +2249,26 @@ def _test_read_log_tail():
     check("read_log_tail : 5 dernières lignes (chemin Path)",
           res.get("lines") == [f"ligne {i}" for i in range(16, 21)])
     check("read_log_tail : taille exposée", res.get("size") == log.stat().st_size)
+
+    # Péremption : mtime/age_seconds exposés. Un ``modal deploy`` ne démarre
+    # aucun container — sans cet âge, l'UI laisse croire que le code déployé
+    # tourne alors que le log peut dater du dernier container.
+    aged = tmp / "aged.log"
+    aged.write_text("ligne figée\n")
+    fixed = time.time() - 7200
+    os.utime(aged, (fixed, fixed))
+    res = bw.read_log_tail(aged, 5)
+    check("read_log_tail : mtime exposé (epoch du fichier)",
+          isinstance(res.get("mtime"), float) and abs(res["mtime"] - fixed) < 2)
+    check("read_log_tail : age_seconds cohérent avec mtime (~2 h)",
+          isinstance(res.get("age_seconds"), int)
+          and abs(res["age_seconds"] - 7200) <= 2)
+
+    absent = bw.read_log_tail(tmp / "absent2.log", 5)
+    check("read_log_tail : fichier absent → mtime/age_seconds à None",
+          absent.get("error") == "log file not found"
+          and absent.get("mtime") is None
+          and absent.get("age_seconds") is None)
 
     big = tmp / "big.log"
     big.write_text("\n".join(f"l{i}" for i in range(1, 2501)) + "\n")
@@ -1917,7 +2521,13 @@ def main():
     _test_start_checkpoint_order()
     _test_custom_nodes_sync()
     _test_start_restore_restart()
+    _test_worker_build_id()
     _test_shutdown_comfy()
+    _test_wait_for_port()
+    _test_startup_timing_blocks()
+    _test_wait_for_port_timing()
+    _test_startup_timing_block()
+    _test_restore_timing_mode()
     _test_launch_comfy_redirect()
     _test_launch_comfy_direct()
     _test_logs_tail_cli_fallback()

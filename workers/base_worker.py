@@ -29,6 +29,7 @@ Usage (Phase 4 — ``apps/all_in_one.py``)
 from __future__ import annotations
 
 import base64
+import hashlib
 import os
 import shutil
 import socket
@@ -80,6 +81,43 @@ Au-delà de ``COMFY_LOG_MAX_BYTES``, le log est tronqué à ses derniers
 ``COMFY_LOG_KEEP_BYTES`` avant l'append du nouvel en-tête : sans cela il
 croîtrait indéfiniment sur le volume (un node bavard peut écrire des Go)."""
 
+WORKER_BUILD_ID_PATH = Path("/cache/logs/worker_build_id")
+"""Empreinte du code du worker **au moment du snapshot** (sur le volume).
+
+Un snapshot mémoire GPU fige le process ComfyUI lancé par
+``start_checkpoint``. Au redéploiement, la restauration peut réutiliser ce
+snapshot : le port 8000 répond alors — mais c'est **l'ancien** ComfyUI qui
+répond, et ``_launch_comfy`` (nouveau code) n'est jamais exécuté. Ce fichier
+permet à ``start_restore`` de comparer l'empreinte gravée dans le snapshot à
+l'empreinte du code courant (``WORKER_BUILD_ID``) et de forcer un redémarrage
+quand elles diffèrent."""
+
+
+def _compute_worker_build_id() -> str:
+    """Empreinte du code de ce fichier (16 hex) — surchargeable par l'env.
+
+    ``COMFYCH_BUILD_ID`` permet d'injecter un identifiant externe (CI) ; sinon
+    on hache ``base_worker.py`` lui-même : toute modification du worker change
+    l'empreinte, ce qui sert de détecteur de redéploiement.
+
+    Returns
+    -------
+    str
+        16 caractères hexadécimaux (ou l'identifiant d'environnement tel quel).
+    """
+    env_id = os.environ.get("COMFYCH_BUILD_ID", "").strip()
+    if env_id:
+        return env_id
+    try:
+        return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:16]
+    except OSError:
+        # Fichier illisible (rare) : on garde un identifiant stable et hex.
+        return hashlib.sha256(str(__file__).encode()).hexdigest()[:16]
+
+
+WORKER_BUILD_ID = _compute_worker_build_id()
+"""Empreinte du code **actuellement déployé** (voir ``WORKER_BUILD_ID_PATH``)."""
+
 COMFY_CLI_LOG_CANDIDATES = (
     Path("/root/comfy/ComfyUI/user/comfyui.log"),
     Path("/root/comfy/ComfyUI/comfyui.log"),
@@ -103,16 +141,200 @@ COMFY_CLI_LOG_TAIL_LINES = 300
 # ── Helpers ──────────────────────────────────────────────────────────────
 
 
-def wait_for_port(port: int, timeout: int = 60) -> None:
-    """Block until the port on ``127.0.0.1`` is accepting connections."""
-    deadline = time.time() + timeout
+TIMING_LABEL_WIDTH = 38
+"""Largeur du libellé dans les blocs de chronométrage écrits dans le log."""
+
+PORT_POLL_INTERVAL = 0.5
+"""Intervalle (s) entre deux tentatives de connexion du port dans
+``wait_for_port`` — assez court pour détecter une disponibilité rapidement,
+assez long pour ne pas marteler la boucle pendant les 5 minutes d'attente."""
+
+TIMING_VALUE_WIDTH = 5
+"""Largeur de la valeur (secondes, une décimale) dans ces blocs."""
+
+STARTUP_MODE_CHECKPOINT = "snapshot en préparation"
+"""Mode affiché dans le timing de ``start_checkpoint`` (avant capture GPU)."""
+
+STARTUP_MODE_SNAPSHOT = "restauré depuis snapshot"
+"""ComfyUI répondait déjà : le snapshot a bien été réutilisé (aucun reload)."""
+
+STARTUP_MODE_CODE_CHANGED = "redémarrage forcé, code modifié"
+"""Le snapshot portait une autre empreinte : son process ComfyUI a été tué."""
+
+STARTUP_MODE_NEW_NODES = "redémarrage forcé, nouveaux custom nodes"
+"""Des custom nodes ont été liés après la capture : il faut rescanner."""
+
+STARTUP_MODE_COLD = "redémarrage forcé, cold start (port muet)"
+"""ComfyUI ne répondait pas au bout de l'attente : relance complète."""
+
+
+class StartupTiming(dict):
+    """Chronométrage du démarrage de ComfyUI, phase par phase (dict ``label → s``).
+
+    Un simple ``dict`` suffit : il est rempli par ``start_checkpoint`` /
+    ``start_restore`` puis formaté par ``write_timing_block``. ``total`` est
+    exposé comme propriété pour ne pas polluer les phases du bloc.
+    """
+
+    @property
+    def total(self) -> float:
+        return sum(_measured_seconds(v) for v in self.values())
+
+
+def _measured_seconds(value: object, fallback: object = 0.0) -> float:
+    """Durée en float ≥ 0 ; ``fallback`` si la valeur est inutilisable.
+
+    ``wait_for_port`` renvoie sa propre mesure, mais il est monkeypatché en
+    test (certaines versions ne renvoient rien) : on ne veut alors ni planter
+    au formatage, ni afficher une durée négative (horloge du container).
+    """
+    for candidate in (value, fallback):
+        try:
+            number = float(candidate)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            continue
+        if number != number:  # NaN : ni mesurable ni affichable
+            continue
+        return max(0.0, number)
+    return 0.0
+
+
+def format_timing_line(label: str, seconds: float) -> str:
+    """Une ligne de bloc de timing : ``label`` aligné, valeur en secondes."""
+    value = _measured_seconds(seconds)
+    return (
+        f"  {label:<{TIMING_LABEL_WIDTH}} : "
+        f"{value:>{TIMING_VALUE_WIDTH}.1f}s"
+    )
+
+
+def write_timing_block(
+    title: str,
+    phases,
+    mode: str = "",
+    path: Path | str | None = None,
+) -> float:
+    """Écrit un bloc de chronométrage du démarrage ComfyUI dans le log.
+
+    Le bloc est ajouté en **append** à ``path`` (défaut ``COMFY_LOG_PATH``,
+    résolu à l'appel pour rester patchable en test) et dupliqué sur la stdout
+    du worker : le log du container Modal natif montre ainsi les mêmes
+    durées, sans attendre le commit du volume.
+
+    Parameters
+    ----------
+    title : str
+        Intitulé du bloc (``démarrage (checkpoint)``, ``restauration
+        (snapshot)``…).
+    phases : list[tuple[str, float]]
+        Phases mesurées, dans l'ordre d'exécution (libellé, secondes).
+    mode : str
+        Mode retenu (snapshot vs redémarrage forcé). Vide = ligne omise.
+    path : Path | str | None
+        Fichier de log ; ``None`` → ``COMFY_LOG_PATH`` courant.
+
+    Returns
+    -------
+    float
+        Le TOTAL en secondes (somme des phases).
+    """
+    total = sum(_measured_seconds(seconds) for _, seconds in phases)
+    lines = [f"───── timing {title} ─────"]
+    if mode:
+        lines.append(f"  {'mode':<{TIMING_LABEL_WIDTH}} : {mode}")
+    lines.extend(format_timing_line(label, seconds) for label, seconds in phases)
+    lines.append("  " + "─" * 44)
+    lines.append(format_timing_line("TOTAL", total))
+    block = "\n".join(lines) + "\n"
+
+    log_path = Path(COMFY_LOG_PATH if path is None else path)
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "a") as f:
+            f.write("\n" + block)
+            f.flush()
+    except OSError as e:
+        # Un log non inscriptible ne doit jamais faire échouer un démarrage.
+        print(f"[ComfyWorker] ⚠️ timing non écrit dans {log_path} : {e}")
+
+    # Même bloc sur la stdout du worker : visible dans les logs Modal natifs.
+    print(block.rstrip("\n"))
+    return total
+
+
+def wait_for_port(
+    port: int, timeout: int = 60, progress_every: float = 5.0
+) -> float:
+    """Block until the port on ``127.0.0.1`` is accepting connections.
+
+    Returns
+    -------
+    float
+        Durée réellement attendue, en secondes (0.0 si le port répondait
+        déjà). C'est la mesure qui alimente les blocs de timing du démarrage :
+        l'écart entre « Popen rendu la main » et « ComfyUI prêt » (chargement
+        des custom nodes, des modèles, du VAE) est le vrai coût d'un
+        redémarrage — il n'a rien à voir avec le temps de ``Popen``.
+
+    Raises
+    ------
+    TimeoutError
+        Si le port n'accepte toujours pas de connexion à l'échéance.
+    """
+    started = time.time()
+    # Budget borné : un ``timeout`` non numérique (None, 0, négatif passé par
+    # mégarde) ne doit pas produire d'attente infinie dans un ``@modal.enter``
+    # — ce serait un container qui ne démarre jamais.
+    deadline = started + _measured_seconds(timeout, 60.0)
+    # Période de progression : jamais nulle (attente sans fin / boucle serrée).
+    period = _measured_seconds(progress_every, 5.0) or 5.0
+    next_report = period
     while time.time() < deadline:
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=1):
-                return  # port is open — ComfyUI is ready
+                elapsed = _measured_seconds(time.time() - started)
+                print(f"[ComfyWorker] port {port} prêt après {elapsed:.1f}s")
+                return elapsed  # port is open — ComfyUI is ready
         except OSError:
-            time.sleep(0.5)
-    raise TimeoutError(f"ComfyUI never became ready on port {port}")
+            elapsed = time.time() - started
+            # Progression périodique : sans elle, un démarrage de plusieurs
+            # minutes est indiscernable d'un worker bloqué.
+            if elapsed >= next_report:
+                next_report += period
+                print(f"[ComfyWorker] en attente du port {port}… ({elapsed:.0f}s)")
+            # Pas de veille jamais plus long que le temps restant ni qu'une
+            # période de progression : l'échéance est respectée à ~10 ms près
+            # et une ligne de progression n'est jamais sautée par un pas trop
+            # gros. Marge de 10 ms : sur une échéance courte, on préfère un
+            # dernier essai de connexion plutôt qu'un TimeoutError anticipé.
+            remaining = deadline - time.time()
+            step = min(PORT_POLL_INTERVAL, period, max(0.01, remaining))
+            time.sleep(step)
+    elapsed = _measured_seconds(time.time() - started)
+    raise TimeoutError(
+        f"ComfyUI never became ready on port {port} after {elapsed:.1f}s"
+    )
+
+
+def log_freshness(path: Path | str) -> dict:
+    """Âge du fichier de log : ``{"mtime": float|None, "age_seconds": int|None}``.
+
+    Un ``modal deploy`` ne démarre aucun container : ils se créent à la
+    première requête. Le log affiché peut donc dater de plusieurs heures alors
+    que le code vient d'être déployé. Ces deux clés permettent à l'UI (et aux
+    clients de l'API ``/logs``) de rendre cette péremption visible au lieu de
+    laisser croire que le nouveau code tourne déjà.
+
+    ``mtime``/``age_seconds`` valent ``None`` quand le fichier est absent ou
+    illisible : l'absence d'information ne doit jamais faire échouer la lecture
+    du log.
+    """
+    try:
+        mtime = os.stat(path).st_mtime
+    except (OSError, TypeError, ValueError):  # chemin invalide, fichier absent
+        return {"mtime": None, "age_seconds": None}
+    # Horloge du container en avance sur le mtime (rare) → jamais négatif.
+    return {"mtime": mtime, "age_seconds": max(0, int(time.time() - mtime))}
 
 
 def read_log_tail(
@@ -139,14 +361,20 @@ def read_log_tail(
     Returns
     -------
     dict
-        ``{"lines": [...], "path": str, "size": int}`` ou, en cas de
-        problème, ``{"lines": [], "path": str, "error": str}``.
+        ``{"lines": [...], "path": str, "size": int, "mtime": float,
+        "age_seconds": int}`` ou, en cas de problème, ``{"lines": [],
+        "path": str, "error": str}`` avec ``mtime``/``age_seconds`` à ``None``.
     """
     log_path = Path(path)
     window = COMFY_LOG_MAX_BYTES if max_bytes is None else max_bytes
     try:
         if not log_path.is_file():
-            return {"lines": [], "path": str(log_path), "error": "log file not found"}
+            return {
+                "lines": [],
+                "path": str(log_path),
+                "error": "log file not found",
+                **log_freshness(log_path),
+            }
         size = log_path.stat().st_size
         # Lecture bornée : on ne charge que la fin du fichier (une fenêtre
         # suffit largement pour 2000 lignes) et on jette la première ligne
@@ -157,9 +385,19 @@ def read_log_tail(
                 f.readline()
             content = f.read().decode("utf-8", errors="replace")
         tail = content.splitlines()[-max(1, min(int(lines), 2000)):]
-        return {"lines": tail, "path": str(log_path), "size": size}
+        return {
+            "lines": tail,
+            "path": str(log_path),
+            "size": size,
+            **log_freshness(log_path),
+        }
     except (OSError, TypeError, ValueError) as e:
-        return {"lines": [], "path": str(log_path), "error": str(e)}
+        return {
+            "lines": [],
+            "path": str(log_path),
+            "error": str(e),
+            **log_freshness(log_path),
+        }
 
 
 def rotate_log(path: Path | str = COMFY_LOG_PATH) -> None:
@@ -219,7 +457,9 @@ def _append_cli_log_fallback(
     -------
     dict
         ``result`` inchangé, ou complété des clés ``lines`` (concaténées),
-        ``fallback_path`` et ``fallback_size``.
+        ``fallback_path`` et ``fallback_size``. ``mtime``/``age_seconds``
+        restent ceux du log **principal** (c'est lui qui dit quand un
+        container a réellement démarré, pas le log interne du wrapper).
     """
     if result.get("error"):
         return result
@@ -235,7 +475,7 @@ def _append_cli_log_fallback(
         extra = read_log_tail(candidate, lines)
         if extra.get("error") or not extra.get("lines"):
             return result
-        merged = dict(result)
+        merged = dict(result)  # mtime/age_seconds du log principal conservés
         merged["lines"] = list(result.get("lines") or []) + [
             f"───── log interne comfy-cli ({candidate}) ─────"
         ] + list(extra["lines"])
@@ -272,6 +512,39 @@ def _count_custom_node_dirs(path: Path | str | None = None) -> int:
         return sum(1 for entry in base.iterdir() if entry.is_dir())
     except OSError:
         return 0
+
+
+def read_worker_build_id(path: Path | str | None = None) -> str:
+    """Lit l'empreinte gravée dans le snapshot (``""`` si absente).
+
+    Un snapshot pris par une version antérieure ne contient pas le fichier :
+    l'absence est donc traitée comme « code inconnu », c'est-à-dire « différent
+    du code courant » → redémarrage de ComfyUI.
+    """
+    target = WORKER_BUILD_ID_PATH if path is None else Path(path)
+    try:
+        return target.read_text().strip()
+    except OSError:
+        return ""
+
+
+def write_worker_build_id(path: Path | str | None = None) -> str:
+    """Grave l'empreinte courante sur le volume (best effort).
+
+    Returns
+    -------
+    str
+        L'empreinte écrite, ou ``""`` si l'écriture a échoué (volume absent ou
+        en lecture seule : le démarrage de ComfyUI ne doit jamais en échouer).
+    """
+    target = WORKER_BUILD_ID_PATH if path is None else Path(path)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(WORKER_BUILD_ID)
+        return WORKER_BUILD_ID
+    except OSError as e:
+        print(f"[ComfyWorker] ⚠️ Empreinte non écrite dans {target} : {e}")
+        return ""
 
 
 def commit_log_volume() -> None:
@@ -327,7 +600,27 @@ class ComfyWorker:
 
         This method runs *before* the GPU snapshot is taken, so the snapshot
         captures ComfyUI in a fully-loaded state ready to serve requests.
+
+        L'empreinte du code (``WORKER_BUILD_ID``) est gravée sur le volume
+        AVANT tout le reste : c'est la trace que ``start_restore`` comparera à
+        son propre code pour détecter un redéploiement (et invalider le
+        snapshot, qui contient l'ancien process ComfyUI).
+
+        Chaque étape est chronométrée : le bloc ``timing`` écrit dans le log
+        sépare le coût de la préparation (volumes, symlinks, deps) de celui
+        du lancement (``Popen``) et de l'attente réelle de disponibilité de
+        ComfyUI (ouverture du port 8000) — c'est cette dernière qui domine.
         """
+        started_at = time.time()
+        timing = StartupTiming()
+
+        # ── 0. Graver l'empreinte du code dans le snapshot ──
+        write_worker_build_id()
+        print(f"[ComfyWorker] build id: {WORKER_BUILD_ID}")
+        # Commit explicite : l'empreinte doit être durable sur le volume, c'est
+        # elle que ``start_restore`` relira après restauration du snapshot.
+        commit_log_volume()
+
         # ── Préparer le système de fichiers AVANT de lancer ComfyUI ──
         # ComfyUI ne scanne custom_nodes/ qu'une seule fois à son démarrage :
         # tout symlink créé après le lancement est ignoré (missing_node_type).
@@ -335,9 +628,49 @@ class ComfyWorker:
         self._sync_custom_nodes_from_volume()
         self._restore_uploads_from_volume()
         self._sync_user_settings_from_volume()
+        helpers_done_at = time.time()
+        timing["préparation (volumes, symlinks, deps)"] = (
+            helpers_done_at - started_at
+        )
 
         self.proc = self._launch_comfy()
-        wait_for_port(8000, timeout=300)
+        launched_at = time.time()
+        timing["lancement du process ComfyUI"] = launched_at - helpers_done_at
+
+        # ``wait_for_port`` renvoie SA mesure : c'est le temps que ComfyUI a
+        # réellement mis à devenir joignable (import des custom nodes, modèles).
+        wait_started_at = time.time()
+        wait_seconds = wait_for_port(8000, timeout=300)
+        ready_at = time.time()
+        timing["attente du port 8000 (ready)"] = _measured_seconds(
+            wait_seconds, ready_at - wait_started_at
+        )
+
+        self._log_startup_timing(
+            "démarrage (checkpoint)", timing, STARTUP_MODE_CHECKPOINT
+        )
+
+    def _log_startup_timing(
+        self, title: str, timing: StartupTiming, mode: str = ""
+    ) -> float:
+        """Écrit le bloc de timing dans le log puis sur la stdout du worker.
+
+        Le volume est commité dans la foulée : sans cela, le timing du
+        démarrage n'apparaîtrait qu'à l'arrêt du container — c'est-à-dire trop
+        tard pour diagnostiquer un démarrage lent.
+
+        Returns
+        -------
+        float
+            Le TOTAL mesuré, en secondes.
+        """
+        total = write_timing_block(title, list(timing.items()), mode=mode)
+        print(
+            f"[ComfyWorker] Démarrage ComfyUI terminé en {total:.1f}s"
+            f" ({mode or title})"
+        )
+        commit_log_volume()
+        return total
 
     def _launch_comfy(self):
         """Lance ComfyUI headless en capturant TOUTE sa sortie dans COMFY_LOG_PATH.
@@ -364,7 +697,16 @@ class ComfyWorker:
         -------
         subprocess.Popen
             Le process ComfyUI, à mémoriser sur ``self.proc``.
+
+        Notes
+        -----
+        Le détail du lancement (préparation, ``Popen``) est mémorisé sur
+        ``self._launch_timing`` : ``start_checkpoint``/``start_restore``
+        l'incluent dans le bloc de timing pour distinguer le coût du ``fork``
+        de celui, bien plus long, du chargement de ComfyUI (visible seulement
+        via l'ouverture du port).
         """
+        launch_started = time.time()
         COMFY_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         rotate_log(COMFY_LOG_PATH)
 
@@ -375,6 +717,7 @@ class ComfyWorker:
         node_dirs = _count_custom_node_dirs()
         main_py_ok = main_py.is_file()
         version = _comfyui_version(comfy_root) if main_py_ok else "absente"
+        prepared_at = time.time()
 
         env = os.environ.copy()
         # Logs temps réel : sans ces deux variables, Python bufferise par blocs
@@ -386,6 +729,10 @@ class ComfyWorker:
             log_file.write(
                 f"\n===== ComfyUI start {datetime.now().isoformat()} =====\n"
             )
+            # L'empreinte du worker en tête du log : elle dit immédiatement
+            # QUELLE version du code a lancé ce ComfyUI (et donc si une relance
+            # a bien eu lieu après un redéploiement).
+            log_file.write(f"build_id: {WORKER_BUILD_ID}\n")
             if main_py_ok:
                 cmd: list[str] | str = [
                     sys.executable,
@@ -417,8 +764,28 @@ class ComfyWorker:
                 )
             else:
                 proc = subprocess.Popen(cmd, shell=True, **popen_kwargs)
+            popen_done_at = time.time()
         # Hors du ``with`` : le process garde son propre descripteur du fichier.
         commit_log_volume()
+
+        # ``Popen`` rend la main dès le fork : la durée mesurée ici ne dit RIEN
+        # du temps de chargement de ComfyUI (c'est ``wait_for_port`` qui le
+        # mesure). On la conserve pour montrer que le lancement n'est pas le
+        # goulot d'étranglement.
+        self._launch_timing = {
+            "préparation du lancement (rotate, diagnostics)": max(
+                0.0, prepared_at - launch_started
+            ),
+            "Popen (fork/exec)": max(0.0, popen_done_at - prepared_at),
+        }
+        print(
+            "[ComfyWorker] ComfyUI lancé (pid {}) : préparation {:.1f}s, "
+            "Popen {:.1f}s".format(
+                getattr(proc, "pid", "?"),
+                self._launch_timing["préparation du lancement (rotate, diagnostics)"],
+                self._launch_timing["Popen (fork/exec)"],
+            )
+        )
         return proc
 
     def _restore_uploads_from_volume(self):
@@ -617,36 +984,130 @@ class ComfyWorker:
         démarrage).
 
         Si ComfyUI ne répond pas (crash avant le snapshot), il est relancé.
+
+        Le port qui répond ne dit **pas** quelle version de ComfyUI écoute : un
+        snapshot GPU pris par un ancien déploiement peut être réutilisé, et son
+        process ComfyUI (ancien code) répond sur 8000. On compare donc
+        l'empreinte du code gravée dans le snapshot (``WORKER_BUILD_ID_PATH``)
+        à ``WORKER_BUILD_ID`` ; si elles diffèrent, on ne fait pas confiance au
+        port : le process restauré est tué et ComfyUI est relancé par le code
+        courant (``_launch_comfy``), ce qui recharge le nouveau code.
+
+        Le bloc ``timing`` écrit dans le log dit **quel mode** a été retenu :
+        ``restauré depuis snapshot`` (le port répondait, rien à recharger —
+        quelques secondes) ou ``redémarrage forcé (…)`` (code modifié, nouveaux
+        nodes ou cold start — c'est là que se jouent les dizaines de secondes).
         """
+        started_at = time.time()
+        timing = StartupTiming()
+
+        # ── 1. Détecter un redéploiement (empreinte du snapshot vs actuelle) ──
+        snapshot_build_id = read_worker_build_id()
+        code_changed = snapshot_build_id != WORKER_BUILD_ID
+        if code_changed:
+            print(
+                f"[ComfyWorker] ⚠️ Code du worker modifié depuis le snapshot "
+                f"(snapshot={snapshot_build_id or 'inconnu'}, actuel={WORKER_BUILD_ID}) "
+                f"— redémarrage de ComfyUI pour charger le nouveau code"
+            )
+        checked_at = time.time()
+        timing["vérification build id"] = checked_at - started_at
+
+        # ── 2. Décider si ComfyUI tourne déjà — sans se fier au port à l'aveugle ──
+        comfy_already_running = False
+        shutdown_seconds = 0.0
+        mode = STARTUP_MODE_SNAPSHOT
+        if code_changed:
+            # Le process du snapshot est l'ANCIEN code : le port répondrait,
+            # mais ce serait l'ancien ComfyUI. On l'arrête avant tout test.
+            shutdown_seconds += self._timed_shutdown()
+            mode = STARTUP_MODE_CODE_CHANGED
+        after_shutdown_at = time.time()
+
+        # ── 3. Préparer le système de fichiers AVANT tout lancement ──
         self._link_models_from_manifest()
         self._restore_uploads_from_volume()
         self._sync_user_settings_from_volume()
         new_nodes = self._sync_custom_nodes_from_volume()
+        helpers_done_at = time.time()
+        timing["préparation (volumes, symlinks, deps)"] = (
+            helpers_done_at - after_shutdown_at
+        )
 
-        comfy_already_running = False
-        try:
-            wait_for_port(8000, timeout=30)
-            comfy_already_running = True
-            print("[ComfyWorker] ComfyUI is running from snapshot")
-        except (TimeoutError, OSError):
-            print("[ComfyWorker] ComfyUI not responding after snapshot — cold restarting...")
+        # ── 4. Test du port : snapshot réutilisable, ou cold start à mesurer ──
+        snapshot_wait_seconds = 0.0
+        if not code_changed:
+            probe_started_at = time.time()
+            try:
+                snapshot_wait_seconds = _measured_seconds(
+                    wait_for_port(8000, timeout=30),
+                    time.time() - probe_started_at,
+                )
+                comfy_already_running = True
+                print("[ComfyWorker] ComfyUI is running from snapshot")
+            except (TimeoutError, OSError):
+                # Le port n'est jamais venu : ce délai fait partie du coût réel
+                # du cold start, on le compte dans « attente/relance ».
+                snapshot_wait_seconds = max(
+                    snapshot_wait_seconds, time.time() - probe_started_at
+                )
+                print("[ComfyWorker] ComfyUI not responding after snapshot — cold restarting...")
+                mode = STARTUP_MODE_COLD
 
         # ComfyUI n'a scanné custom_nodes/ qu'au moment du snapshot :
         # si de nouveaux nodes ont été synchronisés depuis, il faut le relancer.
-        if comfy_already_running and new_nodes > 0:
-            print(
-                f"[ComfyWorker] {new_nodes} nouveau(x) node(s) détecté(s) — "
-                "redémarrage de ComfyUI pour les charger"
-            )
-            self._shutdown_comfy()
+        # (En pratique le cas ``code_changed`` a déjà tué le process ci-dessus ;
+        # la condition reste pour couvrir un reliquat de snapshot.)
+        if comfy_already_running and (new_nodes > 0 or code_changed):
+            if new_nodes > 0:
+                print(
+                    f"[ComfyWorker] {new_nodes} nouveau(x) node(s) détecté(s) — "
+                    "redémarrage de ComfyUI pour les charger"
+                )
+            shutdown_seconds += self._timed_shutdown()
             comfy_already_running = False
+            mode = STARTUP_MODE_NEW_NODES
+        timing["arrêt éventuel de ComfyUI"] = shutdown_seconds
 
+        restart_wait_seconds = 0.0
         if not comfy_already_running:
             self.proc = self._launch_comfy()
-            wait_for_port(8000, timeout=300)
-            print("[ComfyWorker] ComfyUI (re)démarré — custom nodes chargés")
+            relaunch_started_at = time.time()
+            restart_wait_seconds = _measured_seconds(
+                wait_for_port(8000, timeout=300),
+                time.time() - relaunch_started_at,
+            )
+            # Garde-fou : un port qui répond ne prouve rien si le process qu'on
+            # vient de lancer est mort aussitôt (port 8000 déjà tenu par un
+            # ComfyUI du snapshot) — on servirait alors encore l'ancien code.
+            poll = getattr(self.proc, "poll", None)
+            exit_code = poll() if callable(poll) else None
+            if exit_code is not None:
+                print(
+                    f"[ComfyWorker] ⚠️ Le ComfyUI relancé est déjà sorti "
+                    f"(code {exit_code}) : le port 8000 est probablement tenu "
+                    f"par un process du snapshot (ancien code)"
+                )
+            if exit_code is None:
+                print("[ComfyWorker] ComfyUI (re)démarré — custom nodes chargés")
+                # Le code qui tourne est maintenant celui-ci : on grave
+                # l'empreinte pour que la prochaine restauration ne redémarre
+                # pas inutilement.
+                write_worker_build_id()
+                commit_log_volume()
+        timing["attente/relance ComfyUI"] = (
+            snapshot_wait_seconds + restart_wait_seconds
+        )
+
+        self._log_startup_timing("restauration (snapshot)", timing, mode)
 
         print("[ComfyWorker] App restored from snapshot!")
+
+    def _timed_shutdown(self, timeout: float = 10) -> float:
+        """``_shutdown_comfy`` chronométré — 0.0 s quand rien n'est arrêté."""
+        started_at = time.time()
+        self._shutdown_comfy(timeout=timeout)
+        return max(0.0, time.time() - started_at)
 
     def _shutdown_comfy(self, timeout: float = 10) -> None:
         """Arrête proprement le process ComfyUI (terminate, puis kill en secours)."""
@@ -898,10 +1359,12 @@ class ComfyWorker:
         Returns
         -------
         dict
-            ``{"lines": [...], "path": str, "size": int}`` ou, en cas de
-            problème, ``{"lines": [], "path": str, "error": str}``.
+            ``{"lines": [...], "path": str, "size": int, "mtime": float,
+            "age_seconds": int}`` ou, en cas de problème, ``{"lines": [],
+            "path": str, "error": str}`` (``mtime``/``age_seconds`` à ``None``).
             Clés supplémentaires ``fallback_path``/``fallback_size`` quand le
-            log interne de comfy-cli a été concaténé.
+            log interne de comfy-cli a été concaténé (``mtime``/
+            ``age_seconds`` restent ceux du log principal).
         """
         # Repli historique : lire le log via un container GPU réveille le GPU
         # (cold start 1-3 min). Le chemin principal est la fonction CPU

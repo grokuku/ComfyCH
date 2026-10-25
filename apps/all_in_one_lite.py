@@ -52,6 +52,12 @@ VOLUMES = {
     gpu=L4Worker.gpu_type,
     volumes=dict(VOLUMES),
     scaledown_window=L4Worker.scaledown_window,
+    # Snapshot mémoire : il fige le process ComfyUI lancé par start_checkpoint.
+    # Un snapshot GPU peut survivre à un redéploiement et servir l'ANCIEN code :
+    # il est donc invalidé par l'empreinte WORKER_BUILD_ID (workers/base_worker.py),
+    # qui force start_restore à tuer le process restauré et à relancer ComfyUI.
+    # En cas de comportement étrange, désactiver enable_memory_snapshot /
+    # experimental_options est le premier levier (ComfyUI redémarre alors à froid).
     enable_memory_snapshot=True,
     experimental_options={"enable_gpu_snapshot": True},
 )
@@ -63,6 +69,12 @@ class L4(L4Worker):
     gpu=L40SWorker.gpu_type,
     volumes=dict(VOLUMES),
     scaledown_window=L40SWorker.scaledown_window,
+    # Snapshot mémoire : il fige le process ComfyUI lancé par start_checkpoint.
+    # Un snapshot GPU peut survivre à un redéploiement et servir l'ANCIEN code :
+    # il est donc invalidé par l'empreinte WORKER_BUILD_ID (workers/base_worker.py),
+    # qui force start_restore à tuer le process restauré et à relancer ComfyUI.
+    # En cas de comportement étrange, désactiver enable_memory_snapshot /
+    # experimental_options est le premier levier (ComfyUI redémarre alors à froid).
     enable_memory_snapshot=True,
     experimental_options={"enable_gpu_snapshot": True},
 )
@@ -74,6 +86,12 @@ class L40S(L40SWorker):
     gpu=A100Worker.gpu_type,
     volumes=dict(VOLUMES),
     scaledown_window=A100Worker.scaledown_window,
+    # Snapshot mémoire : il fige le process ComfyUI lancé par start_checkpoint.
+    # Un snapshot GPU peut survivre à un redéploiement et servir l'ANCIEN code :
+    # il est donc invalidé par l'empreinte WORKER_BUILD_ID (workers/base_worker.py),
+    # qui force start_restore à tuer le process restauré et à relancer ComfyUI.
+    # En cas de comportement étrange, désactiver enable_memory_snapshot /
+    # experimental_options est le premier levier (ComfyUI redémarre alors à froid).
     enable_memory_snapshot=True,
     experimental_options={"enable_gpu_snapshot": True},
 )
@@ -98,6 +116,10 @@ def read_worker_logs(lines: int = 200) -> dict:
     côté extension est de 60 s). Le log est écrit par ``ComfyWorker`` dans
     ``COMFY_LOG_PATH`` (``/cache/logs/comfyui.log``) ; ce container-ci se
     contente de le lire après un ``reload()`` du volume.
+
+    Le retour de ``read_log_tail`` est renvoyé tel quel : il porte
+    ``mtime``/``age_seconds``, qui permettent au client de voir que le
+    log est périmé (aucun container n'a redémarré depuis le déploiement).
     """
     try:
         MODELS_VOLUME.reload()  # rend visibles les écritures des autres containers
