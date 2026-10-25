@@ -16,6 +16,7 @@ import modal
 import auth
 from gateway_router import build_router
 from image import image
+from workers.base_worker import COMFY_LOG_PATH, read_log_tail
 from workers.l4_worker import L4Worker
 
 app = modal.App(
@@ -24,22 +25,65 @@ app = modal.App(
     secrets=auth.get_modal_secrets(),
 )
 
+# ─── Volumes partagés ───
+
+MODELS_VOLUME = modal.Volume.from_name("comfy-models", create_if_missing=True)
+"""Volume des modèles — porte aussi le log ComfyUI (``/cache/logs/comfyui.log``).
+
+Le même volume est monté par les workers GPU **et** par la fonction CPU
+``read_worker_logs`` : c'est ce qui permet de lire les logs sans réveiller
+de GPU.
+"""
+
+VOLUMES = {
+    "/cache": MODELS_VOLUME,
+    "/user-settings": modal.Volume.from_name("comfy-user-settings", create_if_missing=True),
+    "/custom_nodes": modal.Volume.from_name("comfy-custom-nodes", create_if_missing=True),
+}
+"""Montages communs aux workers (``/cache`` = modèles + logs persistés)."""
+
+
 # ─── Déclaration du worker L4 comme classe Modal ───
 
 
 @app.cls(
     gpu=L4Worker.gpu_type,
-    volumes={
-        "/cache": modal.Volume.from_name("comfy-models", create_if_missing=True),
-        "/user-settings": modal.Volume.from_name("comfy-user-settings", create_if_missing=True),
-        "/custom_nodes": modal.Volume.from_name("comfy-custom-nodes", create_if_missing=True),
-    },
+    volumes=dict(VOLUMES),
     scaledown_window=L4Worker.scaledown_window,
     enable_memory_snapshot=True,
     experimental_options={"enable_gpu_snapshot": True},
 )
 class L4(L4Worker):
     pass
+
+
+# ─── Lecture des logs sans GPU ───
+
+
+@app.function(
+    volumes={"/cache": MODELS_VOLUME},
+    cpu=1,
+    memory=512,
+    timeout=60,
+)
+def read_worker_logs(lines: int = 200) -> dict:
+    """Lit les dernières lignes du log ComfyUI persistant sur le volume.
+
+    Fonction CPU volontairement séparée : consulter les logs ne doit PAS
+    réveiller un container GPU (cold start 1-3 min, alors que le timeout
+    côté extension est de 60 s). Le log est écrit par ``ComfyWorker`` dans
+    ``COMFY_LOG_PATH`` (``/cache/logs/comfyui.log``) ; ce container-ci se
+    contente de le lire après un ``reload()`` du volume.
+    """
+    try:
+        MODELS_VOLUME.reload()  # rend visibles les écritures des autres containers
+    except Exception:  # noqa: BLE001 — reload best effort (volume non monté)
+        pass
+
+    result = read_log_tail(COMFY_LOG_PATH, lines)
+    if result.get("error") == "log file not found":
+        result["error"] = "log file not found — le worker n'a pas encore démarré"
+    return result
 
 
 # ─── Routeur FastAPI public ───
@@ -57,6 +101,7 @@ web_app = build_router(
         "https://127.0.0.1:8188",
     ],
     title="Modal ComfyUI Gateway (L4)",
+    logs_reader=read_worker_logs,
 )
 
 

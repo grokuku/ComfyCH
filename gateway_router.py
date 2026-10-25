@@ -116,11 +116,18 @@ def build_router(
     worker_map: dict[str, type],
     cors_origins: list[str],
     title: str,
+    logs_reader=None,
 ) -> FastAPI:
     """Construit le routeur FastAPI public pour une app Modal Gateway.
 
     ``worker_map`` associe un nom de GPU (``"L4"``, ``"L40S"``…) à la classe
     Modal worker correspondante (``apps/all_in_one*.py``).
+
+    ``logs_reader`` est la **fonction CPU** de l'app qui lit le log ComfyUI
+    persisté sur le volume (``read_worker_logs``). Quand elle est fournie,
+    ``GET /logs`` l'appelle au lieu de réveiller un container GPU : un cold
+    start GPU dure 1 à 3 minutes, alors qu'un log doit s'afficher tout de
+    suite. ``None`` conserve l'ancien chemin (``worker.logs_tail``, coûteux).
     """
     web_app = FastAPI(title=title)
 
@@ -434,15 +441,22 @@ def build_router(
         nodes (tracebacks, dépendances manquantes, erreurs réseau d'un node),
         invisibles depuis le client. Le GPU est soit passé en query param
         (``?gpu=L40S``), soit déduit du dernier appel à /generate.
+
+        Le log est lu par la fonction **CPU** ``logs_reader`` quand elle est
+        fournie : aucun container GPU n'est réveillé (pas de cold start). Le
+        repli ``worker.logs_tail`` reste disponible pour les anciens déploiements.
         """
         gpu = gpu or last_gpu.get("default", "L4")
         worker_cls = worker_map.get(gpu)
         if not worker_cls:
             return JSONResponse({"error": f"Unknown GPU: {gpu}"}, status_code=400)
 
-        worker = worker_cls()
         try:
-            result = await worker.logs_tail.remote.aio(lines)
+            if logs_reader is not None:
+                result = await logs_reader.remote.aio(lines)
+            else:
+                worker = worker_cls()
+                result = await worker.logs_tail.remote.aio(lines)
         except Exception as e:
             return JSONResponse(
                 {"error": f"Worker logs unavailable: {e}"}, status_code=500

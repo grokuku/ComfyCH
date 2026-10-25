@@ -49,12 +49,28 @@ CUSTOM_NODES_VOLUME_PATH = Path("/custom_nodes")
 COMFY_CUSTOM_NODES_DIR = Path("/root/comfy/ComfyUI/custom_nodes")
 """Dossier scanné par ComfyUI — une seule fois, à son démarrage."""
 
-COMFY_LOG_PATH = Path("/tmp/comfyui.log")
-"""Sortie stdout/stderr de ComfyUI (tracebacks des custom nodes inclus)."""
+COMFY_LOG_PATH = Path("/cache/logs/comfyui.log")
+"""Sortie stdout/stderr de ComfyUI (tracebacks des custom nodes inclus).
+
+Écrit sur le volume ``comfy-models`` (monté en ``/cache`` par les 3 apps) et
+non dans ``/tmp`` : le log survit à l'arrêt du container et reste lisible par
+une **fonction CPU** (``read_worker_logs`` des apps ``all_in_one*``) sans
+réveiller de GPU — un cold start GPU prend 1 à 3 minutes, alors que consulter
+ses logs doit être instantané."""
+
+COMFY_LOG_VOLUME_NAME = "comfy-models"
+"""Volume Modal qui porte ``COMFY_LOG_PATH`` (monté en ``/cache``)."""
 
 COMFY_LOG_MAX_BYTES = 2 * 1024 * 1024
 """Fenêtre de lecture de ``logs_tail`` (2 Mio) — un node bavard ne doit pas
 faire charger des centaines de Mo en mémoire au worker."""
+
+COMFY_LOG_KEEP_BYTES = 512 * 1024
+"""Portion conservée lors de la rotation au démarrage (512 Kio).
+
+Au-delà de ``COMFY_LOG_MAX_BYTES``, le log est tronqué à ses derniers
+``COMFY_LOG_KEEP_BYTES`` avant l'append du nouvel en-tête : sans cela il
+croîtrait indéfiniment sur le volume (un node bavard peut écrire des Go)."""
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -70,6 +86,91 @@ def wait_for_port(port: int, timeout: int = 60) -> None:
         except OSError:
             time.sleep(0.5)
     raise TimeoutError(f"ComfyUI never became ready on port {port}")
+
+
+def read_log_tail(
+    path: Path | str = COMFY_LOG_PATH,
+    lines: int = 200,
+    max_bytes: int | None = None,
+) -> dict:
+    """Lit les dernières lignes d'un log ComfyUI en bornant la lecture.
+
+    Fonction pure (aucun accès réseau, aucun accès à l'instance du worker) :
+    elle est partagée par ``ComfyWorker.logs_tail`` (repli côté GPU) et par les
+    fonctions CPU ``read_worker_logs`` des apps — les deux chemins doivent
+    renvoyer exactement le même format.
+
+    Parameters
+    ----------
+    path : Path | str
+        Fichier à lire (par défaut ``COMFY_LOG_PATH``, sur le volume).
+    lines : int
+        Nombre de lignes demandées (borné à 2000, minimum 1).
+    max_bytes : int | None
+        Fenêtre de lecture (défaut ``COMFY_LOG_MAX_BYTES``).
+
+    Returns
+    -------
+    dict
+        ``{"lines": [...], "path": str, "size": int}`` ou, en cas de
+        problème, ``{"lines": [], "path": str, "error": str}``.
+    """
+    log_path = Path(path)
+    window = COMFY_LOG_MAX_BYTES if max_bytes is None else max_bytes
+    try:
+        if not log_path.is_file():
+            return {"lines": [], "path": str(log_path), "error": "log file not found"}
+        size = log_path.stat().st_size
+        # Lecture bornée : on ne charge que la fin du fichier (une fenêtre
+        # suffit largement pour 2000 lignes) et on jette la première ligne
+        # si elle est probablement coupée par le seek.
+        with open(log_path, "rb") as f:
+            if size > window:
+                f.seek(size - window)
+                f.readline()
+            content = f.read().decode("utf-8", errors="replace")
+        tail = content.splitlines()[-max(1, min(int(lines), 2000)):]
+        return {"lines": tail, "path": str(log_path), "size": size}
+    except (OSError, TypeError, ValueError) as e:
+        return {"lines": [], "path": str(log_path), "error": str(e)}
+
+
+def rotate_log(path: Path | str = COMFY_LOG_PATH) -> None:
+    """Tronque *path* à ses derniers ``COMFY_LOG_KEEP_BYTES`` s'il est trop gros.
+
+    Appelée au lancement de ComfyUI : le log vit sur un volume persistant, il
+    ne doit donc pas grossir sans fin. Best effort — une erreur d'E/S
+    n'empêche pas le démarrage (le pire cas est un log un peu plus long).
+    """
+    log_path = Path(path)
+    try:
+        size = log_path.stat().st_size
+        if size <= COMFY_LOG_MAX_BYTES:
+            return
+        with open(log_path, "rb") as f:
+            f.seek(size - COMFY_LOG_KEEP_BYTES)
+            kept = f.read().split(b"\n", 1)
+        # On jette la première ligne : probablement coupée par le seek.
+        body = kept[1] if len(kept) > 1 else kept[0]
+        with open(log_path, "wb") as f:
+            f.write(body)
+    except OSError:
+        pass
+
+
+def commit_log_volume() -> None:
+    """Commit best effort du volume qui porte le log (``comfy-models``).
+
+    Sans commit, le log écrit par le container GPU n'est visible des autres
+    containers (dont la fonction CPU de lecture) qu'à l'arrêt du container.
+    L'appel est facultatif : Modal commite aussi le volume en arrière-plan et
+    à l'arrêt du container — un échec ne doit jamais faire échouer le
+    démarrage de ComfyUI.
+    """
+    try:
+        modal.Volume.from_name(COMFY_LOG_VOLUME_NAME).commit()
+    except Exception:  # noqa: BLE001 — volume non monté / API indisponible
+        pass
 
 
 # ── Base worker ─────────────────────────────────────────────────────────
@@ -133,24 +234,34 @@ class ComfyWorker:
         de s'écraser) et ``start_new_session=True`` détache le process du
         groupe courant pour qu'il survive à son parent.
 
+        Le log vit sur le volume ``/cache`` (voir ``COMFY_LOG_PATH``) : il reste
+        donc lisible par une fonction CPU après l'arrêt du container. Une
+        rotation simple est appliquée au lancement (``rotate_log``) puis un
+        commit best effort tente de rendre l'en-tête visible sans attendre
+        l'arrêt du container.
+
         Returns
         -------
         subprocess.Popen
             Le process ComfyUI, à mémoriser sur ``self.proc``.
         """
         COMFY_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        rotate_log(COMFY_LOG_PATH)
         with open(COMFY_LOG_PATH, "a") as log_file:
             log_file.write(
                 f"\n===== ComfyUI start {datetime.now().isoformat()} =====\n"
             )
             log_file.flush()
-            return subprocess.Popen(
+            proc = subprocess.Popen(
                 "comfy launch --background -- --listen 0.0.0.0 --port 8000",
                 shell=True,
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
+        # Hors du ``with`` : le process garde son propre descripteur du fichier.
+        commit_log_volume()
+        return proc
 
     def _restore_uploads_from_volume(self):
         """Copy user-uploaded images from the volume to the ComfyUI input dir.
@@ -627,23 +738,7 @@ class ComfyWorker:
             ``{"lines": [...], "path": str, "size": int}`` ou, en cas de
             problème, ``{"lines": [], "path": str, "error": str}``.
         """
-        try:
-            if not COMFY_LOG_PATH.is_file():
-                return {
-                    "lines": [],
-                    "path": str(COMFY_LOG_PATH),
-                    "error": "log file not found",
-                }
-            size = COMFY_LOG_PATH.stat().st_size
-            # Lecture bornée : on ne charge que la fin du fichier (une fenêtre
-            # suffit largement pour 2000 lignes) et on jette la première ligne
-            # si elle est probablement coupée par le seek.
-            with open(COMFY_LOG_PATH, "rb") as f:
-                if size > COMFY_LOG_MAX_BYTES:
-                    f.seek(size - COMFY_LOG_MAX_BYTES)
-                    f.readline()
-                content = f.read().decode("utf-8", errors="replace")
-            tail = content.splitlines()[-max(1, min(int(lines), 2000)):]
-            return {"lines": tail, "path": str(COMFY_LOG_PATH), "size": size}
-        except (OSError, TypeError, ValueError) as e:
-            return {"lines": [], "path": str(COMFY_LOG_PATH), "error": str(e)}
+        # Repli historique : lire le log via un container GPU réveille le GPU
+        # (cold start 1-3 min). Le chemin principal est la fonction CPU
+        # ``read_worker_logs`` des apps (``build_router(logs_reader=...)``).
+        return read_log_tail(COMFY_LOG_PATH, lines)

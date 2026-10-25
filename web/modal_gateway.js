@@ -1099,12 +1099,14 @@
             '  to { opacity: 1; }',
             '}',
             '/* Panneau de la modale */',
-            '/* Colonne flex : le scroll est interne (étapes scrollables + logs épinglés). */',
+            '/* Colonne flex : le scroll est interne (étapes à hauteur fixe + logs extensibles). */',
+            '/* La hauteur est pilotable au clavier/souris via la poignée de resize (bas du panneau) */',
+            '/* et persistée dans localStorage (clé modal-panel-height). */',
             '.modal-settings-panel {',
             '  background: #2a2a2e; color: #e0e0e0;',
             '  border-radius: 12px;',
             '  width: min(1240px, 96vw);',
-            '  height: min(780px, 94vh);',
+            '  height: var(--modal-panel-height, min(780px, 94vh));',
             '  display: flex; flex-direction: column;',
             '  box-shadow: 0 8px 32px rgba(0,0,0,0.5);',
             '  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;',
@@ -1378,8 +1380,10 @@
             '.modal-prereq-body input:focus { border-color: #4a4aff; }',
             '',
             '/* Grille des 3 étapes */',
+            '/* Hauteur préférée fixe : agrandir la modale profite aux logs, pas aux étapes. */',
+            '/* flex-shrink autorisé pour rester propre sous 480 px de hauteur de panneau. */',
             '.modal-steps {',
-            '  flex: 1; min-height: 0;',
+            '  flex: 0 1 auto; height: 420px; min-height: 220px;',
             '  display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px;',
             '  padding: 14px 18px;',
             '}',
@@ -1479,13 +1483,22 @@
             '}',
             '.modal-check input { margin: 0; accent-color: #4a4aff; cursor: pointer; }',
             '',
-            '/* Logs épinglés en bas */',
+            '/* Logs toujours visibles, seule zone qui grandit au redimensionnement */',
             '.modal-logs {',
-            '  flex-shrink: 0; height: 138px;',
+            '  flex: 1 1 auto; min-height: 150px; overflow: hidden;',
             '  display: flex; flex-direction: column;',
             '  border-top: 1px solid #3a3a3e; background: #1a1a1e;',
-            '  border-radius: 0 0 12px 12px;',
             '}',
+            '/* Poignée de redimensionnement vertical (pleine largeur, bas du panneau) */',
+            '.modal-resize-handle {',
+            '  flex-shrink: 0; height: 8px; width: 100%;',
+            '  cursor: ns-resize; background: #232327;',
+            '  border-top: 1px solid #38383d;',
+            '  border-radius: 0 0 12px 12px;',
+            '  touch-action: none;',
+            '}',
+            '.modal-resize-handle:hover,',
+            '.modal-resize-handle.is-active { background: #4a4aff; }',
             '.modal-logs-head {',
             '  flex-shrink: 0; display: flex; align-items: center; gap: 10px;',
             '  padding: 6px 18px; border-bottom: 1px solid #38383d;',
@@ -1532,9 +1545,13 @@
             '/* Écrans étroits : les étapes s\'empilent verticalement */',
             '@media (max-width: 900px) {',
             '  .modal-prereq.open .modal-prereq-body { grid-template-columns: 1fr; }',
-            '  .modal-steps { grid-template-columns: 1fr; overflow-y: auto; }',
+            '  /* Étapes empilées : hauteur bornée par la place disponible, scroll interne. */',
+            '  .modal-steps {',
+            '    grid-template-columns: 1fr; overflow-y: auto;',
+            '    height: auto; max-height: 55vh; min-height: 200px;',
+            '  }',
             '  .modal-step { min-height: 260px; }',
-            '  .modal-logs { height: 110px; }',
+            '  .modal-logs { flex: 1 1 auto; min-height: 120px; }',
             '}',
             '',
             '/* Scrollbars fines des zones scrollables du nouveau layout */',
@@ -2315,7 +2332,7 @@
             '    </div>',
             '  </div>',
             '',
-            '  <div class="modal-logs" id="modal-log-section" style="display:none;">',
+            '  <div class="modal-logs" id="modal-log-section">',
             '    <div class="modal-logs-head">',
             '      <span class="modal-logs-title">📋 Logs</span>',
             '      <span class="modal-logs-live">en direct</span>',
@@ -2324,8 +2341,9 @@
             '      <button id="modal-log-force-release" class="modal-btn modal-btn--sm" style="display:none;margin:0 0 0 10px;" title="Libère le verrou d\'opération sans tuer le processus Modal en cours">🔓 Forcer la libération</button>',
             '      <button id="modal-log-worker-logs" class="modal-btn modal-btn--sm" style="margin:0 0 0 10px;" title="Affiche les dernières lignes du log ComfyUI du worker Modal (tracebacks des custom nodes)">🖥️ Logs worker</button>',
             '    </div>',
-            '    <pre id="modal-log-output" class="modal-logs-body"></pre>',
+            '    <pre id="modal-log-output" class="modal-logs-body">─── Logs ───\nLancez une opération ou cliquez sur « 🖥️ Logs worker » pour voir les logs du worker.</pre>',
             '  </div>',
+            '  <div class="modal-resize-handle" id="modal-resize-handle" title="Glisser pour agrandir la zone de logs"></div>',
             '</div>',
         ].join('\n');
         document.body.appendChild(overlay);
@@ -2360,9 +2378,70 @@
             document.removeEventListener('mouseup', onModalDragUp);
         }
 
+        // ── Redimensionnement vertical de la modale (poignée du bas) ──────
+        // Seule la hauteur change (jamais la largeur) : les étapes au-dessus
+        // gardent leur hauteur et c'est la zone de logs qui absorbe l'écart.
+        // Handlers document nommés + détachés à la fermeture : même précaution
+        // que le drag du header (fuite de listeners sinon).
+        var PANEL_HEIGHT_KEY = 'modal-panel-height';
+        var PANEL_MIN_HEIGHT = 480;
+        var isResizingPanel = false;
+        var resizeStartY = 0;
+        var resizeStartHeight = 0;
+
+        /** Hauteur max : la modale doit rester dans la fenêtre. */
+        function maxPanelHeight() {
+            return Math.max(PANEL_MIN_HEIGHT, window.innerHeight - 40);
+        }
+
+        /** Applique une hauteur (bornée) au panneau. */
+        function applyPanelHeight(height) {
+            if (!panel) return;
+            var clamped = Math.max(PANEL_MIN_HEIGHT, Math.min(height, maxPanelHeight()));
+            panel.style.height = clamped + 'px';
+        }
+
+        function onPanelResizeMove(e) {
+            if (!isResizingPanel || !panel) return;
+            applyPanelHeight(resizeStartHeight + (e.clientY - resizeStartY));
+            e.preventDefault();
+        }
+
+        function onPanelResizeUp() {
+            if (!isResizingPanel) return;
+            isResizingPanel = false;
+            document.body.style.userSelect = '';
+            var handle = document.getElementById('modal-resize-handle');
+            if (handle) handle.classList.remove('is-active');
+            // Mémorise la hauteur choisie pour la prochaine ouverture.
+            if (panel) {
+                try {
+                    window.localStorage.setItem(
+                        PANEL_HEIGHT_KEY,
+                        String(Math.round(panel.getBoundingClientRect().height))
+                    );
+                } catch (_) { /* localStorage indisponible (mode privé) */ }
+            }
+        }
+
+        function detachPanelResizeListeners() {
+            document.removeEventListener('mousemove', onPanelResizeMove);
+            document.removeEventListener('mouseup', onPanelResizeUp);
+        }
+
+        // Hauteur restaurée depuis la session précédente.
+        if (panel) {
+            var storedHeight = 0;
+            try {
+                storedHeight = parseInt(window.localStorage.getItem(PANEL_HEIGHT_KEY), 10) || 0;
+            } catch (_) { /* localStorage indisponible */ }
+            if (storedHeight > 0) applyPanelHeight(storedHeight);
+        }
+
         // Gestionnaires d'événements
         overlay.querySelector('.modal-settings-close').onclick = function () {
             detachModalDragListeners();
+            detachPanelResizeListeners();
             window._modalSettingsOpen = false;
             overlay.remove();
         };
@@ -2399,6 +2478,26 @@
 
             document.addEventListener('mousemove', onModalDragMove);
             document.addEventListener('mouseup', onModalDragUp);
+        }
+
+        // ── Poignée de redimensionnement (bas du panneau) ────────────────
+        var resizeHandle = document.getElementById('modal-resize-handle');
+        if (resizeHandle && panel) {
+            resizeHandle.addEventListener('mousedown', function (e) {
+                isResizingPanel = true;
+                resizeStartY = e.clientY;
+                resizeStartHeight = panel.getBoundingClientRect().height;
+                document.body.style.userSelect = 'none';
+                resizeHandle.classList.add('is-active');
+                document.addEventListener('mousemove', onPanelResizeMove);
+                document.addEventListener('mouseup', onPanelResizeUp);
+                e.preventDefault();
+            });
+            // Double-clic : retour à la hauteur par défaut du CSS.
+            resizeHandle.addEventListener('dblclick', function () {
+                panel.style.height = '';
+                try { window.localStorage.removeItem(PANEL_HEIGHT_KEY); } catch (_) {}
+            });
         }
 
         // ── Barre « Connexion » repliable ────────────────────────────────
