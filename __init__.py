@@ -12,6 +12,7 @@ import asyncio
 import ast
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -42,6 +43,12 @@ DEFAULT_CONFIG = {
     "custom_nodes": [],
     "custom_nodes_ext": [],
     "custom_nodes_local": [],
+    # Paquets pip supplémentaires installés au build de l'image (dépendances
+    # OPTIONNELLES des custom nodes, souvent absentes de leur requirements.txt :
+    # ex. ``sageattention`` requis par comfyui-kjnodes, ``mediapipe`` pour
+    # comfyui_facetools). Installés en best-effort (cf. image.py) : un échec
+    # n'empêche jamais le build.
+    "extra_pip_packages": [],
     "models_to_sync": [],
     "local_output_dir": "",
     "allowed_hosts": [],
@@ -75,6 +82,52 @@ def save_config(config: dict) -> None:
         current.update(config)
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         CONFIG_PATH.write_text(json.dumps(current, indent=2))
+
+
+# ─── Paquets pip supplémentaires (dépendances optionnelles des nodes) ───
+
+# Un nom/version de paquet pip ne contient JAMAIS de métacaractère shell. La
+# validation est une LISTE BLANCHE (défense en profondeur : la même règle est
+# réappliquée dans image.py, config.json étant éditable à la main) : tout ce qui
+# n'y correspond pas est IGNORÉ, jamais concaténé dans une commande.
+_PIP_PACKAGE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.\-+=<>!~,\[\]]*$")
+_PIP_PACKAGE_MAX_LEN = 80
+
+
+def _is_safe_pip_package(package) -> bool:
+    """True si *package* peut être passé tel quel à ``pip install``.
+
+    Refuse les entrées non-str, vides, trop longues et surtout tout caractère
+    permettant une injection shell (espace, point-virgule, esperluette, pipe,
+    backtick, ``$``, parenthèses) ou une option pip (premier caractère ``-``).
+    """
+    if not isinstance(package, str):
+        return False
+    value = package.strip()
+    if not value or len(value) > _PIP_PACKAGE_MAX_LEN:
+        return False
+    return _PIP_PACKAGE_RE.fullmatch(value) is not None
+
+
+def _filter_pip_packages(value) -> tuple[list[str], list[str]] | None:
+    """Filtre la valeur brute de ``extra_pip_packages``.
+
+    Retourne ``(acceptés, rejetés)`` (rejetés = entrées d'origine refusées), ou
+    ``None`` si *value* n'est pas une liste — l'appelant ignore alors le champ
+    sans rien casser.
+    """
+    if not isinstance(value, list):
+        return None
+    accepted: list[str] = []
+    rejected: list[str] = []
+    for item in value:
+        if _is_safe_pip_package(item):
+            package = item.strip()
+            if package not in accepted:
+                accepted.append(package)
+        else:
+            rejected.append(str(item))
+    return accepted, rejected
 
 
 def _mask_config(config: dict) -> dict:
@@ -722,6 +775,29 @@ if PromptServer is not None:
                 data = await request.json()
             except Exception:
                 data = {}
+            if not isinstance(data, dict):
+                data = {}
+            # « Paquets pip supplémentaires » : champ validé à l'écriture, mais
+            # JAMAIS motif de rejet de la requête (un 400 casserait l'UI).
+            # Les entrées dangereuses sont écartées et signalées.
+            if "extra_pip_packages" in data:
+                raw_packages = data.get("extra_pip_packages")
+                filtered = _filter_pip_packages(raw_packages)
+                if filtered is None:
+                    # Champ inutilisable (pas une liste) : ignoré tel quel.
+                    data.pop("extra_pip_packages", None)
+                    print(
+                        "[Modal Gateway] ⚠️ extra_pip_packages ignoré "
+                        f"(liste attendue, reçu {type(raw_packages).__name__})"
+                    )
+                else:
+                    accepted, rejected = filtered
+                    if rejected:
+                        print(
+                            "[Modal Gateway] ⚠️ Paquet(s) pip ignoré(s) "
+                            f"(caractère interdit ou nom invalide) : {rejected}"
+                        )
+                    data["extra_pip_packages"] = accepted
             save_config(data)
             return web.json_response(
                 {"ok": True, "config": _mask_config(load_config())}

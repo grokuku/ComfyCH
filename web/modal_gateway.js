@@ -1457,6 +1457,19 @@
             '}',
             '.modal-divider { flex-shrink: 0; height: 1px; background: #38383d; margin: 2px 0; }',
             '',
+            '/* Champ de formulaire dans une étape (ex. paquets pip supplémentaires) */',
+            '.modal-field { display: flex; flex-direction: column; gap: 4px; }',
+            '.modal-field-label { font-size: 11px; color: #999; }',
+            '.modal-field-row { display: flex; gap: 6px; align-items: center; }',
+            '.modal-field-row .modal-input { flex: 1; min-width: 0; }',
+            '.modal-input {',
+            '  width: 100%; padding: 6px 8px; box-sizing: border-box;',
+            '  border: 1px solid #3a3a3e; border-radius: 6px;',
+            '  background: #1a1a1e; color: #e0e0e0; font-size: 12px;',
+            '  font-family: inherit; outline: none;',
+            '}',
+            '.modal-input:focus { border-color: #4a4aff; }',
+            '',
             '/* Listes (nodes / modèles) */',
             '.modal-list {',
             '  flex: 1 1 auto; min-height: 100px; max-height: none; overflow-y: auto;',
@@ -2366,6 +2379,17 @@
             '        <div class="modal-row status-item"><span>💾 Volume comfy-models</span><span class="val muted">…</span></div>',
             '        <div class="modal-row status-item"><span>🌐 API configurée</span><span class="val muted">…</span></div>',
             '        <div class="modal-row status-item"><span>🔑 Secret Modal</span><span class="val muted">…</span></div>',
+            // Dépendances OPTIONNELLES des custom nodes (ex. sageattention pour
+            // kjnodes, mediapipe pour facetools) : absentes des requirements.txt
+            // des nodes, installées au build en best-effort.
+            '        <div class="modal-field">',
+            '          <label class="modal-field-label" for="cfg-extra-pip">Paquets pip supplémentaires</label>',
+            '          <div class="modal-field-row">',
+            '            <input type="text" id="cfg-extra-pip" class="modal-input" value="" placeholder="sageattention, mediapipe, ultralytics" autocomplete="off" />',
+            '            <button id="cfg-save-extra-pip" class="modal-btn modal-btn--sm" title="Enregistrer les paquets pip supplémentaires">💾</button>',
+            '          </div>',
+            '          <div class="modal-hint">Dépendances optionnelles des custom nodes (ex. sageattention pour kjnodes). Séparées par des virgules. Installées au déploiement — un échec n\'empêche pas le build.</div>',
+            '        </div>',
             '        <div class="modal-divider"></div>',
             '        <div class="modal-row"><span>📁 User settings locaux</span><span class="val muted" id="status-user-settings">⏳ Vérification...</span></div>',
             '        <div class="modal-row"><span>🔄 Dernière sync user</span><span class="val muted" id="status-user-sync">⏳ Jamais</span></div>',
@@ -3304,6 +3328,59 @@
 
         // Résumé de la barre « Connexion » (replié par défaut)
         updatePrereqSummary();
+
+        // ── Paquets pip supplémentaires (dépendances optionnelles) ──────
+        // Champ libre « a, b, c ». Le serveur écarte les entrées dangereuses
+        // (caractères shell interdits) et renvoie la liste retenue.
+        var extraPipEl = document.getElementById('cfg-extra-pip');
+        var saveExtraPipBtn = document.getElementById('cfg-save-extra-pip');
+        if (extraPipEl && Array.isArray(config.extra_pip_packages)) {
+            extraPipEl.value = config.extra_pip_packages.join(', ');
+        }
+        if (extraPipEl && saveExtraPipBtn) {
+            saveExtraPipBtn.onclick = async function () {
+                var packages = (extraPipEl.value || '')
+                    .split(',')
+                    .map(function (p) { return p.trim(); })
+                    .filter(function (p) { return p.length > 0; });
+                saveExtraPipBtn.disabled = true;
+                try {
+                    var resp = await fetch('/api/modal/config', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ extra_pip_packages: packages }),
+                    });
+                    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                    var payload = await resp.json();
+                    var saved = (payload && payload.config &&
+                        Array.isArray(payload.config.extra_pip_packages))
+                        ? payload.config.extra_pip_packages
+                        : packages;
+                    // Refléter la liste réellement retenue par le serveur.
+                    extraPipEl.value = saved.join(', ');
+                    if (modalConfig) modalConfig.extra_pip_packages = saved;
+                    var dropped = packages.length - saved.length;
+                    if (dropped > 0) {
+                        showNotification(
+                            '⚠️ ' + dropped + ' entrée(s) ignorée(s) (caractères interdits). ' +
+                            saved.length + ' paquet(s) enregistré(s) — un déploiement (🚀 Déployer) est nécessaire pour les installer.',
+                            'info'
+                        );
+                    } else {
+                        showNotification(
+                            '✅ ' + saved.length + ' paquet(s) pip enregistré(s) — un déploiement (🚀 Déployer) est nécessaire pour les installer.',
+                            'success'
+                        );
+                    }
+                    saveExtraPipBtn.textContent = '✅';
+                    setTimeout(function () { saveExtraPipBtn.textContent = '💾'; }, 2000);
+                } catch (e) {
+                    showNotification('❌ Erreur sauvegarde paquets pip : ' + e.message, 'error');
+                } finally {
+                    saveExtraPipBtn.disabled = false;
+                }
+            };
+        }
 
         // Badges de date (sync / deploy / user sync)
         var syncBadge = document.getElementById('status-sync');

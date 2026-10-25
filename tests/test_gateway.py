@@ -1338,6 +1338,52 @@ def _test_custom_nodes_sync():
         check("custom nodes : déjà présents → 0 nouveau", rc == 0)
         check("custom nodes : log lié(s)/déjà présent(s)",
               "0 lié(s), 2 déjà présent(s)" in out)
+
+        # ── Deps des nodes : installées AU BUILD, plus au démarrage ──
+        # 30 × ``pip install -r`` ≈ 141-187 s de préparation par container :
+        # l'étape ne doit plus tourner que sur demande (COMFYCH_INSTALL_DEPS=1).
+        vol2 = tmp / "nodes_deps"
+        _make_node(vol2, "node_req", files=("requirements.txt", "install.py"))
+        bw.CUSTOM_NODES_VOLUME_PATH = vol2
+        bw.COMFY_CUSTOM_NODES_DIR = tmp / "comfy_deps"
+        calls = []
+        real_req = bw.ComfyWorker._install_node_requirements
+        real_inst = bw.ComfyWorker._run_node_install_script
+        real_flag = bw.INSTALL_NODE_DEPS_AT_STARTUP
+        bw.ComfyWorker._install_node_requirements = lambda self, p: calls.append("pip")
+        bw.ComfyWorker._run_node_install_script = lambda self, p: calls.append("install")
+        try:
+            bw.INSTALL_NODE_DEPS_AT_STARTUP = False
+            rc, out = _sync()
+            check("custom nodes : deps NON réinstallées au démarrage (défaut)", calls == [])
+            check("custom nodes : rc inchangé malgré l'étape ignorée", rc == 1)
+            check("custom nodes : étape deps ignorée → log explicite",
+                  "COMFYCH_INSTALL_DEPS=0" in out)
+
+            bw.INSTALL_NODE_DEPS_AT_STARTUP = True
+            rc, out = _sync()
+            check("custom nodes : COMFYCH_INSTALL_DEPS=1 rétablit pip + install.py",
+                  calls == ["pip", "install"])
+            check("custom nodes : étape deps rétablie → pas de log d'ignorance",
+                  "COMFYCH_INSTALL_DEPS=0" not in out)
+        finally:
+            bw.INSTALL_NODE_DEPS_AT_STARTUP = real_flag
+            bw.ComfyWorker._install_node_requirements = real_req
+            bw.ComfyWorker._run_node_install_script = real_inst
+
+        # ── Chronométrage par node : top 5 seulement si la préparation coûte ──
+        bw.CUSTOM_NODES_VOLUME_PATH = vol
+        bw.COMFY_CUSTOM_NODES_DIR = tmp / "comfy_timed"
+        sync_log = tmp / "logs" / "comfyui.log"
+        real_log = bw.COMFY_LOG_PATH
+        bw.COMFY_LOG_PATH = sync_log
+        try:
+            rc, out = _sync()
+            check("custom nodes : préparation rapide → aucun top de lenteurs",
+                  not sync_log.exists())
+            check("custom nodes : durée par node mesurée sans erreur", rc == 2)
+        finally:
+            bw.COMFY_LOG_PATH = real_log
     finally:
         bw.CUSTOM_NODES_VOLUME_PATH, bw.COMFY_CUSTOM_NODES_DIR = real_vol, real_dir
 
@@ -1479,8 +1525,9 @@ def _test_wait_for_port():
           f"port {port} prêt" in buf.getvalue())
 
     # ── Port muet : timeout court → TimeoutError, jamais d'attente infinie ──
-    # (timeout=1.2 s plutôt que 0.3 : la progression est logguée toutes les
-    # secondes — en dessous, aucune ligne ne peut apparaître.)
+    # ``progress_every=0.3`` : la progression est logguée à cette période, donc
+    # il faut au moins une période dans le budget de ``timeout`` pour qu'une
+    # ligne apparaisse (la période par défaut est de 5 s).
     real_socket = bw.socket
     bw.socket = types.SimpleNamespace(
         create_connection=lambda address, timeout=None: (_ for _ in ()).throw(
@@ -1490,7 +1537,7 @@ def _test_wait_for_port():
     started = time.time()
     try:
         with contextlib.redirect_stdout(io.StringIO()) as buf:
-            bw.wait_for_port(port, timeout=1.2)
+            bw.wait_for_port(port, timeout=1.2, progress_every=0.3)
         raised = None
     except BaseException as e:  # noqa: BLE001 — on vérifie le type ensuite
         raised = e
@@ -1582,11 +1629,55 @@ def _test_startup_timing_blocks():
     check("write_timing_block : séparateur de 44 ─",
           ("  " + "─" * 44) in written)
 
+    # ── Top des nodes les plus lents (garde-fou de la préparation) ──
+    slow_log = tmp / "slow.log"
+    with contextlib.redirect_stdout(io.StringIO()):
+        slow_total = bw.write_slowest_nodes_block(
+            [("comfyui-easy-use", 2.1), ("RES4LYF", 1.8), ("node_a", 0.2),
+             ("node_b", 0.1), ("node_c", 0.05), ("node_lent", 9.0)],
+            path=slow_log,
+        )
+    slow_written = slow_log.read_text() if slow_log.is_file() else ""
+    slow_lines = [
+        line for line in slow_written.splitlines()
+        if " : " in line and "TOTAL" not in line
+    ]
+    check("write_slowest_nodes_block : total renvoyé", abs(slow_total - 13.25) < 0.01)
+    check("write_slowest_nodes_block : bloc écrit dans le log",
+          "top 5 nodes les plus lents (préparation)" in slow_written)
+    check("write_slowest_nodes_block : 5 nodes au maximum", len(slow_lines) == 5)
+    check("write_slowest_nodes_block : les plus lents listés en premier",
+          slow_written.index("node_lent") < slow_written.index("comfyui-easy-use"))
+    check("write_slowest_nodes_block : node le plus lent absent du top 5 exclu",
+          "node_c" not in slow_written)
+
+    fast_log = tmp / "fast.log"
+    with contextlib.redirect_stdout(io.StringIO()):
+        fast_total = bw.write_slowest_nodes_block(
+            [("node_a", 0.01), ("node_b", 0.02)], path=fast_log
+        )
+    check("write_slowest_nodes_block : sous le seuil → rien d'écrit",
+          abs(fast_total - 0.03) < 0.001 and not fast_log.exists())
+
+    slow_blocker = tmp / "fichier-bloquant"
+    slow_blocker.write_text("x")
+    with contextlib.redirect_stdout(io.StringIO()) as slow_buf:
+        blocked_total = bw.write_slowest_nodes_block(
+            [("node_lent", 42.0)], path=slow_blocker / "x"
+        )
+    check("write_slowest_nodes_block : OSError toléré (total renvoyé)",
+          abs(blocked_total - 42.0) < 0.01
+          and "top des nodes lents non écrit" in slow_buf.getvalue())
+
     # Un log non inscriptible ne doit jamais faire échouer un démarrage.
+    # ``blocker`` est un FICHIER : il ne peut pas servir de dossier parent à
+    # ``blocker / "x"``, donc ``mkdir`` échoue avec un OSError.
+    blocker = tmp / "pas-un-dossier"
+    blocker.write_text("x")
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         total = bw.write_timing_block(
-            "démarrage (checkpoint)", phases, path=tmp / "comfyui.log" / "x"
+            "démarrage (checkpoint)", phases, path=blocker / "x"
         )
     check("write_timing_block : OSError toléré (total renvoyé, avertissement)",
           abs(total - 59.7) < 0.05 and "timing non écrit" in buf.getvalue())
@@ -1677,7 +1768,8 @@ def _test_startup_timing_blocks():
 
     block, _ = _restore_block("deadbeefdeadbeef")
     check("start_restore : code modifié → « redémarrage forcé (code modifié) »",
-          "redémarrage forcé (code modifié)" in block)
+          bw.STARTUP_MODE_CODE_CHANGED in block
+          and "code modifié" in block)
 
     block, _ = _restore_block(bw.WORKER_BUILD_ID, new_nodes=1)
     check("start_restore : nouveaux nodes → « nouveaux custom nodes » dans le bloc",
@@ -1741,9 +1833,11 @@ def _test_wait_for_port_timing():
               took < 3)
 
         # ── Logs de progression : un démarrage long n'est pas un silence ──
+        # Période courte : le budget ci-dessus ne couvre qu'une fraction de la
+        # période par défaut (5 s), donc aucune ligne n'apparaîtrait.
         with contextlib.redirect_stdout(io.StringIO()) as out:
             try:
-                bw.wait_for_port(8000, timeout=0.3, progress_every=0.0)
+                bw.wait_for_port(8000, timeout=0.5, progress_every=0.1)
             except TimeoutError:
                 pass
         check("wait_for_port : progression loguée pendant l'attente",
@@ -2487,6 +2581,263 @@ def _test_extension_worker_logs_route():
         comfych.urllib, comfych.load_config = real_urllib, real_config
 
 
+# ─────────────── Filtre des sous-modules git cachés (régression) ───────────
+
+def _test_hidden_submodules_preserved():
+    """Un dossier caché n'est plus exclu en bloc : les sous-modules survivent.
+
+    Régression de production : « [VRGDG] 1 failed submodule(s):
+    .VRGDG_LTXLoopingSampler / No module named 'ComfyUI-LTXVideo' » causée par
+    l'ancienne règle « tout dossier commençant par . est exclu ».
+    """
+    import tarfile
+
+    sync_mod = _load_sync_module()
+    root = Path(tempfile.mkdtemp())
+    node = _make_node(root, "vrgamedevgirl", files=("__init__.py", "nodes.py"))
+
+    sub = node / ".VRGDG_LTXLoopingSampler"
+    sub.mkdir()
+    (sub / "__init__.py").write_text("x")
+    (sub / "sampler.py").write_text("x")
+    (sub / "_C.cpython-311-x86_64-linux-gnu.so").write_bytes(b"s" * 16)
+    (node / ".git").mkdir()
+    (node / ".git" / "config").write_text("x")
+    (node / ".venv").mkdir()
+    (node / ".venv" / "pyvenv.cfg").write_text("x")
+    (node / ".DS_Store").write_bytes(b"x")
+    (node / ".gitignore").write_text("x")
+    (node / ".gitmodules").write_text("x")
+    (node / ".code_cache.py").write_text("x")
+
+    check("filtre : sous-module git caché CONSERVÉ",
+          sync_mod._dir_exclusion_reason(".VRGDG_LTXLoopingSampler") is None)
+    check("filtre : autres dossiers cachés conservés",
+          all(sync_mod._dir_exclusion_reason(d) is None for d in
+              [".VRGDG_LTXLoopingSampler", ".hidden_lib", ".submodule",
+               ".kjnodes_patch"]))
+    check("filtre : .git et .venv EXCLUS",
+          sync_mod._dir_exclusion_reason(".git") == sync_mod._SKIP_HIDDEN
+          and sync_mod._dir_exclusion_reason(".venv") is not None)
+    check("filtre : liste explicite des dossiers cachés techniques",
+          all(sync_mod._dir_exclusion_reason(d) is not None for d in
+              [".git", ".github", ".venv", ".idea", ".vscode", ".cache",
+               ".mypy_cache", ".pytest_cache", ".ruff_cache", ".staging"]))
+    check("filtre : .git reste listé dans EXCLUDE_DIRS",
+          ".git" in sync_mod.EXCLUDE_DIRS
+          and ".git" in sync_mod.HIDDEN_EXCLUDE_DIRS)
+    check("filtre : au niveau custom_nodes/, un dossier caché n'est pas un node",
+          sync_mod._dir_exclusion_reason(".hidden_node", node_root=True) is not None)
+    check("filtre : métadonnées cachées exclues (.DS_Store, .gitignore…)",
+          all(sync_mod._is_excluded_file(n) for n in
+              [".DS_Store", ".gitignore", ".gitmodules", ".gitattributes"]))
+    check("filtre : code caché conservé (.py/.so sous dossier caché)",
+          not sync_mod._is_excluded_file(".code_cache.py")
+          and not sync_mod._is_excluded_file("_C.cpython-311-x86_64-linux-gnu.so"))
+
+    archive = Path(tempfile.mkdtemp()) / "nodes.tar.gz"
+    stats = sync_mod._build_custom_nodes_archive([node], archive)
+    with tarfile.open(archive, mode="r:gz") as tar:
+        names = set(tar.getnames())
+
+    check("archive : le sous-module caché est archivé (import possible)",
+          {"vrgamedevgirl/.VRGDG_LTXLoopingSampler/__init__.py",
+           "vrgamedevgirl/.VRGDG_LTXLoopingSampler/sampler.py",
+           "vrgamedevgirl/.VRGDG_LTXLoopingSampler/_C.cpython-311-x86_64-linux-gnu.so"}
+          <= names)
+    check("archive : .git/.venv et métadonnées restent exclus",
+          not any(n.startswith("vrgamedevgirl/.git/") or
+                  n.startswith("vrgamedevgirl/.venv/") for n in names)
+          and "vrgamedevgirl/.DS_Store" not in names
+          and "vrgamedevgirl/.gitignore" not in names)
+    check("archive : sous-module conservé signalé dans les stats",
+          stats["kept_hidden_dirs"] == [".VRGDG_LTXLoopingSampler"])
+    check("résumé : ligne informative sur les sous-modules conservés",
+          any("sous-module(s) caché(s) conservé(s)" in line
+              for line in sync_mod._archive_exclusion_summary_lines(stats)))
+
+
+# ────────── Champ « paquets pip supplémentaires » (config + image) ─────────
+
+def _test_extra_pip_packages_config():
+    """``extra_pip_packages`` : défaut vide, liste blanche, filtre sans 400."""
+    comfych = _load_comfych_module()
+
+    check("pip : DEFAULT_CONFIG contient extra_pip_packages (liste vide)",
+          comfych.DEFAULT_CONFIG.get("extra_pip_packages") == [])
+
+    check("pip : paquets légitimes acceptés",
+          all(comfych._is_safe_pip_package(p) for p in
+              ["sageattention", "mediapipe", "ultralytics", "onnxruntime-gpu",
+               "mediapipe>=0.10.9", "torch==2.4.1", "foo[extra]", "x_y",
+               "diffusers~=0.31"]))
+    check("pip : entrées dangereuses rejetées",
+          not any(comfych._is_safe_pip_package(p) for p in
+                  ["x; rm -rf /", "x && reboot", "x | tee /etc/passwd",
+                   "$(reboot)", "`reboot`", "x y", "x\nrm -rf /",
+                   "-r /etc/passwd", "--index-url http://evil", "", "   ",
+                   None, 42, ["sageattention"]]))
+
+    accepted, rejected = comfych._filter_pip_packages(
+        ["sageattention", "x; rm -rf /", "", "mediapipe"]
+    )
+    check("pip : filtre → valides conservés, dangereux écartés",
+          accepted == ["sageattention", "mediapipe"]
+          and "x; rm -rf /" in rejected)
+    check("pip : doublons dédupliqués",
+          comfych._filter_pip_packages(["a", " a ", "b"]) == (["a", "b"], []))
+    check("pip : champ non-liste → None (champ ignoré, pas de 400)",
+          comfych._filter_pip_packages("sageattention") is None
+          and comfych._filter_pip_packages(None) is None)
+
+
+def _test_post_config_extra_pip_packages():
+    """``post_config`` accepte le champ, filtre les entrées, ne renvoie pas 400."""
+    import json as json_mod
+
+    routes = {}
+
+    class _Router:
+        def add_route(self, method, path, handler):
+            routes[(method, path)] = handler
+
+    class FakePromptServer:
+        def __init__(self):
+            self.app = SimpleNamespace(router=_Router())
+
+        def add_routes(self):
+            return "original"
+
+    server_mod = types.ModuleType("server")
+    server_mod.PromptServer = FakePromptServer
+    aiohttp_mod = types.ModuleType("aiohttp")
+    aiohttp_mod.web = _FakeWeb
+    saved = {name: sys.modules.get(name) for name in ("server", "aiohttp")}
+    sys.modules["server"] = server_mod
+    sys.modules["aiohttp"] = aiohttp_mod
+    try:
+        comfych = _load_comfych_module()
+    finally:
+        for name, previous in saved.items():
+            if previous is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
+
+    cfg = Path(tempfile.mkdtemp()) / "config.json"
+    comfych.CONFIG_PATH = cfg
+    comfych._add_routes_with_modal(FakePromptServer())
+    post_config = routes.get(("POST", "/api/modal/config"))
+    check("pip : route POST /api/modal/config enregistrée",
+          callable(post_config))
+
+    class _FakeRequest:
+        def __init__(self, payload):
+            self._payload = payload
+            self.headers = {"Host": "127.0.0.1:8188"}
+
+        async def json(self):
+            return self._payload
+
+    resp = asyncio.run(post_config(_FakeRequest(
+        {"extra_pip_packages": ["sageattention", "x; rm -rf /", "mediapipe"]}
+    )))
+    stored = json_mod.loads(cfg.read_text())["extra_pip_packages"]
+    check("pip : liste valide acceptée (200, pas de 400)",
+          resp.status == 200 and resp.payload["ok"] is True)
+    check("pip : entrées dangereuses écartées à l'écriture",
+          stored == ["sageattention", "mediapipe"])
+    check("pip : commande dangereuse jamais stockée dans config.json",
+          "rm -rf" not in cfg.read_text())
+
+    # Champ inutilisable (chaîne au lieu d'une liste) : ignoré, config conservée.
+    resp = asyncio.run(post_config(_FakeRequest(
+        {"extra_pip_packages": "sageattention; rm -rf /"}
+    )))
+    check("pip : champ non-liste ignoré sans casser la requête",
+          resp.status == 200
+          and json_mod.loads(cfg.read_text())["extra_pip_packages"]
+          == ["sageattention", "mediapipe"])
+
+    # Les autres clés restent enregistrées normalement (compatibilité).
+    asyncio.run(post_config(_FakeRequest({"api_url": "https://x.modal.run"})))
+    check("pip : sauvegarde des autres clés inchangée",
+          json_mod.loads(cfg.read_text())["api_url"] == "https://x.modal.run")
+
+    # Liste vide acceptée (désactivation du champ).
+    asyncio.run(post_config(_FakeRequest({"extra_pip_packages": []})))
+    check("pip : liste vide acceptée",
+          json_mod.loads(cfg.read_text())["extra_pip_packages"] == [])
+
+
+class _RecordingImage:
+    """Image Modal factice qui retient les commandes exécutées."""
+
+    instances = []
+
+    def __init__(self):
+        self.commands = []
+        _RecordingImage.instances.append(self)
+
+    @classmethod
+    def debian_slim(cls, python_version="3.11"):
+        return cls()
+
+    def add_local_python_source(self, *a, **kw): return self
+    def add_local_file(self, *a, **kw): return self
+    def add_local_dir(self, *a, **kw): return self
+    def apt_install(self, *a, **kw): return self
+    def pip_install_from_requirements(self, *a, **kw): return self
+
+    def run_commands(self, *cmds, **kw):
+        self.commands.extend(cmds)
+        return self
+
+
+def _test_extra_pip_install_best_effort():
+    """Le build installe les paquets pip en best-effort (jamais bloquant)."""
+    spec = importlib.util.spec_from_file_location(
+        "comfych_image", str(PROJECT_ROOT / "image.py")
+    )
+    image_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(image_mod)
+
+    check("pip image : paquets valides extraits de la config",
+          image_mod._extra_pip_packages(
+              {"extra_pip_packages": ["sageattention", "x; rm -rf /", 42, ""]}
+          ) == ["sageattention"])
+    check("pip image : config absente/corrompue → liste vide, aucune exception",
+          image_mod._extra_pip_packages({}) == []
+          and image_mod._extra_pip_packages({"extra_pip_packages": "sageattention"}) == []
+          and image_mod._extra_pip_packages("pas un dict") == [])
+
+    cmd = image_mod._pip_install_command("sageattention")
+    check("pip image : commande = pip install <paquet>",
+          cmd.startswith("pip install sageattention"))
+    check("pip image : commande toujours suffixée de « || echo » (build non bloquant)",
+          "|| echo" in cmd and cmd.count("|| echo") == 1)
+    check("pip image : échec du paquet signalé dans le log du build",
+          "build continue" in cmd)
+
+    # Bout en bout : _build_image() avec un config.json fournissant des paquets.
+    image_mod.modal = SimpleNamespace(Image=_RecordingImage)
+    image_mod._read_saved_config = lambda: {
+        "extra_pip_packages": ["sageattention", "mediapipe>=0.10", "x; rm -rf /"]
+    }
+    image_mod._build_image()
+    recorded = _RecordingImage.instances[-1].commands
+    pip_commands = [c for c in recorded if c.startswith("pip install sageattention")]
+    check("pip image : paquet supplémentaire installé au build",
+          len(pip_commands) == 1)
+    check("pip image : plusieurs paquets → plusieurs commandes",
+          any(c.startswith("pip install") and "mediapipe>=0.10" in c
+              for c in recorded))
+    check("pip image : entrée dangereuse jamais exécutée",
+          not any("rm -rf" in c for c in recorded))
+    check("pip image : toutes les commandes pip restent best-effort",
+          all("|| echo" in c for c in recorded if c.startswith("pip install ")))
+
+
 # ─────────────────────────── Main ──────────────────────────────────────────
 
 def main():
@@ -2513,6 +2864,10 @@ def main():
     _test_safe_model_filename()
     _test_tar_member_validation()
     _test_node_exclusions()
+    _test_hidden_submodules_preserved()
+    _test_extra_pip_packages_config()
+    _test_post_config_extra_pip_packages()
+    _test_extra_pip_install_best_effort()
     _test_image_size_guard()
     _test_archive_summary_lines()
     _test_node_size_report()

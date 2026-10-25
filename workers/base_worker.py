@@ -58,6 +58,21 @@ stdout/stderr de ComfyUI dans notre log (le wrapper ``comfy launch
 COMFY_CUSTOM_NODES_DIR = COMFY_ROOT / "custom_nodes"
 """Dossier scanné par ComfyUI — une seule fois, à son démarrage."""
 
+INSTALL_NODE_DEPS_AT_STARTUP = os.environ.get("COMFYCH_INSTALL_DEPS", "0") == "1"
+"""Réinstaller les deps pip des custom nodes à chaque démarrage du worker ?
+
+**Désactivé par défaut** : les ``requirements.txt`` de tous les nodes locaux
+sont installés **au build de l'image** (voir ``image.py``), donc l'étape est
+un pur gaspillage à l'exécution. Mesure réelle : ``pip install -r`` coûte
+3-6 s par node *même quand tout est déjà satisfait* (pip résout et vérifie),
+sur 30 nodes ≈ 141-187 s de « préparation » à chaque démarrage de container.
+De plus un install runtime ne survit pas au snapshot (il touche
+site-packages, pas le volume) : il est repayé intégralement à chaque fois.
+
+Le flag ``COMFYCH_INSTALL_DEPS=1`` rétablit le comportement historique —
+secours pour un node ajouté sur le volume sans rebuild de l'image (le code
+du node, lui, vient toujours du volume)."""
+
 COMFY_LOG_PATH = Path("/cache/logs/comfyui.log")
 """Sortie stdout/stderr de ComfyUI (tracebacks des custom nodes inclus).
 
@@ -151,6 +166,16 @@ assez long pour ne pas marteler la boucle pendant les 5 minutes d'attente."""
 
 TIMING_VALUE_WIDTH = 5
 """Largeur de la valeur (secondes, une décimale) dans ces blocs."""
+
+PREP_SLOW_THRESHOLD_SECONDS = 10.0
+"""Somme des durées par node (préparation) au-delà de laquelle un top est écrit.
+
+Garde-fou : avec les deps installées au build, lier les nodes doit coûter
+quelques millisecondes chacun. Un dépassement signale un node à optimiser
+(``install.py`` bavard, ``requirements.txt`` volumineux…)."""
+
+PREP_SLOW_TOP_N = 5
+"""Nombre de nodes listés dans le top des plus lents de la préparation."""
 
 STARTUP_MODE_CHECKPOINT = "snapshot en préparation"
 """Mode affiché dans le timing de ``start_checkpoint`` (avant capture GPU)."""
@@ -248,18 +273,83 @@ def write_timing_block(
     block = "\n".join(lines) + "\n"
 
     log_path = Path(COMFY_LOG_PATH if path is None else path)
+    error = _append_log_block(block, log_path)
+    if error:
+        # Un log non inscriptible ne doit jamais faire échouer un démarrage.
+        print(f"[ComfyWorker] ⚠️ timing non écrit dans {log_path} : {error}")
+
+    # Même bloc sur la stdout du worker : visible dans les logs Modal natifs.
+    print(block.rstrip("\n"))
+    return total
+
+
+def write_slowest_nodes_block(
+    nodes,
+    path: Path | str | None = None,
+    threshold: float = PREP_SLOW_THRESHOLD_SECONDS,
+) -> float:
+    """Top des nodes les plus lents de la préparation (garde-fou de perf).
+
+    Rien n'est écrit si la somme des durées reste sous *threshold* : le cas
+    normal (liens de symlinks seuls) ne doit pas polluer le log. Au-delà, le
+    bloc liste les ``PREP_SLOW_TOP_N`` nodes les plus lents — de quoi repérer
+    le node qui coûte les dizaines de secondes de « préparation » du démarrage.
+
+    Parameters
+    ----------
+    nodes : list[tuple[str, float]]
+        Durées par node ``(nom, secondes)``, dans l'ordre de traitement.    path : Path | str | None
+        Fichier de log ; ``None`` → ``COMFY_LOG_PATH`` courant.
+    threshold : float
+        Seuil (s) de somme en dessous duquel rien n'est écrit.
+
+    Returns
+    -------
+    float
+        Le TOTAL mesuré (somme des durées), même si aucun bloc n'a été écrit.
+    """
+    total = sum(_measured_seconds(seconds) for _, seconds in nodes)
+    nodes = list(nodes)
+    if total <= _measured_seconds(threshold, PREP_SLOW_THRESHOLD_SECONDS):
+        return total
+
+    slowest = sorted(
+        nodes, key=lambda item: _measured_seconds(item[1]), reverse=True
+    )[:PREP_SLOW_TOP_N]
+    lines = [f"───── top {PREP_SLOW_TOP_N} nodes les plus lents (préparation) ─────"]
+    lines.extend(
+        format_timing_line(str(name), seconds) for name, seconds in slowest
+    )
+    lines.append("  " + "─" * 44)
+    lines.append(format_timing_line("TOTAL préparation des nodes", total))
+    block = "\n".join(lines) + "\n"
+
+    log_path = Path(COMFY_LOG_PATH if path is None else path)
+    error = _append_log_block(block, log_path)
+    if error:
+        print(f"[ComfyWorker] ⚠️ top des nodes lents non écrit dans {log_path} : {error}")
+    print(block.rstrip("\n"))
+    return total
+
+
+def _append_log_block(block: str, log_path: Path) -> str | None:
+    """Ajoute *block* à *log_path* (dossier créé au besoin), en append.
+
+    Returns
+    -------
+    str | None
+        Le message d'erreur si l'écriture a échoué, ``None`` sinon. Aucune
+        exception ne remonte : un log non inscriptible (volume absent, disque
+        plein, chemin invalide) ne doit jamais faire échouer un démarrage.
+    """
     try:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with open(log_path, "a") as f:
             f.write("\n" + block)
             f.flush()
+        return None
     except OSError as e:
-        # Un log non inscriptible ne doit jamais faire échouer un démarrage.
-        print(f"[ComfyWorker] ⚠️ timing non écrit dans {log_path} : {e}")
-
-    # Même bloc sur la stdout du worker : visible dans les logs Modal natifs.
-    print(block.rstrip("\n"))
-    return total
+        return str(e)
 
 
 def wait_for_port(
@@ -878,12 +968,23 @@ class ComfyWorker:
     def _sync_custom_nodes_from_volume(self) -> int:
         """Symlink each custom node from /custom_nodes volume into ComfyUI.
 
-        Le code des nodes vit sur le volume (plus installé dans l'image). Au
-        démarrage on symlink chaque dossier node dans ComfyUI, on installe ses
-        dépendances pip (requirements.txt — généralement déjà présentes via le
-        build de l'image, donc idempotent et rapide) et on exécute son
-        install.py s'il existe. Les échecs sont loggés en warning sans jamais
-        faire échouer le démarrage du worker.
+        Répartition des responsabilités : **le build porte les deps, le volume
+        porte le code**. ``image.py`` installe les ``requirements.txt`` de tous
+        les nodes locaux dans l'image (dépendances persistantes, donc payées une
+        seule fois), le volume ne transporte que le code des nodes. Au démarrage
+        cette méthode ne fait donc que créer les symlinks — quelques
+        millisecondes par node — au lieu de rejouer ``pip install`` + ``install.py``
+        pour chacun (mesuré : 141-187 s pour 30 nodes).
+
+        L'installation runtime reste disponible en secours (``install.py``,
+        ``requirements.txt`` d'un node ajouté sans rebuild) : elle n'a lieu que
+        si ``INSTALL_NODE_DEPS_AT_STARTUP`` est vrai
+        (``COMFYCH_INSTALL_DEPS=1``). Les échecs sont loggés en warning sans
+        jamais faire échouer le démarrage du worker.
+
+        Chaque node est chronométré ; si la préparation dépasse
+        ``PREP_SLOW_THRESHOLD_SECONDS``, un top des nodes les plus lents est
+        écrit dans le log (garde-fou de perf).
 
         Returns
         -------
@@ -912,28 +1013,45 @@ class ComfyWorker:
             return 0
 
         print(f"[ComfyWorker] Nodes trouvés sur le volume : {names}")
+        if not INSTALL_NODE_DEPS_AT_STARTUP:
+            print(
+                "[ComfyWorker] deps des nodes déjà installées au build "
+                "(COMFYCH_INSTALL_DEPS=0) — étape ignorée"
+            )
 
         comfy_path.mkdir(parents=True, exist_ok=True)
         linked = 0
         existing = 0
+        node_seconds: list[tuple[str, float]] = []
         for name in names:
-            item = vol_path / name
-            dst = comfy_path / name
-            if dst.exists() or dst.is_symlink():
-                existing += 1
-            else:
-                try:
-                    dst.symlink_to(item)
-                    linked += 1
-                except OSError as e:
-                    print(f"[ComfyWorker] ⚠️ Impossible de lier {name} : {e}")
-                    continue
+            node_started_at = time.time()
+            try:
+                item = vol_path / name
+                dst = comfy_path / name
+                if dst.exists() or dst.is_symlink():
+                    existing += 1
+                else:
+                    try:
+                        dst.symlink_to(item)
+                        linked += 1
+                    except OSError as e:
+                        print(f"[ComfyWorker] ⚠️ Impossible de lier {name} : {e}")
+                        continue
 
-            # Install node deps + run install.py (best-effort)
-            self._install_node_requirements(item)
-            self._run_node_install_script(item)
+                # Deps + install.py : opt-in seulement (faites au build sinon).
+                if INSTALL_NODE_DEPS_AT_STARTUP:
+                    self._install_node_requirements(item)
+                    self._run_node_install_script(item)
+            finally:
+                # Mesuré même en cas d'échec de symlink (``continue``) : le
+                # top des nodes lents doit refléter tout ce qui a coûté du temps.
+                node_seconds.append((name, time.time() - node_started_at))
 
         print(f"[ComfyWorker] Custom nodes : {linked} lié(s), {existing} déjà présent(s)")
+        try:
+            write_slowest_nodes_block(node_seconds)
+        except Exception as e:  # noqa: BLE001 — la mesure ne casse jamais le démarrage
+            print(f"[ComfyWorker] ⚠️ top des nodes lents indisponible : {e}")
         return linked
 
     def _install_node_requirements(self, node_dir: Path) -> None:
@@ -1105,9 +1223,13 @@ class ComfyWorker:
 
     def _timed_shutdown(self, timeout: float = 10) -> float:
         """``_shutdown_comfy`` chronométré — 0.0 s quand rien n'est arrêté."""
+        had_proc = getattr(self, "proc", None) is not None
         started_at = time.time()
         self._shutdown_comfy(timeout=timeout)
-        return max(0.0, time.time() - started_at)
+        elapsed = max(0.0, time.time() - started_at)
+        # Rien à arrêter → 0.0 s exactement : la phase ne doit pas afficher un
+        # bruit de mesure d'horloge dans le bloc de timing.
+        return elapsed if had_proc else 0.0
 
     def _shutdown_comfy(self, timeout: float = 10) -> None:
         """Arrête proprement le process ComfyUI (terminate, puis kill en secours)."""

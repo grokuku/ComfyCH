@@ -78,11 +78,43 @@ EXCLUDE_DIRS = {
     ".mypy_cache",
     ".pytest_cache",
     ".ruff_cache",
-    # Déjà couverts par la règle « dossier caché », listés pour l'intention.
+    ".staging",
     ".github",
     ".idea",
     ".vscode",
 }
+
+# Sous-ensemble CACHÉ de :data:`EXCLUDE_DIRS` : les SEULS dossiers commençant
+# par ``.`` élagués dans l'arbre d'un node.
+#
+# ATTENTION — ne JAMAIS revenir à une règle « tout dossier caché est exclu » :
+# plusieurs repos de nodes embarquent des SOUS-MODULES git légitimes dont le nom
+# commence par un point et que le node importe au runtime. Régression observée en
+# production après une sync :
+#
+#     [VRGDG] 1 failed submodule(s): .VRGDG_LTXLoopingSampler
+#     ModuleNotFoundError: No module named 'ComfyUI-LTXVideo'
+#
+# Tout AUTRE dossier commençant par ``.`` est donc CONSERVÉ (son poids éventuel
+# reste couvert par :data:`EXCLUDE_FILE_EXTS` et les garde-fous de taille).
+HIDDEN_EXCLUDE_DIRS = {
+    ".git",  # volume souvent énorme : jamais transféré
+    ".github",
+    ".venv",
+    ".idea",
+    ".vscode",
+    ".cache",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    _STAGING_DIR_NAME,  # dossier interne du volume, jamais un node
+}
+
+# Fichiers de code conservés même quand leur nom commence par ``.`` : un
+# sous-module conservé peut livrer du bytecode natif (``.so``/``.pyd``) ou du
+# Python sous un nom pointé. Les métadonnées cachées (``.DS_Store``,
+# ``.gitignore``, ``.gitmodules``…) restent, elles, exclues.
+HIDDEN_KEEP_FILE_EXTS = {".py", ".pyi", ".so", ".pyd"}
 
 # Contenu de démonstration embarqué par certains repos de nodes (captures
 # d'écran, workflows d'exemple, jeux de test, documentation) : jamais chargé au
@@ -304,9 +336,10 @@ def _node_skip_reason(name: str) -> str | None:
     """Raison d'exclure le dossier *name* de custom_nodes/, ou ``None``.
 
     Le gateway lui-même (``PROJECT_ROOT_NAME``) et ``user`` ne sont pas des
-    nodes ; les dossiers cachés et techniques (``__pycache__``, ``.git``…) non
-    plus. Les radicaux de contenu (:data:`CONTENT_DIR_STEMS`) ne s'appliquent
-    PAS ici : un node peut légitimement s'appeler ``ComfyUI-Workflows``.
+    nodes ; les dossiers techniques (``__pycache__``, ``.git``…) et les dossiers
+    cachés de bookkeeping du volume (``.staging``…) non plus. Les radicaux de
+    contenu (:data:`CONTENT_DIR_STEMS`) ne s'appliquent PAS ici : un node peut
+    légitimement s'appeler ``ComfyUI-Workflows``.
     """
     if name == PROJECT_ROOT_NAME:
         return "gateway ComfyCH (code déjà présent dans l'image)"
@@ -349,14 +382,22 @@ def _dir_exclusion_reason(name: str, *, node_root: bool = False) -> str | None:
     *node_root* signale un dossier de premier niveau de ``custom_nodes/`` (donc
     un nom de node) : les radicaux de :data:`CONTENT_DIR_STEMS` n'y sont pas
     appliqués, un node pouvant s'appeler ``ComfyUI-Workflows``.
+
+    Les dossiers cachés ne sont PAS exclus en bloc : seuls les noms de
+    :data:`HIDDEN_EXCLUDE_DIRS` le sont (cf. la régression des sous-modules git
+    nommés ``.VRGDG_LTXLoopingSampler``). Au premier niveau de ``custom_nodes/``
+    en revanche (``node_root``), un dossier caché n'est pas un node : bookkeeping
+    du volume (``.staging``, ``.Trash``…) ou reste de montage.
     """
-    if name.startswith("."):
-        return _SKIP_HIDDEN
     lowered = name.lower()
+    if lowered in HIDDEN_EXCLUDE_DIRS:
+        return _SKIP_HIDDEN
     if lowered in EXCLUDE_DIRS:
         return _SKIP_TECHNICAL
     if lowered in EXCLUDE_CONTENT_DIRS:
         return _SKIP_DEMO_DIR
+    if node_root and name.startswith("."):
+        return _SKIP_HIDDEN
     if not node_root and _dir_name_tokens(lowered) & CONTENT_DIR_STEMS:
         return _SKIP_DEMO_DIR
     return None
@@ -371,10 +412,14 @@ def _file_exclusion_reason(
     (cf. :data:`MAX_IMAGE_MB`) : une image de plus de ``MAX_IMAGE_MB`` est une
     capture ou un exemple, pas un asset d'UI. Sans taille connue, la décision
     par nom seul fait foi (le fichier est conservé).
+
+    Les fichiers cachés de métadonnées sont écartés, SAUF le code
+    (:data:`HIDDEN_KEEP_FILE_EXTS`) : un sous-module conservé peut livrer du
+    ``.so``/``.pyd`` (cf. :data:`HIDDEN_EXCLUDE_DIRS`).
     """
-    if name.startswith("."):
-        return _SKIP_HIDDEN
     suffix = Path(name).suffix.lower()
+    if name.startswith(".") and suffix not in HIDDEN_KEEP_FILE_EXTS:
+        return _SKIP_HIDDEN
     if suffix in EXCLUDE_FILE_EXTS:
         return _SKIP_HEAVY_FILE
     if suffix in EXCLUDE_MEDIA_EXTS:
@@ -414,6 +459,7 @@ def _new_archive_counters() -> dict:
     """Compteurs d'exclusion remplis pendant l'énumération d'un node."""
     return {
         "demo_dirs": set(),
+        "hidden_dirs": set(),
         "skipped_demo_dirs": 0,
         "media_exts": set(),
         "skipped_media": 0,
@@ -445,6 +491,10 @@ def _iter_node_files(node_dir, counters: dict | None = None):
                 continue
             if os.path.islink(os.path.join(root, dir_name)):
                 continue
+            if dir_name.startswith(".") and counters is not None:
+                # Sous-module caché conservé (ex. `.VRGDG_LTXLoopingSampler`) :
+                # tracé dans le résumé du packaging, mais JAMAIS élagué.
+                counters["hidden_dirs"].add(dir_name)
             kept_dirs.append(dir_name)
         dirs[:] = kept_dirs
 
@@ -500,8 +550,9 @@ def _build_custom_nodes_archive(
     Retourne ``{"files": n, "skipped_large": n, "size": octets}`` complété par
     le détail des exclusions : ``skipped_demo_dirs``/``demo_dir_names``
     (dossiers de démonstration élagués), ``skipped_media``/``media_exts``
-    (fichiers média ignorés) et ``skipped_large_images``/``image_exts``
-    (images au-delà de ``MAX_IMAGE_MB``).
+    (fichiers média ignorés), ``skipped_large_images``/``image_exts``
+    (images au-delà de ``MAX_IMAGE_MB``) et ``kept_hidden_dirs`` (sous-modules
+    cachés conservés).
     """
     import tarfile
 
@@ -544,6 +595,7 @@ def _build_custom_nodes_archive(
         "media_exts": sorted(counters["media_exts"]),
         "skipped_large_images": counters["skipped_large_images"],
         "image_exts": sorted(counters["image_exts"]),
+        "kept_hidden_dirs": sorted(counters["hidden_dirs"]),
         "size": os.path.getsize(archive_path),
     }
 
@@ -622,6 +674,13 @@ def _archive_exclusion_summary_lines(stats: dict) -> list[str]:
     if stats.get("skipped_large"):
         lines.append(
             f"⚠️ {stats['skipped_large']} fichier(s) > {MAX_FILE_MB} MB ignoré(s)"
+        )
+    if stats.get("kept_hidden_dirs"):
+        # Sous-modules git nommés avec un point : conservés volontairement (le
+        # node les importe). Ligne informative, PAS une exclusion.
+        names = [f"{name}/" for name in stats["kept_hidden_dirs"]]
+        lines.append(
+            f"  ✔ sous-module(s) caché(s) conservé(s) : {_format_node_list(names)}"
         )
     return lines
 

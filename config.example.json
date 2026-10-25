@@ -8,5 +8,6 @@
   "custom_nodes_ext": [],
   "custom_nodes_local": [],
   "models_to_sync": [],
-  "local_output_dir": ""
+  "local_output_dir": "",
+  "extra_pip_packages": []
 }

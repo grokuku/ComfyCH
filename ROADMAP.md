@@ -30,6 +30,14 @@
 - **Custom nodes synchronisés par volume** : packaging tar.gz (protection path
   traversal + swap atomique) vers le volume `comfy-custom-nodes`, symlinkés par
   les workers au démarrage — plus besoin de redeploy pour changer un node.
+- **Dépendances optionnelles des custom nodes** : champ « Paquets pip
+  supplémentaires » dans l'étape 1 de la modale (ex. `sageattention` pour
+  kjnodes, `mediapipe` pour facetools), installés au build en **best-effort**
+  (`pip install … || echo`) — un échec ne casse ni l'image ni le déploiement.
+- **Sous-modules git cachés préservés** à la sync des custom nodes : seuls les
+  dossiers cachés techniques (`.git`, `.venv`, `.staging`…) sont élagués, un
+  `.VRGDG_LTXLoopingSampler` (sous-module importable) est conservé — corrige les
+  `ModuleNotFoundError: No module named 'ComfyUI-LTXVideo'`.
 
 ---
 

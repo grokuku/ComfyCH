@@ -68,6 +68,31 @@ le cloud ne sert que pour les rendus ponctuels (paiement à la seconde).
   volume `comfy-custom-nodes`. Les workers les **symlinkent au démarrage** —
   **sans redeploy** pour changer un node.
 
+### Dépendances optionnelles des custom nodes
+
+Certains custom nodes importent une dépendance **optionnelle** qu'ils ne
+déclarent jamais dans leur `requirements.txt` : le node se charge, puis le rendu
+échoue avec `ModuleNotFoundError` (`sageattention` pour comfyui-kjnodes /
+`PatchSageAttention`, `mediapipe` pour comfyui_facetools, `ultralytics`…).
+
+La modale (étape 1 « Build ») expose pour cela un champ **Paquets pip
+supplémentaires** : une liste séparée par des virgules, par exemple
+
+```
+sageattention, mediapipe, ultralytics
+```
+
+Ces paquets sont installés **au build de l'image**, après les requirements des
+nodes, en **best-effort** : un échec (`sageattention` a besoin d'un GPU/CUDA pour
+se compiler, version incompatible, index injoignable) affiche un avertissement
+dans le log du build et **n'empêche jamais** l'image d'être construite ni le
+déploiement d'aboutir — seul le node concerné échouera à l'exécution. Il faut
+redéployer (🚀 Déployer) pour que la liste prenne effet.
+
+Les noms sont validés (liste blanche de caractères) : une entrée contenant un
+métacaractère shell (`;`, `&`, `|`, `$`, espaces…) est ignorée à l'enregistrement
+et au build.
+
 ## Sécurité
 
 - Routes du gateway protégées par `X-API-Key` (fail-closed : 401 si mauvaise clé,
