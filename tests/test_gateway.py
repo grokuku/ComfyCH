@@ -1109,7 +1109,8 @@ def _fake_subprocess(calls, label):
     """Module ``subprocess`` factice qui enregistre chaque Popen dans *calls*.
 
     ``kwargs`` conserve les mots-clés de chaque lancement (stdout/stderr),
-    utilisés par les checks de redirection des logs ComfyUI.
+    utilisés par les checks de redirection des logs ComfyUI. ``args`` conserve
+    les arguments positionnels (commande de lancement de ComfyUI).
     """
     fake = types.ModuleType("fake_subprocess")
 
@@ -1117,9 +1118,11 @@ def _fake_subprocess(calls, label):
 
     fake.STDOUT = -2  # même valeur sentinelle que le vrai subprocess
     fake.kwargs = []
+    fake.args = []
 
     def Popen(*args, **kwargs):
         calls.append(label)
+        fake.args.append(args)
         fake.kwargs.append(kwargs)
         return _FakeProc()
 
@@ -1332,6 +1335,165 @@ def _test_launch_comfy_redirect():
           content.count("===== ComfyUI start ") == 2)
     check("_launch_comfy : ancienne sortie conservée (append)",
           content.startswith("ancienne sortie\n"))
+
+
+def _test_launch_comfy_direct():
+    """ComfyUI est lancé via main.py — pas via `comfy launch` qui daemonise.
+
+    `comfy launch --background` daemonise le serveur et détourne sa stdout vers
+    son log interne : notre COMFY_LOG_PATH ne contient alors que l'en-tête du
+    wrapper et les erreurs d'import des nodes (`IMPORT FAILED`, ModuleNotFound)
+    restent invisibles. On vérifie donc le lancement direct de main.py.
+    """
+    bw = _load_base_worker()
+    tmp = Path(tempfile.mkdtemp())
+    comfy_root = tmp / "ComfyUI"
+    nodes_dir = comfy_root / "custom_nodes"
+    nodes_dir.mkdir(parents=True)
+    for name in ("node_a", "node_b", "node_c"):
+        (nodes_dir / name).mkdir()
+    (comfy_root / "main.py").write_text("# point d'entrée ComfyUI\n")
+    (comfy_root / "comfyui_version.py").write_text('__version__ = "0.3.40"\n')
+
+    fake = _fake_subprocess([], "popen")
+    real = (
+        bw.subprocess, bw.COMFY_ROOT, bw.COMFY_LOG_PATH, bw.COMFY_CUSTOM_NODES_DIR
+    )
+    log_path = tmp / "logs" / "comfyui.log"
+    bw.subprocess, bw.COMFY_ROOT = fake, comfy_root
+    bw.COMFY_LOG_PATH, bw.COMFY_CUSTOM_NODES_DIR = log_path, nodes_dir
+    try:
+        proc = bw.ComfyWorker()._launch_comfy()
+    finally:
+        (
+            bw.subprocess, bw.COMFY_ROOT, bw.COMFY_LOG_PATH, bw.COMFY_CUSTOM_NODES_DIR
+        ) = real
+
+    check("_launch_comfy direct : process retourné", isinstance(proc, _FakeProc))
+    check("_launch_comfy direct : main.py lancé avec sys.executable",
+          len(fake.args) == 1
+          and fake.args[0][0] == [
+              sys.executable, str(comfy_root / "main.py"),
+              "--listen", "0.0.0.0", "--port", "8000",
+          ])
+    kwargs = fake.kwargs[0] if fake.kwargs else {}
+    check("_launch_comfy direct : pas de shell (aucun wrapper comfy-cli)",
+          not kwargs.get("shell"))
+    check("_launch_comfy direct : cwd = racine ComfyUI",
+          kwargs.get("cwd") == str(comfy_root))
+    check("_launch_comfy direct : PYTHONUNBUFFERED=1 (logs temps réel)",
+          (kwargs.get("env") or {}).get("PYTHONUNBUFFERED") == "1")
+    check("_launch_comfy direct : PYTHONIOENCODING=utf-8",
+          (kwargs.get("env") or {}).get("PYTHONIOENCODING") == "utf-8")
+    check("_launch_comfy direct : stdout/stderr toujours capturés dans le log",
+          Path(kwargs["stdout"].name) == log_path
+          and kwargs.get("stderr") == fake.STDOUT
+          and kwargs.get("start_new_session") is True)
+
+    content = log_path.read_text()
+    cmd_line = (
+        f"commande: {sys.executable} {comfy_root / 'main.py'} "
+        "--listen 0.0.0.0 --port 8000"
+    )
+    check("_launch_comfy direct : commande exacte loguée", cmd_line in content)
+    check("_launch_comfy direct : nombre de custom_nodes logué",
+          "custom_nodes: 3 dossier(s)" in content)
+    check("_launch_comfy direct : présence + version de ComfyUI loguées",
+          "main.py: présent (ComfyUI 0.3.40)" in content)
+
+    # ── Repli : main.py absent → wrapper comfy-cli (comportement historique)
+    empty_root = tmp / "vide"
+    empty_root.mkdir()
+    fake2 = _fake_subprocess([], "popen")
+    bw.subprocess, bw.COMFY_ROOT = fake2, empty_root
+    bw.COMFY_LOG_PATH = tmp / "logs" / "repli.log"
+    bw.COMFY_CUSTOM_NODES_DIR = empty_root / "custom_nodes"
+    try:
+        proc2 = bw.ComfyWorker()._launch_comfy()
+    finally:
+        (
+            bw.subprocess, bw.COMFY_ROOT, bw.COMFY_LOG_PATH, bw.COMFY_CUSTOM_NODES_DIR
+        ) = real
+
+    kwargs2 = fake2.kwargs[0] if fake2.kwargs else {}
+    checkar = str(fake2.args[0][0]) if fake2.args and fake2.args[0] else ""
+    check("_launch_comfy repli : comfy launch utilisé si main.py absent",
+          isinstance(proc2, _FakeProc)
+          and checkar == "comfy launch --background -- --listen 0.0.0.0 --port 8000"
+          and kwargs2.get("shell") is True)
+    repli = (tmp / "logs" / "repli.log").read_text()
+    check("_launch_comfy repli : repli + absence de main.py logués",
+          "repli comfy-cli" in repli and "custom_nodes: 0 dossier(s)" in repli)
+
+
+def _test_logs_tail_cli_fallback():
+    """logs_tail : log principal minuscule → complété par le log de comfy-cli."""
+    bw = _load_base_worker()
+    worker = bw.ComfyWorker()
+    tmp = Path(tempfile.mkdtemp())
+
+    log = tmp / "comfyui.log"
+    log.write_text(
+        "===== ComfyUI start 2026-10-25T10:04:26 =====\n"
+        "Launching ComfyUI from: /root/comfy/ComfyUI\n"
+        "ComfyUI is successfully launched in the background.\n"
+    )  # < 2 Kio → inexploitable
+    cli_log = tmp / "user" / "comfyui.log"
+    cli_log.parent.mkdir(parents=True)
+    cli_log.write_text(
+        "\n".join(
+            ["Total VRAM 23028 MB", "IMPORT FAILED: ComfyUI-AI-Helper", "ModuleNotFoundError: requests"]
+        ) + "\n"
+    )
+
+    real = (bw.COMFY_LOG_PATH, bw.COMFY_CLI_LOG_CANDIDATES)
+    bw.COMFY_LOG_PATH, bw.COMFY_CLI_LOG_CANDIDATES = log, (cli_log,)
+    try:
+        res = asyncio.run(worker.logs_tail(50))
+        check("logs_tail : complément comfy-cli ajouté quand le log est minuscule",
+              res.get("fallback_path") == str(cli_log)
+              and "IMPORT FAILED: ComfyUI-AI-Helper" in res.get("lines", []))
+        check("logs_tail : séparateur explicite avant le log interne",
+              any(
+                  line.startswith("───── log interne comfy-cli")
+                  and str(cli_log) in line
+                  for line in res.get("lines", [])
+              ))
+        check("logs_tail : log principal conservé avant le complément",
+              res.get("lines", [""])[0].startswith("===== ComfyUI start")
+              and res.get("size") == log.stat().st_size)
+
+        # Log principal exploitable → aucun complément (le log fait foi).
+        big = tmp / "gros.log"
+        big.write_text("x" * (bw.COMFY_CLI_LOG_MIN_BYTES + 1) + "\n")
+        bw.COMFY_LOG_PATH = big
+        res = asyncio.run(worker.logs_tail(50))
+        check("logs_tail : log principal suffisant → pas de complément",
+              "fallback_path" not in res
+              and not any("log interne comfy-cli" in line for line in res["lines"]))
+
+        # Aucun log comfy-cli présent → résultat inchangé.
+        bw.COMFY_LOG_PATH = log
+        bw.COMFY_CLI_LOG_CANDIDATES = (tmp / "absent" / "comfyui.log",)
+        res = asyncio.run(worker.logs_tail(50))
+        check("logs_tail : log interne absent → résultat inchangé",
+              "fallback_path" not in res and "error" not in res
+              and res["lines"][-1] == "ComfyUI is successfully launched in the background.")
+
+        # La fonction CPU partagée garde son contrat (aucun complément).
+        bw.COMFY_CLI_LOG_CANDIDATES = (cli_log,)
+        res = bw.read_log_tail(log, 50)
+        check("read_log_tail (CPU) : pas de complément comfy-cli",
+              "fallback_path" not in res
+              and not any("log interne comfy-cli" in line for line in res["lines"]))
+    finally:
+        bw.COMFY_LOG_PATH, bw.COMFY_CLI_LOG_CANDIDATES = real
+
+    paths = bw._fallback_cli_log_paths()
+    check("_fallback_cli_log_paths : ~ développé, racine comfy en tête",
+          len(paths) == 3
+          and str(paths[0]) == "/root/comfy/ComfyUI/user/comfyui.log"
+          and all("~" not in str(p) for p in paths))
 
 
 def _test_logs_tail():
@@ -1757,6 +1919,8 @@ def main():
     _test_start_restore_restart()
     _test_shutdown_comfy()
     _test_launch_comfy_redirect()
+    _test_launch_comfy_direct()
+    _test_logs_tail_cli_fallback()
     _test_logs_tail()
     _test_read_log_tail()
     _test_log_rotation()

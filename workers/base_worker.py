@@ -29,6 +29,7 @@ Usage (Phase 4 — ``apps/all_in_one.py``)
 from __future__ import annotations
 
 import base64
+import os
 import shutil
 import socket
 import subprocess
@@ -46,7 +47,14 @@ import modal
 CUSTOM_NODES_VOLUME_PATH = Path("/custom_nodes")
 """Volume Modal qui porte le code des custom nodes (monté dans les 3 apps)."""
 
-COMFY_CUSTOM_NODES_DIR = Path("/root/comfy/ComfyUI/custom_nodes")
+COMFY_ROOT = Path("/root/comfy/ComfyUI")
+"""Racine de l'installation ComfyUI (``comfy install`` de ``image.py``).
+
+Le lancement vise ``COMFY_ROOT/main.py`` : c'est le seul moyen de garder la
+stdout/stderr de ComfyUI dans notre log (le wrapper ``comfy launch
+--background`` daemonise et redirige la sortie vers son propre log interne)."""
+
+COMFY_CUSTOM_NODES_DIR = COMFY_ROOT / "custom_nodes"
 """Dossier scanné par ComfyUI — une seule fois, à son démarrage."""
 
 COMFY_LOG_PATH = Path("/cache/logs/comfyui.log")
@@ -71,6 +79,25 @@ COMFY_LOG_KEEP_BYTES = 512 * 1024
 Au-delà de ``COMFY_LOG_MAX_BYTES``, le log est tronqué à ses derniers
 ``COMFY_LOG_KEEP_BYTES`` avant l'append du nouvel en-tête : sans cela il
 croîtrait indéfiniment sur le volume (un node bavard peut écrire des Go)."""
+
+COMFY_CLI_LOG_CANDIDATES = (
+    Path("/root/comfy/ComfyUI/user/comfyui.log"),
+    Path("/root/comfy/ComfyUI/comfyui.log"),
+    Path("~/.comfy/comfyui.log"),
+)
+"""Logs internes écrits par ``comfy-cli`` (dont ``comfy launch``).
+
+Réplique de la sortie ComfyUI quand le wrapper CLI est utilisé (repli) :
+le wrapper daemonise le serveur et détourne sa stdout vers ces fichiers,
+qui ne sont donc **pas** sur le volume ``/cache`` et disparaissent avec le
+container — d'où leur rôle de simple complément de diagnostic."""
+
+COMFY_CLI_LOG_MIN_BYTES = 2 * 1024
+"""En dessous de cette taille, le log principal est jugé inexploitable et
+complété par le log interne de comfy-cli (en-tête du wrapper seul)."""
+
+COMFY_CLI_LOG_TAIL_LINES = 300
+"""Nombre de lignes lues dans le log interne de comfy-cli (complément)."""
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -158,6 +185,95 @@ def rotate_log(path: Path | str = COMFY_LOG_PATH) -> None:
         pass
 
 
+def _fallback_cli_log_paths() -> list[Path]:
+    """Chemins candidats des logs internes écrits par ``comfy-cli``.
+
+    Returns
+    -------
+    list[Path]
+        Candidats dans l'ordre de préférence (``~`` développé). Le premier
+        fichier existant est utilisé comme complément de ``logs_tail``.
+    """
+    return [Path(p).expanduser() for p in COMFY_CLI_LOG_CANDIDATES]
+
+
+def _append_cli_log_fallback(
+    result: dict, lines: int = COMFY_CLI_LOG_TAIL_LINES
+) -> dict:
+    """Complète un log principal quasi vide par celui de comfy-cli.
+
+    Quand ComfyUI est lancé par le wrapper ``comfy launch`` (repli), notre
+    ``COMFY_LOG_PATH`` ne contient que 3-4 lignes du wrapper : le serveur
+    daemonisé écrit ailleurs. Si le log principal fait moins de
+    ``COMFY_CLI_LOG_MIN_BYTES`` et qu'un log interne existe, on concatène ses
+    dernières lignes derrière un séparateur explicite.
+
+    Parameters
+    ----------
+    result : dict
+        Résultat de ``read_log_tail`` (non modifié : une copie est renvoyée).
+    lines : int
+        Nombre de lignes à reprendre du log interne.
+
+    Returns
+    -------
+    dict
+        ``result`` inchangé, ou complété des clés ``lines`` (concaténées),
+        ``fallback_path`` et ``fallback_size``.
+    """
+    if result.get("error"):
+        return result
+    if (result.get("size") or 0) >= COMFY_CLI_LOG_MIN_BYTES:
+        return result
+
+    for candidate in _fallback_cli_log_paths():
+        try:
+            if not candidate.is_file():
+                continue
+        except OSError:
+            continue
+        extra = read_log_tail(candidate, lines)
+        if extra.get("error") or not extra.get("lines"):
+            return result
+        merged = dict(result)
+        merged["lines"] = list(result.get("lines") or []) + [
+            f"───── log interne comfy-cli ({candidate}) ─────"
+        ] + list(extra["lines"])
+        merged["fallback_path"] = str(candidate)
+        merged["fallback_size"] = extra.get("size")
+        return merged
+    return result
+
+
+def _comfyui_version(root: Path | str | None = None) -> str:
+    """Version de ComfyUI lue dans ``comfyui_version.py`` (best effort)."""
+    base = COMFY_ROOT if root is None else Path(root)
+    try:
+        for line in (base / "comfyui_version.py").read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines():
+            stripped = line.strip()
+            if stripped.startswith("__version__"):
+                return stripped.split("=", 1)[1].strip().strip("\"'")
+    except (OSError, IndexError):
+        pass
+    return "version inconnue"
+
+
+def _count_custom_node_dirs(path: Path | str | None = None) -> int:
+    """Nombre de dossiers présents dans ``custom_nodes/`` (best effort).
+
+    Sert de diagnostic au lancement : si ce compte est nul, les symlinks du
+    volume n'ont pas été créés et ComfyUI répondra ``missing_node_type`` quoi
+    qu'il arrive.
+    """
+    base = Path(COMFY_CUSTOM_NODES_DIR if path is None else path)
+    try:
+        return sum(1 for entry in base.iterdir() if entry.is_dir())
+    except OSError:
+        return 0
+
+
 def commit_log_volume() -> None:
     """Commit best effort du volume qui porte le log (``comfy-models``).
 
@@ -224,11 +340,15 @@ class ComfyWorker:
         wait_for_port(8000, timeout=300)
 
     def _launch_comfy(self):
-        """Lance ComfyUI headless en redirigeant stdout/stderr vers COMFY_LOG_PATH.
+        """Lance ComfyUI headless en capturant TOUTE sa sortie dans COMFY_LOG_PATH.
 
-        Le log permet de diagnostiquer les erreurs d'import des custom nodes
-        (tracebacks, dépendances manquantes) qui n'apparaissent nulle part
-        ailleurs : sans lui on ne voit que ``missing_node_type`` côté gateway.
+        On n'utilise volontairement pas ``comfy launch --background`` : ce
+        wrapper **daemonise** ComfyUI et détourne sa stdout vers son propre log
+        interne (``user/comfyui.log``), ce qui rend invisibles les erreurs
+        d'import des custom nodes (``missing_node_type``), les tracebacks
+        d'exécution et les erreurs réseau des nodes (401, timeout…). On lance
+        donc ``main.py`` directement avec l'interpréteur courant : le process
+        reste notre enfant, sa sortie arrive dans ``COMFY_LOG_PATH``.
 
         Le fichier est ouvert en append (les redémarrages s'ajoutent au lieu
         de s'écraser) et ``start_new_session=True`` détache le process du
@@ -247,18 +367,56 @@ class ComfyWorker:
         """
         COMFY_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         rotate_log(COMFY_LOG_PATH)
+
+        comfy_root = Path(COMFY_ROOT)
+        main_py = comfy_root / "main.py"
+        # Diagnostics écrits AVANT le lancement : sans eux, un log vide serait
+        # indiscernable d'un ComfyUI mort au démarrage.
+        node_dirs = _count_custom_node_dirs()
+        main_py_ok = main_py.is_file()
+        version = _comfyui_version(comfy_root) if main_py_ok else "absente"
+
+        env = os.environ.copy()
+        # Logs temps réel : sans ces deux variables, Python bufferise par blocs
+        # et un traceback d'import de node n'apparaît qu'au flush/arrêt.
+        env["PYTHONUNBUFFERED"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
+
         with open(COMFY_LOG_PATH, "a") as log_file:
             log_file.write(
                 f"\n===== ComfyUI start {datetime.now().isoformat()} =====\n"
             )
+            if main_py_ok:
+                cmd: list[str] | str = [
+                    sys.executable,
+                    str(main_py),
+                    "--listen",
+                    "0.0.0.0",
+                    "--port",
+                    "8000",
+                ]
+                log_file.write(f"commande: {' '.join(cmd)}\n")
+                log_file.write(f"main.py: présent (ComfyUI {version})\n")
+            else:
+                # Repli : comportement historique (sortie partielle — le wrapper
+                # daemonise —, mais le serveur démarre).
+                cmd = "comfy launch --background -- --listen 0.0.0.0 --port 8000"
+                log_file.write(f"commande: {cmd}\n")
+                log_file.write(f"main.py: {main_py} introuvable — repli comfy-cli\n")
+            log_file.write(f"custom_nodes: {node_dirs} dossier(s)\n")
             log_file.flush()
-            proc = subprocess.Popen(
-                "comfy launch --background -- --listen 0.0.0.0 --port 8000",
-                shell=True,
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
+
+            popen_kwargs: dict = {
+                "stdout": log_file,
+                "stderr": subprocess.STDOUT,
+                "start_new_session": True,
+            }
+            if main_py_ok:
+                proc = subprocess.Popen(
+                    cmd, cwd=str(comfy_root), env=env, **popen_kwargs
+                )
+            else:
+                proc = subprocess.Popen(cmd, shell=True, **popen_kwargs)
         # Hors du ``with`` : le process garde son propre descripteur du fichier.
         commit_log_volume()
         return proc
@@ -727,6 +885,11 @@ class ComfyWorker:
         timeout…) qui se traduisent côté client par un ``missing_node_type``
         ou un HTTP 500 sans détail.
 
+        Si ce log est quasi vide (moins de ``COMFY_CLI_LOG_MIN_BYTES``), on le
+        complète par les dernières lignes du log interne de ``comfy-cli`` :
+        c'est le seul contenu disponible quand ComfyUI a été lancé par le
+        wrapper ``comfy launch`` (repli) qui daemonise le serveur.
+
         Parameters
         ----------
         lines : int, optional
@@ -737,8 +900,12 @@ class ComfyWorker:
         dict
             ``{"lines": [...], "path": str, "size": int}`` ou, en cas de
             problème, ``{"lines": [], "path": str, "error": str}``.
+            Clés supplémentaires ``fallback_path``/``fallback_size`` quand le
+            log interne de comfy-cli a été concaténé.
         """
         # Repli historique : lire le log via un container GPU réveille le GPU
         # (cold start 1-3 min). Le chemin principal est la fonction CPU
         # ``read_worker_logs`` des apps (``build_router(logs_reader=...)``).
-        return read_log_tail(COMFY_LOG_PATH, lines)
+        # Le complément comfy-cli reste ici (méthode du worker) : la fonction
+        # CPU n'a pas accès à ces chemins et doit garder le même format.
+        return _append_cli_log_fallback(read_log_tail(COMFY_LOG_PATH, lines))
