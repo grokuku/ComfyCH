@@ -2838,6 +2838,198 @@ def _test_extra_pip_install_best_effort():
           all("|| echo" in c for c in recorded if c.startswith("pip install ")))
 
 
+# ──────────── Sync des user settings : bases SQLite ────────────────────────
+
+def _test_sqlite_snapshot():
+    """Les bases SQLite sont copiées via l'API backup (état cohérent)."""
+    import sqlite3
+
+    sync_mod = _load_sync_module()
+    tmp = Path(tempfile.mkdtemp())
+    src = tmp / "user" / "default" / "ComfyUI-AI-Helper" / "aih.db"
+    src.parent.mkdir(parents=True, exist_ok=True)
+
+    # Base en mode WAL avec la connexion encore ouverte : cas réel d'un ComfyUI
+    # qui tourne pendant le sync (le journal -wal existe sur le disque).
+    writer = sqlite3.connect(str(src))
+    writer.execute("PRAGMA journal_mode=WAL")
+    writer.execute("CREATE TABLE credential (key TEXT PRIMARY KEY, value TEXT)")
+    writer.executemany(
+        "INSERT INTO credential VALUES (?, ?)",
+        [("server_url", "https://aih.example"), ("api_key", "sk-secret")],
+    )
+    writer.commit()
+
+    dst = tmp / "snapshot" / "aih.db"
+    check("snapshot sqlite : base copiée",
+          sync_mod._snapshot_sqlite(src, dst) is True)
+    check("snapshot sqlite : fichier de copie écrit", dst.is_file())
+
+    copy = sqlite3.connect(str(dst))
+    try:
+        rows = dict(copy.execute("SELECT key, value FROM credential").fetchall())
+    finally:
+        copy.close()
+    writer.close()
+
+    check("snapshot sqlite : lignes (credentials) présentes dans la copie",
+          rows == {"server_url": "https://aih.example", "api_key": "sk-secret"})
+
+    missing = tmp / "absent.db"
+    check("snapshot sqlite : source inexistante → False",
+          sync_mod._snapshot_sqlite(missing, tmp / "out.db") is False)
+    check("snapshot sqlite : source inexistante → aucune copie partielle",
+          not (tmp / "out.db").exists())
+
+    junk = tmp / "pas-une-base.db"
+    junk.write_text("pas du sqlite")
+    check("snapshot sqlite : fichier corrompu → False (fallback attendu)",
+          sync_mod._snapshot_sqlite(junk, tmp / "out2.db") is False)
+
+
+def _test_sqlite_upload_preparation():
+    """Chemin nominal (snapshot) et fallback (base + journaux) d'un upload."""
+    import sqlite3
+
+    sync_mod = _load_sync_module()
+    tmp = Path(tempfile.mkdtemp())
+    node_dir = tmp / "user" / "default" / "ComfyUI-AI-Helper"
+    node_dir.mkdir(parents=True, exist_ok=True)
+    src = node_dir / "aih.db"
+    conn = sqlite3.connect(str(src))
+    conn.execute("CREATE TABLE credential (key TEXT PRIMARY KEY)")
+    conn.execute("INSERT INTO credential VALUES ('api_key')")
+    conn.commit()
+    conn.close()
+    (node_dir / "aih.db-wal").write_bytes(b"")
+    (node_dir / "aih.db-shm").write_bytes(b"")
+    rel = Path("default") / "ComfyUI-AI-Helper" / "aih.db"
+
+    entries = sync_mod._prepare_sqlite_upload(src, rel, tmp / "work" / "db0")
+    check("upload base : une seule entrée quand le snapshot réussit",
+          len(entries) == 1)
+    check("upload base : l'entrée est la copie temporaire, pas la source",
+          len(entries) == 1 and entries[0][0] != src and entries[0][0].is_file())
+    check("upload base : chemin relatif de destination préservé",
+          len(entries) == 1 and entries[0][1] == rel)
+
+    # Fallback : l'API backup échoue (base verrouillée en écriture exclusive).
+    real_snapshot = sync_mod._snapshot_sqlite
+    sync_mod._snapshot_sqlite = lambda *a, **kw: False
+    try:
+        fallback = sync_mod._prepare_sqlite_upload(src, rel, tmp / "work" / "db1")
+    finally:
+        sync_mod._snapshot_sqlite = real_snapshot
+
+    names = sorted(path.name for path, _ in fallback)
+    check("upload base : fallback copie la base ET ses journaux -wal/-shm",
+          names == ["aih.db", "aih.db-shm", "aih.db-wal"])
+    check("upload base : fallback conserve le dossier",
+          bool(fallback) and all(dest.parent == rel.parent for _, dest in fallback))
+
+
+def _test_user_settings_db_selection():
+    """La sélection des user settings inclut les bases, exclut journaux/logs."""
+    sync_mod = _load_sync_module()
+    root = Path(tempfile.mkdtemp()) / "user"
+    node_dir = root / "default" / "ComfyUI-AI-Helper"
+    node_dir.mkdir(parents=True, exist_ok=True)
+    for name in (
+        "aih.db",
+        "state.sqlite",
+        "settings.json",
+        "aih.db-wal",
+        "aih.db-shm",
+        "comfyui.log",
+        "pending.tmp",
+        "pending.temp",
+    ):
+        (node_dir / name).write_bytes(b"x")
+    (root / "default" / "cache").mkdir(parents=True)
+    (root / "default" / "cache" / "blob.bin").write_bytes(b"x")
+    (root / "default" / "__manager").mkdir(parents=True)
+    (root / "default" / "__manager" / "config.ini").write_bytes(b"x")
+
+    kept = {
+        p.relative_to(root).as_posix()
+        for p in sync_mod._select_user_setting_files(root)
+    }
+    check("user settings : bases .db et .sqlite incluses",
+          {"default/ComfyUI-AI-Helper/aih.db",
+           "default/ComfyUI-AI-Helper/state.sqlite"} <= kept)
+    check("user settings : réglages non-DB toujours inclus",
+          "default/ComfyUI-AI-Helper/settings.json" in kept)
+    check("user settings : journaux -wal/-shm jamais uploadés séparément",
+          not any(p.endswith(("-wal", "-shm")) for p in kept))
+    check("user settings : .log/.tmp/.temp toujours exclus",
+          not any(p.endswith((".log", ".tmp", ".temp")) for p in kept))
+    check("user settings : dossiers cache et __manager exclus",
+          not any("/cache/" in p or "__manager" in p for p in kept))
+    check("user settings : garde-fou de taille par défaut = 200 MB",
+          sync_mod.MAX_USER_DB_MB == 200)
+
+    # Garde-fou : seuil abaissé pour ne pas créer 200 MB sur le disque.
+    big = node_dir / "big.db"
+    with open(big, "wb") as handle:
+        handle.truncate(2 * 1024 * 1024)  # fichier creux : 2 MB logiques
+    buf = io.StringIO()
+    sync_mod.MAX_USER_DB_MB = 1
+    try:
+        with contextlib.redirect_stdout(buf):
+            kept_small = {p.name for p in sync_mod._select_user_setting_files(root)}
+    finally:
+        sync_mod.MAX_USER_DB_MB = 200
+
+    check("user settings : base > MAX_USER_DB_MB écartée", "big.db" not in kept_small)
+    check("user settings : le garde-fou ne touche pas les autres fichiers",
+          {"settings.json", "aih.db"} <= kept_small)
+    check("user settings : base ignorée annoncée explicitement",
+          "big.db" in buf.getvalue()
+          and "ne seront pas transférés" in buf.getvalue())
+
+
+def _test_worker_user_settings_sync():
+    """Le worker copie les réglages et journalise les bases SQLite reçues."""
+    bw = _load_base_worker()
+    tmp = Path(tempfile.mkdtemp())
+    vol = tmp / "user-settings"
+    dest = tmp / "comfy" / "user"
+    helper_dir = vol / "default" / "ComfyUI-AI-Helper"
+    helper_dir.mkdir(parents=True, exist_ok=True)
+    (helper_dir / "aih.db").write_bytes(b"db")
+    (helper_dir / "extra.txt").write_text("x")
+    (vol / "settings.json").write_text("{}")
+
+    real_vol, real_dest = bw.USER_SETTINGS_VOLUME_PATH, bw.USER_SETTINGS_DIR
+    bw.USER_SETTINGS_VOLUME_PATH, bw.USER_SETTINGS_DIR = vol, dest
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            bw.ComfyWorker()._sync_user_settings_from_volume()
+    finally:
+        bw.USER_SETTINGS_VOLUME_PATH, bw.USER_SETTINGS_DIR = real_vol, real_dest
+    out = buf.getvalue()
+
+    check("worker : base SQLite copiée dans user/",
+          (dest / "default" / "ComfyUI-AI-Helper" / "aih.db").is_file())
+    check("worker : fichiers copiés comptés", "3 fichier(s) copié(s)" in out)
+    check("worker : bases SQLite nommées dans les logs", "['aih.db']" in out)
+
+    # Volume sans base : la mention SQLite reste absente.
+    plain = tmp / "empty-vol"
+    plain.mkdir()
+    (plain / "settings.json").write_text("{}")
+    bw.USER_SETTINGS_VOLUME_PATH = plain
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            bw.ComfyWorker()._sync_user_settings_from_volume()
+    finally:
+        bw.USER_SETTINGS_VOLUME_PATH = real_vol
+    check("worker : aucune base → pas de mention SQLite",
+          "SQLite" not in buf.getvalue())
+
+
 # ─────────────────────────── Main ──────────────────────────────────────────
 
 def main():
@@ -2868,6 +3060,10 @@ def main():
     _test_extra_pip_packages_config()
     _test_post_config_extra_pip_packages()
     _test_extra_pip_install_best_effort()
+    _test_sqlite_snapshot()
+    _test_sqlite_upload_preparation()
+    _test_user_settings_db_selection()
+    _test_worker_user_settings_sync()
     _test_image_size_guard()
     _test_archive_summary_lines()
     _test_node_size_report()

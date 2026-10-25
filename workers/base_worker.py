@@ -58,6 +58,12 @@ stdout/stderr de ComfyUI dans notre log (le wrapper ``comfy launch
 COMFY_CUSTOM_NODES_DIR = COMFY_ROOT / "custom_nodes"
 """Dossier scanné par ComfyUI — une seule fois, à son démarrage."""
 
+USER_SETTINGS_VOLUME_PATH = Path("/user-settings")
+"""Volume Modal qui porte le dossier ``user/`` local (réglages + bases SQLite)."""
+
+USER_SETTINGS_DIR = COMFY_ROOT / "user"
+"""Cible de la copie des réglages au démarrage du worker."""
+
 INSTALL_NODE_DEPS_AT_STARTUP = os.environ.get("COMFYCH_INSTALL_DEPS", "0") == "1"
 """Réinstaller les deps pip des custom nodes à chaque démarrage du worker ?
 
@@ -904,8 +910,8 @@ class ComfyWorker:
 
     def _sync_user_settings_from_volume(self):
         """Copy user settings from the mounted volume to the ComfyUI user/ directory."""
-        vol_path = Path("/user-settings")
-        user_path = Path("/root/comfy/ComfyUI/user")
+        vol_path = USER_SETTINGS_VOLUME_PATH
+        user_path = USER_SETTINGS_DIR
 
         if not vol_path.is_dir():
             print("[ComfyWorker] No user-settings volume mounted")
@@ -920,16 +926,31 @@ class ComfyWorker:
 
         # Copy each item from the volume to the user directory
         count = 0
+        databases = []
         for item in vol_path.iterdir():
             dest = user_path / item.name
             if item.is_dir():
                 shutil.copytree(str(item), str(dest), dirs_exist_ok=True)
-                count += 1
+                copied = [p for p in item.rglob("*") if p.is_file()]
             elif item.is_file():
                 shutil.copy2(str(item), str(dest))
-                count += 1
+                copied = [item]
+            else:
+                continue
+            count += len(copied)
+            databases.extend(
+                p.name for p in copied if p.suffix.lower() in (".db", ".sqlite")
+            )
 
-        print(f"[ComfyWorker] Synced {count} items from user-settings volume")
+        # Les bases SQLite portent les réglages des custom nodes (ex. les
+        # credentials de ComfyUI-AI-Helper) : les nommer confirme, depuis les
+        # logs du worker, qu'elles sont bien arrivées.
+        message = f"[ComfyWorker] user settings: {count} fichier(s) copié(s)"
+        if databases:
+            message += (
+                f", dont {len(databases)} base(s) SQLite : {sorted(databases)}"
+            )
+        print(message)
 
     def _link_models_from_manifest(self):
         """Read /cache/model_manifest.json and create symlinks in ComfyUI model dirs."""

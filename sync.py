@@ -18,6 +18,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+import sqlite3
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -1011,6 +1014,151 @@ def sync_hf_models() -> None:
         download_external_model(model["url"], model["filename"], model["model_dir"])
 
 
+# ── User settings sync : bases SQLite ────────────────────────────────────
+
+# Suffixes de bases SQLite : INCLUS dans l'upload des réglages utilisateur.
+# Les custom nodes y persistent leurs préférences (ex. ComfyUI-AI-Helper y
+# stocke ``server_url``/``api_key``) : les exclure vidait les réglages.
+SQLITE_SUFFIXES = {".db", ".sqlite"}
+
+# Compagnons d'une base en mode WAL : jamais uploadés seuls (ils seraient
+# incohérents), ils accompagnent la copie cohérente — ou le fallback quand la
+# base est verrouillée en écriture exclusive.
+SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm")
+
+# Fichiers tournants ou temporaires : jamais synchronisés.
+USER_SETTINGS_EXCLUDE_SUFFIXES = {".log", ".tmp", ".temp"}
+
+# Garde-fou : au-delà, une base n'est pas transférée (durée d'upload et poids
+# du volume). Les réglages qu'elle contient sont alors perdus côté worker.
+MAX_USER_DB_MB = 200
+
+
+def _is_sqlite_file(path: Path) -> bool:
+    """True si *path* est une base SQLite (``.db`` / ``.sqlite``)."""
+    return Path(path).suffix.lower() in SQLITE_SUFFIXES
+
+
+def _is_sqlite_sidecar(path: Path) -> bool:
+    """True si *path* est un journal SQLite (``*-wal`` / ``*-shm``)."""
+    name = Path(path).name.lower()
+    return any(name.endswith(suffix) for suffix in SQLITE_SIDECAR_SUFFIXES)
+
+
+def _snapshot_sqlite(src: Path, dst: Path) -> bool:
+    """Copie cohérente d'une base SQLite via l'API backup.
+
+    Une simple copie de fichier peut être incohérente si la base est en mode
+    WAL et qu'une transaction est en cours (cas d'un ComfyUI qui tourne). L'API
+    backup lit un état transactionnellement cohérent.
+
+    Returns True si la copie a réussi, False sinon (l'appelant fait un fallback).
+    """
+    src = Path(src)
+    dst = Path(dst)
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        src_conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
+        try:
+            dst_conn = sqlite3.connect(str(dst))
+            try:
+                src_conn.backup(dst_conn)
+            finally:
+                dst_conn.close()
+        finally:
+            src_conn.close()
+        return True
+    except Exception as e:
+        print(f"  ⚠️ Snapshot SQLite impossible pour {src.name} : {e}", flush=True)
+        return False
+
+
+def _copy_sqlite_with_journal(src: Path, dst: Path) -> bool:
+    """Fallback : copie la base ET ses journaux ``-wal``/``-shm``.
+
+    Utilisé quand l'API backup échoue (base verrouillée en écriture exclusive).
+    Copier les compagnons permet à SQLite de rejouer le journal au chargement
+    côté worker. Returns True si au moins le fichier principal a été copié.
+    """
+    src = Path(src)
+    dst = Path(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    copied = False
+    for p in (src, Path(str(src) + "-wal"), Path(str(src) + "-shm")):
+        if p.is_file():
+            try:
+                shutil.copy2(str(p), str(dst.parent / p.name))
+                copied = copied or p == src
+            except OSError as e:
+                print(f"  ⚠️ Copie de {p.name} impossible : {e}", flush=True)
+    return copied
+
+
+def _prepare_sqlite_upload(
+    src: Path, rel_path: Path, tmp_dir: Path
+) -> list[tuple[Path, Path]]:
+    """Prépare l'upload d'une base : ``[(fichier local, chemin relatif)]``.
+
+    Chemin nominal : un snapshot cohérent (API backup) est uploadé seul.
+    Fallback : la base et ses journaux sont copiés dans *tmp_dir* puis
+    uploadés ensemble, pour que SQLite rejoue le WAL au chargement.
+    """
+    tmp_dir = Path(tmp_dir)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    snapshot = tmp_dir / Path(src).name
+    if _snapshot_sqlite(src, snapshot):
+        return [(snapshot, rel_path)]
+
+    if _copy_sqlite_with_journal(src, snapshot):
+        return [
+            (p, Path(rel_path).parent / p.name)
+            for p in sorted(tmp_dir.iterdir())
+            if p.is_file()
+        ]
+
+    # Dernier recours : le fichier tel quel (mieux qu'une base absente).
+    return [(Path(src), rel_path)]
+
+
+def _select_user_setting_files(
+    user_dir, *, max_db_mb: float | None = None
+) -> list[Path]:
+    """Fichiers de ``user/`` à uploader vers ``comfy-user-settings``.
+
+    Les bases SQLite sont conservées (les réglages des custom nodes y vivent),
+    mais leurs journaux ``-wal``/``-shm`` sont écartés : ils accompagnent la
+    copie cohérente gérée par :func:`_prepare_sqlite_upload`. Les fichiers de
+    log/temp et les dossiers de cache restent exclus.
+    """
+    user_dir = Path(user_dir)
+    limit_mb = MAX_USER_DB_MB if max_db_mb is None else max_db_mb
+    limit_bytes = limit_mb * _MB
+
+    selected: list[Path] = []
+    for f in sorted(user_dir.rglob("*")):
+        if not f.is_file():
+            continue
+        if f.suffix.lower() in USER_SETTINGS_EXCLUDE_SUFFIXES:
+            continue
+        # Journaux SQLite : jamais uploadés séparément de leur base.
+        if _is_sqlite_sidecar(f):
+            continue
+        # Dossiers de cache (téléchargements du manager, cache HF local…).
+        if "cache" in f.parts or "__manager" in f.parts:
+            continue
+        if _is_sqlite_file(f):
+            size = _file_size(f)
+            if size is not None and size > limit_bytes:
+                print(
+                    f"  ⚠️ Base ignorée (> {limit_mb:g} MB) : {f.name} — les "
+                    f"réglages qu'elle contient ne seront pas transférés",
+                    flush=True,
+                )
+                continue
+        selected.append(f)
+    return selected
+
+
 # ── Local entrypoint: orchestrate the full sync ──────────────────────────
 
 
@@ -1033,38 +1181,46 @@ def main(sync_custom_nodes: bool = False, sync_user_only: bool = False) -> None:
 
         user_dir = Path(__file__).resolve().parent.parent.parent / "user"
         if user_dir.is_dir():
-            # Build a filtered list of files to upload (skip .db files)
-            files_to_upload = []
-            for f in user_dir.rglob("*"):
-                if not f.is_file():
-                    continue
-                # Skip database and cache files that might be locked/modified during upload
-                if f.suffix.lower() in (".db", ".sqlite", ".sqlite-wal", ".sqlite-shm", ".log", ".tmp", ".temp"):
-                    continue
-                # Skip cache directories
-                if "cache" in f.parts or "__manager" in f.parts:
-                    continue
-                files_to_upload.append(f)
+            # Bases SQLite incluses (réglages des custom nodes) : elles sont
+            # copiées via l'API backup et non par une simple copie de fichier.
+            files_to_upload = _select_user_setting_files(user_dir)
+            dbs = sum(1 for f in files_to_upload if _is_sqlite_file(f))
 
-            print(f"📁 Uploading {len(files_to_upload)} user setting file(s) from {user_dir}...")
+            print(
+                f"📁 Uploading {len(files_to_upload)} user setting file(s)"
+                f" (dont {dbs} base(s) SQLite)…",
+                flush=True,
+            )
 
             uploaded = 0
             skipped = 0
+            # Dossier de travail des snapshots SQLite : nettoyé quoi qu'il
+            # arrive, il ne doit jamais rester de copie de base sur disque.
+            tmp_root = Path(tempfile.mkdtemp(prefix="comfych-user-sync-"))
             # Un SEUL batch_upload pour tous les fichiers : chaque
             # ``with user_vol.batch_upload()`` ouvre une session réseau, la
             # rouvrir par fichier rendait l'upload très lent.
             try:
                 with user_vol.batch_upload() as batch:
-                    for f in files_to_upload:
+                    for index, f in enumerate(files_to_upload):
                         rel_path = f.relative_to(user_dir)
-                        try:
-                            batch.put_file(str(f), f"/{rel_path}")
-                            uploaded += 1
-                        except FileExistsError:
-                            skipped += 1
+                        if _is_sqlite_file(f):
+                            entries = _prepare_sqlite_upload(
+                                f, rel_path, tmp_root / f"db{index}"
+                            )
+                        else:
+                            entries = [(f, rel_path)]
+                        for src_file, dest_rel in entries:
+                            try:
+                                batch.put_file(str(src_file), f"/{dest_rel}")
+                                uploaded += 1
+                            except FileExistsError:
+                                skipped += 1
             except FileExistsError:
                 # Batch refusé d'emblée (ex. conflit signalé hors put_file)
                 skipped += 1
+            finally:
+                shutil.rmtree(tmp_root, ignore_errors=True)
 
             print(f"✅ User settings synced to volume ({uploaded} uploaded, {skipped} already present)")
         else:
@@ -1080,8 +1236,6 @@ def main(sync_custom_nodes: bool = False, sync_user_only: bool = False) -> None:
 
     # ── Custom nodes only mode ─────────────────────────────────────────
     if sync_custom_nodes:
-        import tempfile
-
         # NOTE : tous les ``print`` de cette branche utilisent ``flush=True``.
         # Sans flush, la sortie est bufferisée quand stdout n'est pas un TTY
         # (cas de ``modal run`` lancé par le gateway) : l'UI resterait muette
