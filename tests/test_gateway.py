@@ -117,16 +117,26 @@ class Image:
     def debian_slim(cls, python_version="3.11"):
         return cls()
     def add_local_python_source(self, *names, copy=False): return self
+    def add_local_file(self, *a, **kw): return self
+    def add_local_dir(self, *a, **kw): return self
     def apt_install(self, *pkgs): return self
     def pip_install(self, *pkgs): return self
+    def pip_install_from_requirements(self, *a, **kw): return self
+    def run_commands(self, *cmds, **kw): return self
 
 class App:
-    def __init__(self, name="", image=None):
-        self.name = name; self.image = image; self.functions = {}
+    def __init__(self, name="", image=None, secrets=None):
+        self.name = name; self.image = image; self.secrets = secrets; self.functions = {}
+        self.cls_defs = {}
     def function(self, **kw):
         def deco(fn):
             self.functions[fn.__name__] = fn
             return fn
+        return deco
+    def cls(self, **kw):
+        def deco(cls_):
+            self.cls_defs[cls_.__name__] = cls_
+            return cls_
         return deco
     def local_entrypoint(self, **kw):
         def deco(fn):
@@ -152,6 +162,7 @@ modal.enter = _passthrough_decorator
 modal.exit = _passthrough_decorator
 modal.method = _passthrough_decorator
 modal.concurrent = _passthrough_decorator
+modal.asgi_app = _passthrough_decorator
 sys.modules["modal"] = modal
 
 httpx = types.ModuleType("httpx")
@@ -1417,6 +1428,191 @@ def _test_worker_logs_route():
           isinstance(failed, JSONResponse) and failed.status_code == 500
           and "container injoignable" in failed.content.get("error", ""))
 
+    # ── Chemin principal : lecture par la fonction CPU (logs_reader) ──────
+    # Le worker GPU ne doit surtout pas être instancié : l'appeler réveillerait
+    # un container GPU (cold start 1-3 min) pour un simple coup d'œil au log.
+    cpu_asked = []
+
+    class CpuLogsReader:
+        def __init__(self):
+            self.remote = SimpleNamespace(aio=self._read)
+
+        async def _read(self, lines):
+            cpu_asked.append(lines)
+            return {"lines": ["ligne cpu"], "path": "/cache/logs/comfyui.log", "size": 42}
+
+    class NeverTouchedWorker(LogsWorker):
+        def __init__(self):
+            raise AssertionError("aucun worker GPU ne doit être instancié")
+
+    LogsWorker.asked = []
+    cpu_router = gateway_router.build_router(
+        {"L4": NeverTouchedWorker},
+        cors_origins=["*"],
+        title="logs",
+        logs_reader=CpuLogsReader(),
+    )
+    result = asyncio.run(cpu_router.handlers[("GET", "/logs")](lines=42))
+    check("router : /logs lit via la fonction CPU quand logs_reader est fourni",
+          result.get("lines") == ["ligne cpu"])
+    check("router : /logs transmet lines à la fonction CPU", cpu_asked == [42])
+    check("router : /logs ne touche pas aux workers GPU (pas de cold start)",
+          LogsWorker.asked == [])
+
+    bad_cpu = asyncio.run(cpu_router.handlers[("GET", "/logs")](gpu="A100"))
+    check("router : /logs GPU inconnu → 400 même avec logs_reader",
+          isinstance(bad_cpu, JSONResponse) and bad_cpu.status_code == 400)
+
+    class FailingLogsReader:
+        def __init__(self):
+            self.remote = SimpleNamespace(aio=self._read)
+
+        async def _read(self, lines):
+            raise RuntimeError("volume indisponible")
+
+    failing = gateway_router.build_router(
+        {"L4": LogsWorker},
+        cors_origins=["*"],
+        title="logs",
+        logs_reader=FailingLogsReader(),
+    )
+    failed_cpu = asyncio.run(failing.handlers[("GET", "/logs")](lines=10))
+    check("router : /logs fonction CPU en erreur → 500 avec message",
+          isinstance(failed_cpu, JSONResponse) and failed_cpu.status_code == 500
+          and "volume indisponible" in failed_cpu.content.get("error", ""))
+
+
+def _test_read_log_tail():
+    """read_log_tail : lecteur partagé (worker GPU + fonction CPU) borné."""
+    bw = _load_base_worker()
+    tmp = Path(tempfile.mkdtemp())
+
+    check("COMFY_LOG_PATH : log persisté sur le volume /cache",
+          str(bw.COMFY_LOG_PATH).startswith("/cache/"))
+
+    missing = tmp / "absent.log"
+    res = bw.read_log_tail(str(missing), 10)
+    check("read_log_tail : fichier absent → error explicite",
+          res.get("error") == "log file not found" and res.get("lines") == [])
+    check("read_log_tail : chemin str accepté et retourné tel quel",
+          res.get("path") == str(missing))
+
+    log = tmp / "comfyui.log"
+    log.write_text("\n".join(f"ligne {i}" for i in range(1, 21)) + "\n")
+    res = bw.read_log_tail(log, 5)
+    check("read_log_tail : 5 dernières lignes (chemin Path)",
+          res.get("lines") == [f"ligne {i}" for i in range(16, 21)])
+    check("read_log_tail : taille exposée", res.get("size") == log.stat().st_size)
+
+    big = tmp / "big.log"
+    big.write_text("\n".join(f"l{i}" for i in range(1, 2501)) + "\n")
+    res = bw.read_log_tail(big, 10 ** 6)
+    check("read_log_tail : borne haute à 2000 lignes",
+          len(res.get("lines", [])) == 2000 and res["lines"][-1] == "l2500")
+    res = bw.read_log_tail(big, -5)
+    check("read_log_tail : borne basse à 1 ligne", len(res.get("lines", [])) == 1)
+
+    res = bw.read_log_tail(big, 2000, max_bytes=64)
+    lines = res.get("lines", [])
+    check("read_log_tail : fenêtre de lecture bornée (fin du log seul)",
+          lines[-1] == "l2500" and len(lines) < 2000)
+    check("read_log_tail : taille exposée = fichier entier malgré la fenêtre",
+          res.get("size") == big.stat().st_size)
+    check("read_log_tail : aucune ligne tronquée par le seek",
+          all(line.startswith("l") and line[1:].isdigit() for line in lines))
+
+
+def _test_log_rotation():
+    """rotate_log : le log sur volume ne grossit pas sans fin."""
+    bw = _load_base_worker()
+    tmp = Path(tempfile.mkdtemp())
+
+    small = tmp / "small.log"
+    small.write_text("x" * 100 + "\n")
+    bw.rotate_log(small)
+    check("rotate_log : petit log laissé intact",
+          small.read_text() == "x" * 100 + "\n")
+
+    absent = tmp / "absent.log"
+    bw.rotate_log(absent)
+    check("rotate_log : fichier absent → no-op", not absent.exists())
+
+    log = tmp / "comfyui.log"
+    log.write_text("".join(f"ligne-{i:05d}\n" for i in range(500)))
+    before = log.stat().st_size
+    real_max, real_keep = bw.COMFY_LOG_MAX_BYTES, bw.COMFY_LOG_KEEP_BYTES
+    bw.COMFY_LOG_MAX_BYTES, bw.COMFY_LOG_KEEP_BYTES = 1024, 256
+    try:
+        bw.rotate_log(log)
+    finally:
+        bw.COMFY_LOG_MAX_BYTES, bw.COMFY_LOG_KEEP_BYTES = real_max, real_keep
+
+    after = log.stat().st_size
+    content = log.read_text()
+    check("rotate_log : log trop gros tronqué", after < before and after <= 512)
+    check("rotate_log : dernières lignes conservées",
+          content.rstrip().endswith("ligne-00499"))
+    check("rotate_log : première ligne (coupée par le seek) jetée",
+          content.startswith("ligne-"))
+
+    # La rotation est appliquée automatiquement au lancement de ComfyUI.
+    fake = _fake_subprocess([], "popen")
+    real_subprocess, real_log = bw.subprocess, bw.COMFY_LOG_PATH
+    log.write_text("".join(f"ligne-{i:05d}\n" for i in range(500)))
+    bw.subprocess, bw.COMFY_LOG_PATH = fake, log
+    bw.COMFY_LOG_MAX_BYTES, bw.COMFY_LOG_KEEP_BYTES = 1024, 256
+    try:
+        bw.ComfyWorker()._launch_comfy()
+    finally:
+        bw.subprocess, bw.COMFY_LOG_PATH = real_subprocess, real_log
+        bw.COMFY_LOG_MAX_BYTES, bw.COMFY_LOG_KEEP_BYTES = real_max, real_keep
+    check("_launch_comfy : rotation appliquée avant l'append",
+          log.stat().st_size < before + 200
+          and log.read_text().count("===== ComfyUI start ") == 1)
+
+
+def _test_apps_logs_reader():
+    """Les 3 apps exposent read_worker_logs (CPU) et la câblent au routeur."""
+    tmp = Path(tempfile.mkdtemp())
+    log = tmp / "comfyui.log"
+
+    for app_file in ("all_in_one.py", "all_in_one_lite.py", "all_in_one_l4.py"):
+        spec = importlib.util.spec_from_file_location(
+            "comfych_app_" + app_file.replace(".py", ""),
+            str(PROJECT_ROOT / "apps" / app_file),
+        )
+        app_mod = importlib.util.module_from_spec(spec)
+        try:
+            spec.loader.exec_module(app_mod)
+        except Exception as e:  # pragma: no cover — imports non stubbés
+            check(f"{app_file} : import sans erreur ({type(e).__name__}: {e})", False)
+            continue
+
+        check(f"{app_file} : read_worker_logs déclarée comme fonction Modal",
+              "read_worker_logs" in app_mod.app.functions)
+        check(f"{app_file} : read_worker_logs montée sur /cache",
+              isinstance(app_mod.MODELS_VOLUME, Volume))
+
+        real_path = app_mod.COMFY_LOG_PATH
+        try:
+            app_mod.COMFY_LOG_PATH = tmp / "absent.log"
+            res = app_mod.read_worker_logs(10)
+            check(f"{app_file} : log absent → message « worker pas encore démarré »",
+                  res.get("lines") == []
+                  and "pas encore démarré" in res.get("error", ""))
+
+            log.write_text("\n".join(f"ligne {i}" for i in range(1, 31)) + "\n")
+            app_mod.COMFY_LOG_PATH = log
+            res = app_mod.read_worker_logs(3)
+            check(f"{app_file} : read_worker_logs renvoie les N dernières lignes",
+                  res.get("lines") == ["ligne 28", "ligne 29", "ligne 30"])
+            check(f"{app_file} : read_worker_logs expose la taille du log",
+                  res.get("size") == log.stat().st_size)
+            check(f"{app_file} : read_worker_logs borne le nombre de lignes",
+                  len(app_mod.read_worker_logs(10 ** 6).get("lines", [])) == 30)
+        finally:
+            app_mod.COMFY_LOG_PATH = real_path
+
 
 def _test_extension_worker_logs_route():
     """La route locale GET /api/modal/worker-logs relaie {api_url}/logs.
@@ -1562,7 +1758,10 @@ def main():
     _test_shutdown_comfy()
     _test_launch_comfy_redirect()
     _test_logs_tail()
+    _test_read_log_tail()
+    _test_log_rotation()
     _test_worker_logs_route()
+    _test_apps_logs_reader()
     _test_extension_worker_logs_route()
 
     print(f"\n{'='*50}")
